@@ -1,7 +1,7 @@
 # SpscPipe — Lock-Free SPSC Pipe Specification
 
 **Status:** Draft v2 (supersedes the ring-of-descriptors draft)
-**Target framework:** .NET 8+
+**Target framework:** .NET 10+
 **Scope:** A lock-free, single-producer / single-consumer replacement for `System.IO.Pipelines.Pipe`, preserving the public contracts of `PipeReader` and `PipeWriter`. Uses an unbounded linked list of pooled segments with byte-count backpressure.
 
 ---
@@ -578,14 +578,15 @@ The `ReadOnlySequence<byte>` constructor with `endSegment`/`endIndex` enforces t
    current = _head
    consumedSeg = (Segment)consumed.GetObject()
    consumedIdx = consumed.GetInteger()
+   currentTail = Volatile.Read(ref state.Tail)    // acquire; §10.7 invariant
 
    while current != consumedSeg:
-       // Fully consumed. Retire.
        retiredBytes += current.WrittenLength - _headConsumedOffset
                        // first iteration uses _headConsumedOffset;
                        // subsequent iterations treat full segment
        next = Volatile.Read(ref current.Next)    // acquire
-       RetireSegment(current)
+       if current != currentTail:                // §10.7: never retire state.Tail
+           RetireSegment(current)
        current = next
        _headConsumedOffset = 0
 
@@ -623,14 +624,17 @@ SegmentPool.Return(seg)
 ### 7.4 `void Complete(Exception? exception)`
 
 ```
-1. Retire all segments from _head forward up to state.Tail. For each:
-   decrement refcount, return buffers and segments.
-2. Set state.ReaderException if provided.
-3. Volatile.Write(ref state.ReaderCompletionState, 2)
-4. Signal writer awaiter (§8.4).
+1. Set state.ReaderException if provided:
+       state.ReaderException = ExceptionDispatchInfo.Capture(exception)
+       (plain write; completion state release-store below establishes visibility)
+
+2. Release-store completion:
+       Volatile.Write(ref state.ReaderCompletionState, 2)
+
+3. Signal writer awaiter (§8.4).
 ```
 
-Note: after reader completion, the writer may still publish segments before observing the reader completion. Those segments are never retired by the reader. We leak them unless the writer, on next `FlushAsync`, checks reader completion *before* publishing. §6.3 step 3 does this; but between the check and the publication, the reader might complete. This window causes at most one unretired segment. These orphaned segments (and their buffer holders) are cleaned up by `SpscPipe.Dispose()` (§10.6), which walks any segments still reachable from `state.Head` forward and releases their holders and buffers to the pool. Callers that cannot guarantee `Dispose` is called benefit from the safety-net finalizer, which performs the same walk.
+Reader `Complete` does not retire segments or release buffer holders. All segment and holder cleanup is delegated to `SpscPipe.Dispose()` or `Reset()` (§10.6), which walk the segment chain after no operations are in flight. This avoids retiring segments that `state.Tail` still references (§10.7) and eliminates the race window where the writer publishes between a reader-side retirement walk and the writer observing `ReaderCompletionState`.
 
 ### 7.5 `void CancelPendingRead()`
 
@@ -887,7 +891,7 @@ Positions must come from the most recent `ReadAsync` result. Tracked via `_readI
 
 Writer completes → reader sees `WriterCompletionState == 2` on next `ReadAsync`'s acquire-load of that field. Bytes published before completion are visible via the normal mechanism (release-store of `Tail` and `BytesWrittenPublished`).
 
-Reader completes → writer sees `ReaderCompletionState == 2` on next `FlushAsync`'s acquire-load. Ongoing buffers may leak momentarily (§7.4) but are freed by `SpscPipe.Dispose()` or, as a safety net, the finalizer (§10.6).
+Reader completes → writer sees `ReaderCompletionState == 2` on next `FlushAsync`'s acquire-load. Reader `Complete` does not retire segments (§7.4); all segment and holder cleanup is performed by `SpscPipe.Dispose()` or, as a safety net, the finalizer (§10.6).
 
 ### 10.4 Exception propagation
 
@@ -899,15 +903,23 @@ Symmetric for reader-to-writer exception propagation on `FlushAsync`.
 
 ### 10.5 Reset
 
-`Reset()` requires both ends completed. Walks any segments still reachable from `state.Head` forward (following `Next` pointers), releasing holders and returning buffers and segments to their pools — same cleanup walk as `Dispose()` (§10.6). Zeroes all fields including `state.Head`. Re-initializes both awaiters (incrementing `Version`).
+`Reset()` requires both ends completed, with no operations in flight. Performs the same segment cleanup walk as `Dispose()` (§10.6): starts from `_head` if non-null, otherwise from `state.Head` (§10.6 step 1). Releases holders and returns buffers and segments to their pools. Zeroes all fields including `state.Head`. Re-initializes both awaiters (incrementing `Version`).
 
 ### 10.6 Disposal and finalization
 
-`SpscPipe` implements `IDisposable`. `Dispose()` performs a deterministic cleanup of any segments and buffers still outstanding — including orphaned segments published after reader completion (§7.4).
+`SpscPipe` implements `IDisposable`. `Dispose()` performs a deterministic cleanup of any segments and buffers still outstanding — including segments the reader never retired (reader `Complete` delegates all cleanup here, §7.4) and any orphaned segments published after reader completion.
 
 ```
 Dispose():
-1. Walk from state.Head forward, following Next pointers, until null.
+1. Determine walk root:
+       start = _head ?? state.Head
+   _head is non-null if the reader ever called ReadAsync. It points to the
+   first non-retired segment — the chain from here through state.Tail and
+   beyond covers all live segments, including any orphans the writer published
+   after reader completion. If _head is null (reader never read), state.Head
+   is still valid (never retired) and serves as the fallback.
+
+2. Walk from start forward, following Next pointers, until null.
    For each segment:
        if seg.Holder != null:
            ReleaseHolder(seg.Holder)    // §6.5.2
@@ -915,18 +927,28 @@ Dispose():
        seg.Reset()
        SegmentPool.Return(seg)
 
-2. If _activeBufferHolder != null (writer never rotated/completed):
+3. If _activeBufferHolder != null (writer never rotated/completed):
        ReleaseHolder(_activeBufferHolder)
        _activeBufferHolder = null
 
-3. Null out state.Head, state.Tail. Zero byte counters.
+4. Null out state.Head, state.Tail. Zero byte counters.
 ```
 
 `Dispose()` is safe to call after both sides have completed, or after only one side has completed (e.g., the writer completed but the reader abandoned). It is **not** safe to call concurrently with active reader or writer operations — the caller must ensure no operations are in flight.
 
 **Finalizer.** `SpscPipe` includes a weak safety-net finalizer that calls the same cleanup walk. For `ArrayPool<byte>.Shared`-backed buffers this prevents pool pressure under abandoned pipes. For custom `MemoryPool<byte>` implementations backed by pinned or native memory (§13), it prevents genuine resource leaks. The finalizer is suppressed by `Dispose()` via `GC.SuppressFinalize(this)`.
 
-**`Reset()` vs `Dispose()`:** `Reset()` (§10.5) performs the same segment/holder cleanup walk, then re-initializes the pipe for reuse. `Dispose()` performs cleanup only and leaves the pipe in a terminal state. Both share the same internal walk logic.
+**`Reset()` vs `Dispose()`:** `Reset()` (§10.5) performs the same segment/holder cleanup walk (starting from `_head ?? state.Head`), then re-initializes the pipe for reuse. `Dispose()` performs cleanup only and leaves the pipe in a terminal state. Both share the same internal walk logic.
+
+### 10.7 Tail-segment retirement invariant
+
+The segment referenced by `state.Tail` is never returned to the segment pool while `state.Tail` references it. The writer relies on `prevTail = state.Tail` followed by `Volatile.Write(ref prevTail.Next, newSeg)` during publication (§6.4); if the reader had retired that segment and returned it to the pool, the write would corrupt whatever consumer now holds the recycled object.
+
+This invariant is maintained by:
+
+- **`AdvanceTo` (§7.3):** acquires `state.Tail` and does not retire any segment identity-equal to it. In practice, `consumedSeg` is always at or before `state.Tail` in the chain, so the loop body never reaches the tail — the check is a mechanical safety net.
+- **Reader `Complete` (§7.4):** does not retire segments at all; cleanup is delegated to `Dispose` / `Reset`.
+- **`Dispose` / `Reset` (§10.6, §10.5):** run only when no operations are in flight, so `state.Tail` is never concurrently accessed by the writer.
 
 ---
 
