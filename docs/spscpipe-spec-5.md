@@ -150,7 +150,7 @@ internal sealed class SpscPipeWriter : PipeWriter
 internal sealed class SpscPipeReader : PipeReader
 {
     private Segment? _head;               // first non-retired segment
-    private int _headConsumedOffset;      // bytes consumed within _head beyond BufferStart
+    private int _headConsumedOffset;      // Memory-relative offset of first unconsumed byte within _head
     private long _examinedPosition;       // absolute byte position of last examined boundary
     private long _bytesRead;              // mirror of BytesReadPublished, pre-release
 
@@ -532,7 +532,7 @@ Algorithm (shared core, with `TryRead` skipping the await):
 
 5. Determine the end of the available sequence:
        endSeg = tail
-       endIdx = (tail != null) ? tail.BufferStart + tail.WrittenLength : 0
+       endIdx = (tail != null) ? tail.WrittenLength : 0
 
 6. Determine whether there is new data past _examinedPosition:
        availableEndPosition = (endSeg != null)
@@ -596,7 +596,7 @@ The `ReadOnlySequence<byte>` constructor with `endSegment`/`endIndex` enforces t
        _headConsumedOffset = 0
 
    // current == consumedSeg. It is partially (or fully) consumed.
-   offsetInCurrent = consumedIdx - current.BufferStart
+   offsetInCurrent = consumedIdx
    retiredBytes += offsetInCurrent - _headConsumedOffset
    _head = current
    _headConsumedOffset = offsetInCurrent
@@ -606,8 +606,7 @@ The `ReadOnlySequence<byte>` constructor with `endSegment`/`endIndex` enforces t
 4. Compute new examined position:
    examinedSeg = (Segment)examined.GetObject()
    examinedIdx = examined.GetInteger()
-   _examinedPosition = examinedSeg.RunningIndex
-                       + (examinedIdx - examinedSeg.BufferStart)
+   _examinedPosition = examinedSeg.RunningIndex + examinedIdx
 
 5. Release-store the updated byte count:
    Volatile.Write(ref state.BytesReadPublished, _bytesRead)
