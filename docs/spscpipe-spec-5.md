@@ -45,7 +45,7 @@ The BCL `Pipe` uses a linked list of `BufferSegment`s protected by a `SyncObject
 ## 3. Public API
 
 ```csharp
-public sealed class SpscPipe
+public sealed class SpscPipe : IDisposable
 {
     public SpscPipe();
     public SpscPipe(SpscPipeOptions options);
@@ -54,6 +54,7 @@ public sealed class SpscPipe
     public PipeWriter Writer { get; }
 
     public void Reset();
+    public void Dispose();
 }
 
 public sealed class SpscPipeOptions
@@ -106,6 +107,7 @@ internal struct State
     [FieldOffset(72)]  internal long BytesWrittenPublished;   // writer writes, reader acquires
     [FieldOffset(80)]  internal int WriterCompletionState;    // 0=active, 1=completing, 2=completed
     [FieldOffset(88)]  internal ExceptionDispatchInfo? WriterException;
+    [FieldOffset(96)]  internal Segment? Head;                // first segment ever published; writer writes once, reader acquires once
 
     // ---- Cache line 1: reader-published fields ----
     [FieldOffset(128)] internal long BytesReadPublished;      // reader writes, writer acquires
@@ -159,9 +161,19 @@ internal sealed class SpscPipeReader : PipeReader
     private bool _readInProgress;
     private ReadOnlySequence<byte> _lastReturnedBuffer;
 
-    // Awaiter for ReadAsync:
-    private ManualResetValueTaskSourceCore<ReadResult> _readAwaiter;
+    // Awaiter for ReadAsync (carries ReadSignal, not ReadResult — see below):
+    private ManualResetValueTaskSourceCore<ReadSignal> _readAwaiter;
     private CancellationTokenRegistration _readCtr;
+}
+
+// Signal struct for the read awaiter. The writer must not build a ReadResult
+// (which requires reader-local state); instead it signals with minimal flags.
+// SpscPipeReader implements IValueTaskSource<ReadResult> and translates the
+// signal into a real ReadResult on the reader's continuation thread (§8.7).
+internal readonly struct ReadSignal
+{
+    internal bool IsCanceled { get; init; }
+    internal bool IsCompleted { get; init; }
 }
 ```
 
@@ -310,12 +322,12 @@ seg.Next = null                        // will never be rewritten to non-null by
 prevTail = state.Tail                  // plain read; we are the only writer
 if prevTail is null:
     // First segment ever. state.Tail was null; _head (reader-side) is also null.
-    // We need to publish seg as the new tail AND somehow make the reader find it.
-    // The reader finds the first segment by reading state.Tail, so publishing
-    // state.Tail IS the mechanism.
+    // Publish seg as the new tail. Also record it as the permanent head so the
+    // reader can find the start of the list on first ReadAsync (§7.1 step 4).
     //
     // CRITICAL ORDERING: all writes to seg.* above must be visible to the reader
-    // before the reader observes state.Tail = seg.
+    // before the reader observes state.Head or state.Tail = seg.
+    Volatile.Write(ref state.Head, seg)    // release-store #0 (first segment pointer)
     Volatile.Write(ref state.Tail, seg)    // release-store #1
 else:
     // Not first segment. Link prevTail.Next -> seg, then advance Tail.
@@ -360,7 +372,7 @@ MaybeSignalReaderAwaiter()
 
 **Why three release-stores?** They ensure two distinct happens-before edges:
 
-1. `seg.*` writes happen-before any reader observation of `seg` (via either `prevTail.Next` or `state.Tail`).
+1. `seg.*` writes happen-before any reader observation of `seg` (via `state.Head`, `prevTail.Next`, or `state.Tail`).
 2. `seg.WrittenLength` (and transitively all byte contents via `seg.Memory`) happen-before the reader's observation of `state.BytesWrittenPublished`.
 
 Edge (1) is needed for readers that walk the list. Edge (2) is needed for readers that shortcut via the byte counter (used in the awaiter-signal decision).
@@ -369,7 +381,7 @@ Edge (1) is needed for readers that walk the list. Edge (2) is needed for reader
 
 (There is a defensible alternative design where `state.Tail` is omitted and the reader always traverses to `next == null`. We keep `state.Tail` because it's also the upper bound used by `TryRead` to decide "is there new data?" without traversal.)
 
-**Ordering constraint between release-stores #1 and #2.** They can be in either order, but both must precede release-store #3, because a reader observing `BytesWrittenPublished >= new value` must be able to find segments accounting for those bytes. The order shown (Next first, Tail second, Bytes third) is the conservative one.
+**Ordering constraint between release-stores.** For the non-first case, release-stores #1 and #2 can be in either order, but both must precede release-store #3, because a reader observing `BytesWrittenPublished >= new value` must be able to find segments accounting for those bytes. The order shown (Next first, Tail second, Bytes third) is the conservative one. For the first publication, the same constraint holds: release-stores #0 (Head) and #1 (Tail) must both precede #3.
 
 ### 6.5 Buffer lifetime management
 
@@ -445,7 +457,7 @@ We show that the refcount protocol never permits a buffer to be returned to the 
 - Every reader `ReleaseHolder(seg.Holder)` decrements `Refcount` by 1. The reader only reaches this code via `RetireSegment`, which only runs on segments that are reachable from `_head` via the singly-linked chain — i.e., segments that have been published. By the visibility argument above, the matching increment has already executed and is globally visible.
 - Therefore every decrement is preceded (in the happens-before order) by a matching increment on the same holder, so the sum `1 + (increments) - (decrements)` observed at any point during writer-active time is at least 1.
 
-**Visibility of the reader's refcount decrement.** Before the reader calls `ReleaseHolder(seg.Holder)`, it must first hold a reference to `seg.Holder`. The reader obtains this reference by a plain load of `seg.Holder` inside `RetireSegment`. This plain load is valid — that is, it observes the value written by the writer during segment initialization in §6.4 step 1 — because the segment `seg` was reached by an earlier acquire-load: either `Volatile.Read(ref state.Tail)` in `ReadAsync` (for the first segment) or `Volatile.Read(ref prevSeg.Next)` in sequence traversal (for subsequent segments). Both acquire-loads are paired with writer-side release-stores that were program-order after the writer's initialization of `seg.Holder`; the resulting happens-before edge makes the plain load of `seg.Holder` well-defined.
+**Visibility of the reader's refcount decrement.** Before the reader calls `ReleaseHolder(seg.Holder)`, it must first hold a reference to `seg.Holder`. The reader obtains this reference by a plain load of `seg.Holder` inside `RetireSegment`. This plain load is valid — that is, it observes the value written by the writer during segment initialization in §6.4 step 1 — because the segment `seg` was reached by an earlier acquire-load: either `Volatile.Read(ref state.Head)` in `ReadAsync` (for the first segment, §7.1 step 4) or `Volatile.Read(ref prevSeg.Next)` in sequence traversal (for subsequent segments). Both acquire-loads are paired with writer-side release-stores that were program-order after the writer's initialization of `seg.Holder`; the resulting happens-before edge makes the plain load of `seg.Holder` well-defined.
 
 The reader's `Interlocked.Decrement(ref seg.Holder.Refcount)` is, by the §5 axiom, a full fence. It is globally ordered after the reader's plain load of `seg.Holder` (which is program-order before it). It is also globally ordered after all of the reader's prior consumption of `seg`'s bytes (same reason). The reader only calls `RetireSegment` on segments it has fully consumed per `AdvanceTo` — the caller's `consumed` position has moved past them, meaning the caller's contract obligation (to not access the retired portion of the prior `ReadOnlySequence<byte>`) has taken effect. Therefore a reader that decrements `Refcount` to 0 and proceeds to `Pool.Return(holder.Owner)` has demonstrably finished all reads of the buffer contents before returning the buffer. The pool-return does not race with in-flight reader access to the buffer.
 
@@ -508,8 +520,9 @@ Algorithm (shared core, with `TryRead` skipping the await):
        writerDone = Volatile.Read(ref state.WriterCompletionState) == 2
 
 4. If _head == null and tail != null:
-       // First read ever. _head was null; pick up tail as the first segment.
-       _head = FindFirstSegment(tail)    // see below
+       // First read ever. Acquire-load the permanent head pointer set by the
+       // writer's first publication (§6.4).
+       _head = Volatile.Read(ref state.Head)
        _headConsumedOffset = 0
 
 5. Determine the end of the available sequence:
@@ -540,22 +553,11 @@ Algorithm (shared core, with `TryRead` skipping the await):
    ReadAsync: arm the read awaiter (§8.3) and return its ValueTask.
 ```
 
-**`FindFirstSegment(tail)`**: when `_head` is null and `tail` is non-null, we need to find the *first* segment in the list, not the tail. Since the list is singly-linked and we don't maintain a head pointer from the writer side, we keep a reader-side cache. But the *very first* time, `_head` is null and we have no reference to the first segment.
+**First-read initialization (step 4):** the writer publishes `state.Head` exactly once, during the first `PublishActiveSegment` call (§6.4). It is a permanent pointer to the first segment ever published and is never updated again. On the reader's first `ReadAsync`, `_head` is null and `tail` is non-null (at least one segment exists). The reader initializes `_head` by acquire-loading `state.Head`.
 
-Two solutions:
+This is correct regardless of how many segments the writer has published before the reader's first read: `state.Head` always points to the first segment, and the reader traverses the complete chain from there. The earlier design of setting `_head = tail` was incorrect when the writer published multiple segments before the first read — it lost all segments except the most recent.
 
-- **Solution 1:** writer maintains `state.Head` as a "first segment ever published" pointer, set by the very first publication and never changed. Reader reads it once on first `ReadAsync`.
-- **Solution 2:** writer's first publication sets `state.Tail` pointing at the first segment; since it's the only segment, `tail == firstSegment`, so `_head = tail` is correct. Subsequent publications chain via `Next`, and the reader's `_head` evolves independently.
-
-Solution 2 is simpler and correct. The writer's publication protocol (§6.4, first-segment case) does `Volatile.Write(ref state.Tail, seg)` with no prior link, so the reader observing `state.Tail = seg` has seen the complete segment (release-acquire edge) and can use it as both head and tail.
-
-Remove the `FindFirstSegment` call; step 4 becomes:
-
-```
-4. If _head == null and tail != null:
-       _head = tail
-       _headConsumedOffset = 0
-```
+The release-acquire edge (writer's `Volatile.Write(ref state.Head, seg)` in §6.4 paired with the reader's `Volatile.Read(ref state.Head)`) ensures that all of the first segment's fields are visible to the reader. The reader then traverses forward from `_head` via `Volatile.Read(ref seg.Next)` as usual (§7.2).
 
 ### 7.2 The traversal invariant
 
@@ -628,7 +630,7 @@ SegmentPool.Return(seg)
 4. Signal writer awaiter (§8.4).
 ```
 
-Note: after reader completion, the writer may still publish segments before observing the reader completion. Those segments are never retired by the reader. We leak them unless the writer, on next `FlushAsync`, checks reader completion *before* publishing. §6.3 step 3 does this; but between the check and the publication, the reader might complete. This window causes at most one unretired segment. On writer's own `Complete`, it should (defensively) retire any unpublished state, and the single-segment leak from publications after reader completion is accepted as a rare-case allocation (not a long-term leak — the segment and buffer are still referenced from `state.Tail` and freed when the whole `SpscPipe` is GC'd).
+Note: after reader completion, the writer may still publish segments before observing the reader completion. Those segments are never retired by the reader. We leak them unless the writer, on next `FlushAsync`, checks reader completion *before* publishing. §6.3 step 3 does this; but between the check and the publication, the reader might complete. This window causes at most one unretired segment. These orphaned segments (and their buffer holders) are cleaned up by `SpscPipe.Dispose()` (§10.6), which walks any segments still reachable from `state.Head` forward and releases their holders and buffers to the pool. Callers that cannot guarantee `Dispose` is called benefit from the safety-net finalizer, which performs the same walk.
 
 ### 7.5 `void CancelPendingRead()`
 
@@ -672,8 +674,12 @@ if (awaiterState == Idle) return;
 var prev = Interlocked.CompareExchange(
     ref state.ReaderAwaiterState, Signaled, Armed);
 if (prev == Armed):
-    // We won the race. Complete the reader's ValueTaskSource.
-    _reader._readAwaiter.SetResult(ComputeReadResult());
+    // We won the race. Signal the reader with completion flags only.
+    // The reader builds the real ReadResult from reader-local state when
+    // the continuation resumes on the reader's scheduled thread (§8.7).
+    var writerDone = Volatile.Read(ref state.WriterCompletionState) == 2;
+    _reader._readAwaiter.SetResult(new ReadSignal(
+        IsCanceled: false, IsCompleted: writerDone));
 ```
 
 The `Interlocked.MemoryBarrier()` by the §5 axiom is a full sequentially-consistent fence: every store program-order before it is globally ordered before every load program-order after it. This orders the publication stores globally before the awaiter-state load, which is what the double-check protocol requires on this side.
@@ -733,10 +739,13 @@ _readCtr = ct.UnsafeRegister(static (s, t) =>
     var prev = Interlocked.CompareExchange(
         ref r.state.ReaderAwaiterState, Signaled, Armed);
     if (prev == Armed):
-        r._readAwaiter.SetResult(CanceledReadResult);
+        r._readAwaiter.SetResult(new ReadSignal(IsCanceled: true, IsCompleted: false));
 }, this);
 
-return new ValueTask<ReadResult>(_readAwaiter, _readAwaiter.Version);
+// SpscPipeReader implements IValueTaskSource<ReadResult>; its GetResult
+// retrieves the ReadSignal from _readAwaiter and builds the real ReadResult
+// from reader-local state (safe: continuation runs on the reader's scheduler).
+return new ValueTask<ReadResult>(this, _readAwaiter.Version);
 ```
 
 **Why `Interlocked.MemoryBarrier()` in step B?** The double-check protocol requires that on both sides, the "publish my state" store happens globally before the "check other side's state" load. Release-acquire is not enough: a release-store followed by an acquire-load on the same thread may be reordered relative to other memory operations (StoreLoad reordering is permitted by release/acquire alone). Without the fence:
@@ -833,10 +842,14 @@ The awaiter state machine already handles cancellation as just another signaler.
 The awaiter state we maintain (`ReaderAwaiterState`, `WriterAwaiterState`) is a separate coordination layer *on top* of `ManualResetValueTaskSourceCore<T>`. The latter handles the continuation delivery (running the `await` continuation with the configured scheduler); our state machine handles the "do I need to signal?" decision.
 
 Specifically:
-- When the waiter transitions `Idle → Armed`, it calls `_awaiter.Reset()` and prepares to return `new ValueTask(ref _awaiter, _awaiter.Version)`.
+- When the waiter transitions `Idle → Armed`, it calls `_awaiter.Reset()` and prepares to return `new ValueTask<T>(source, _awaiter.Version)`, where `source` is the containing class implementing `IValueTaskSource<T>`.
 - When the signaler wins the CAS `Armed → Signaled`, it calls `_awaiter.SetResult(...)`, which schedules the continuation.
 - The waiter's `ValueTask` completes when the continuation runs.
 - `Version` disambiguates reuse of the `ValueTaskSource` — each arm cycle increments it via `Reset()`.
+
+**Reader-side translation.** The reader's `ManualResetValueTaskSourceCore` carries `ReadSignal` (§4.4), not `ReadResult`. `SpscPipeReader` implements `IValueTaskSource<ReadResult>` and bridges the gap: its `GetResult` retrieves the `ReadSignal` from the core, resets `ReaderAwaiterState` to `Idle`, disposes the cancellation registration, and — for non-canceled signals — builds the real `ReadResult` by re-executing the read logic (§7.1 steps 3–7) from reader-local state. This runs on the reader's scheduled continuation thread, so accessing reader-local fields is safe under the SPSC invariant.
+
+The writer-side flush awaiter does not need this treatment: `FlushResult` depends only on writer-local and shared state that the reader (the signaler) can safely read.
 
 `ManualResetValueTaskSourceCore` is itself using `Interlocked.CompareExchange` internally for its continuation slot. That's unavoidable for any `IValueTaskSource`-backed awaiter and is considered acceptable; the "no Interlocked on hot path" goal applies to our bespoke coordination, not to the .NET async infrastructure.
 
@@ -874,7 +887,7 @@ Positions must come from the most recent `ReadAsync` result. Tracked via `_readI
 
 Writer completes → reader sees `WriterCompletionState == 2` on next `ReadAsync`'s acquire-load of that field. Bytes published before completion are visible via the normal mechanism (release-store of `Tail` and `BytesWrittenPublished`).
 
-Reader completes → writer sees `ReaderCompletionState == 2` on next `FlushAsync`'s acquire-load. Ongoing buffers may leak momentarily (§7.4) but are freed on `SpscPipe` finalization.
+Reader completes → writer sees `ReaderCompletionState == 2` on next `FlushAsync`'s acquire-load. Ongoing buffers may leak momentarily (§7.4) but are freed by `SpscPipe.Dispose()` or, as a safety net, the finalizer (§10.6).
 
 ### 10.4 Exception propagation
 
@@ -886,7 +899,34 @@ Symmetric for reader-to-writer exception propagation on `FlushAsync`.
 
 ### 10.5 Reset
 
-`Reset()` requires both ends completed. Returns all segments and holders to pools. Zeroes all fields. Re-initializes both awaiters (incrementing `Version`).
+`Reset()` requires both ends completed. Walks any segments still reachable from `state.Head` forward (following `Next` pointers), releasing holders and returning buffers and segments to their pools — same cleanup walk as `Dispose()` (§10.6). Zeroes all fields including `state.Head`. Re-initializes both awaiters (incrementing `Version`).
+
+### 10.6 Disposal and finalization
+
+`SpscPipe` implements `IDisposable`. `Dispose()` performs a deterministic cleanup of any segments and buffers still outstanding — including orphaned segments published after reader completion (§7.4).
+
+```
+Dispose():
+1. Walk from state.Head forward, following Next pointers, until null.
+   For each segment:
+       if seg.Holder != null:
+           ReleaseHolder(seg.Holder)    // §6.5.2
+           seg.Holder = null
+       seg.Reset()
+       SegmentPool.Return(seg)
+
+2. If _activeBufferHolder != null (writer never rotated/completed):
+       ReleaseHolder(_activeBufferHolder)
+       _activeBufferHolder = null
+
+3. Null out state.Head, state.Tail. Zero byte counters.
+```
+
+`Dispose()` is safe to call after both sides have completed, or after only one side has completed (e.g., the writer completed but the reader abandoned). It is **not** safe to call concurrently with active reader or writer operations — the caller must ensure no operations are in flight.
+
+**Finalizer.** `SpscPipe` includes a weak safety-net finalizer that calls the same cleanup walk. For `ArrayPool<byte>.Shared`-backed buffers this prevents pool pressure under abandoned pipes. For custom `MemoryPool<byte>` implementations backed by pinned or native memory (§13), it prevents genuine resource leaks. The finalizer is suppressed by `Dispose()` via `GC.SuppressFinalize(this)`.
+
+**`Reset()` vs `Dispose()`:** `Reset()` (§10.5) performs the same segment/holder cleanup walk, then re-initializes the pipe for reuse. `Dispose()` performs cleanup only and leaves the pipe in a terminal state. Both share the same internal walk logic.
 
 ---
 
@@ -895,6 +935,7 @@ Symmetric for reader-to-writer exception propagation on `FlushAsync`.
 | Location | Writer | Reader | Ordering |
 |---|---|---|---|
 | `state.Tail` | W | R | release-store (writer) / acquire-load (reader) |
+| `state.Head` | W (once) | R (once) | release-store (writer, first publication only) / acquire-load (reader, first read only) |
 | `seg.Next` (for any seg) | W (once) | R | release-store (writer) / acquire-load (reader) |
 | `seg.*` initialization fields | W | R | plain; visibility covered by release-store of `Tail` or `prevSeg.Next` |
 | `state.BytesWrittenPublished` | W | R | release-store / acquire-load |
