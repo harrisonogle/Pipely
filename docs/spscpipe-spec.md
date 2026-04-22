@@ -33,12 +33,12 @@ The BCL `Pipe` uses a linked list of `BufferSegment`s protected by a `SyncObject
 
 - **Segment**: a node in a singly-linked list, holding a range of bytes (`{ buffer, start, writtenLength, runningIndex, next }`) and inheriting from `ReadOnlySequenceSegment<byte>`.
 - **Active buffer**: the pooled backing buffer the writer is currently filling. Not yet visible to the reader.
-- **Active segment**: the segment being constructed from the active buffer, not yet linked into the list. Optional — may be deferred until publication.
-- **Published segment**: a segment that has been linked into the list and is visible to the reader.
+- **Unpublished chain**: a writer-local singly-linked list of segments that have been built from completed (rotated-out) active buffers, plus — at `FlushAsync`/`Complete` time — a terminal segment for the current active buffer's unflushed bytes. Invisible to the reader until the chain is spliced onto `state.Tail` (§6.4).
+- **Published segment**: a segment that has been linked into the reader-visible list (i.e., the chain it belonged to has been spliced) and is reachable from `state.Head` through acquire-loaded `Next` pointers.
 - **Retired segment**: a published segment whose bytes are fully consumed and whose buffer has been returned to the pool; the segment object has been returned to the segment pool.
 - **`head`**: pointer to the first non-retired segment. Reader-owned.
 - **`tail`**: pointer to the most recently published segment. Writer-owned.
-- **`_unpublishedTail`**: pointer to the in-progress segment being grown by the writer before publication. Writer-local; not visible to the reader.
+- **`_unpublishedHead` / `_unpublishedTail`**: writer-local pointers to the first and last segments of the unpublished chain. Both null when the chain is empty. Not visible to the reader.
 
 ---
 
@@ -96,33 +96,42 @@ internal sealed class Segment : ReadOnlySequenceSegment<byte>
 
 ### 4.2 Shared state layout
 
-All cross-thread fields live in a `State` object with explicit cache-line padding. A 64-byte cache line is assumed; on ARM64 platforms with 128-byte lines the layout is wasteful but correct. The `FieldOffset` layout prevents false sharing between groups *within* the struct. However, it does not guarantee 64-byte alignment of the struct itself relative to physical cache lines — the CLR aligns heap objects to pointer boundaries (8 bytes on 64-bit), not cache-line boundaries. In practice, the padding between groups absorbs misalignment; worst case, one cache line straddles two groups, but no two groups share a single cache line.
+All cross-thread fields live in a `State` struct with explicit cache-line padding. A 64-byte cache line is assumed; on ARM64 platforms with 128-byte lines the layout is still correct, just wasteful.
+
+The CLR aligns heap objects to pointer boundaries (8 bytes on 64-bit), not cache-line boundaries. A naïve layout that merely pads groups to 64 bytes fails: if the struct base `A` satisfies `A mod 64 ∈ {8, 16, …, 56}`, a 64-byte group's used bytes can straddle a cache-line boundary, and the next group's used bytes can land in the same straddled line. The mitigation is 128-byte **spacing** between groups: even if group N's used bytes straddle lines `k` and `k+1`, the 64 bytes of pad before group N+1 push it onto lines `k+2` and `k+3`. No two groups can ever share a cache line regardless of `A mod 64`.
 
 ```csharp
-[StructLayout(LayoutKind.Explicit, Size = 384)]
+[StructLayout(LayoutKind.Explicit, Size = 512)]
 internal struct State
 {
-    // ---- Cache line 0: writer-published fields ----
+    // ---- Leading pad (0-63): shields Group 0 from adjacent heap allocations ----
+
+    // ---- Group 0 (64-191): writer-published fields ----
     [FieldOffset(64)]  internal Segment? Tail;                // writer writes, reader acquires
     [FieldOffset(72)]  internal long BytesWrittenPublished;   // writer writes, reader acquires
     [FieldOffset(80)]  internal int WriterCompletionState;    // 0=active, 2=completed
     [FieldOffset(88)]  internal ExceptionDispatchInfo? WriterException;
     [FieldOffset(96)]  internal Segment? Head;                // first segment ever published; writer writes once, reader acquires once
+    // (104-191 are pad within Group 0)
 
-    // ---- Cache line 1: reader-published fields ----
-    [FieldOffset(128)] internal long BytesReadPublished;      // reader writes, writer acquires
-    [FieldOffset(136)] internal int ReaderCompletionState;
-    [FieldOffset(144)] internal ExceptionDispatchInfo? ReaderException;
+    // ---- Group 1 (192-319): reader-published fields ----
+    [FieldOffset(192)] internal long BytesReadPublished;      // reader writes, writer acquires
+    [FieldOffset(200)] internal int ReaderCompletionState;
+    [FieldOffset(208)] internal ExceptionDispatchInfo? ReaderException;
+    // (216-319 are pad within Group 1)
 
-    // ---- Cache line 2: awaiter coordination ----
-    [FieldOffset(192)] internal int ReaderAwaiterState;       // see §8
-    [FieldOffset(200)] internal int WriterAwaiterState;       // see §8
+    // ---- Group 2 (320-447): awaiter coordination ----
+    [FieldOffset(320)] internal int ReaderAwaiterState;       // see §8
+    [FieldOffset(328)] internal int WriterAwaiterState;       // see §8
+    // (332-447 are pad within Group 2)
 
-    // ---- Cache line 3: trailing pad to reduce false-sharing with adjacent heap allocations ----
+    // ---- Trailing pad (448-511): shields Group 2 from adjacent heap allocations ----
 }
 ```
 
-Fields on cache line 0 are written only by the writer. Fields on cache line 1 are written only by the reader. Cache line 2 is shared but accessed via release/acquire with the double-check pattern (§8).
+Group 0 is written only by the writer. Group 1 is written only by the reader. Group 2 is shared but accessed via release/acquire with the double-check pattern (§8). The struct is 512 bytes; the extra 128 bytes over a naïve layout buy alignment-invariance — worth it for a per-pipe allocation.
+
+**True 64-byte alignment (v2 option).** If memory pressure on high-fan-out workloads justifies it, the struct can be reshaped as a pinned `byte[]` allocated via `GC.AllocateUninitializedArray<byte>(size + 63, pinned: true)`, with fields projected through `Unsafe.As<byte, T>` at a 64-byte-aligned offset inside the overallocated region. This restores the 384-byte size at the cost of replacing direct field access (`state.Tail = x`) with helpers (`ref StateFields.Tail(ref storage)`). Not worth the ergonomic hit for v1; revisit if profiles demand it.
 
 ### 4.3 Writer-local state
 
@@ -131,18 +140,27 @@ Not in `State`; lives on the `PipeWriter` subclass:
 ```csharp
 internal sealed class SpscPipeWriter : PipeWriter
 {
-    private Segment? _unpublishedTail;    // in-progress segment (not yet linked)
+    // Unpublished chain (writer-local, not visible to reader):
+    private Segment? _unpublishedHead;    // first segment in chain (null if chain empty)
+    private Segment? _unpublishedTail;    // last segment in chain (null iff _unpublishedHead is null)
+    private long _unpublishedBytes;       // sum of WrittenLength over the chain; used for RunningIndex of new entries
+
+    // Active buffer state:
     private BufferHolder? _activeBufferHolder;  // holder for the buffer currently being filled
     private int _activeBufferWritten;     // write offset within active buffer
     private int _activeBufferCapacity;    // cached Memory.Length
     private int _unflushedStart;          // start offset of unflushed bytes within active buffer
-    private long _bytesWritten;           // mirror of BytesWrittenPublished, pre-release
+
+    // Byte accounting:
+    private long _bytesWritten;           // mirror of BytesWrittenPublished, pre-release (updated only on splice)
 
     // Awaiter for FlushAsync backpressure:
     private ManualResetValueTaskSourceCore<FlushResult> _flushAwaiter;
     private CancellationTokenRegistration _flushCtr;
 }
 ```
+
+The `_unpublishedHead`/`_unpublishedTail` pair exists because `GetMemory` may rotate to a new backing buffer mid-frame (the current buffer ran out of room), and the rotated-out buffer still holds unflushed bytes that must not yet be visible to the reader — preserving the BCL contract that bytes become visible only at `FlushAsync`. Rather than attempting to defer `Segment` object creation, the writer constructs a `Segment` eagerly at rotation time and appends it to the unpublished chain (§6.4.1). The chain is spliced into the reader-visible list in one shot by `FlushAsync`/`Complete` (§6.4.2).
 
 ### 4.4 Reader-local state
 
@@ -219,13 +237,16 @@ remaining = _activeBufferCapacity - _activeBufferWritten
 if remaining >= desiredSize:
     return _activeBufferHolder.Owner.Memory.Slice(_activeBufferWritten)
 
-// Not enough room. Flush any unflushed bytes, then rotate to a new buffer.
+// Not enough room. Append any unflushed bytes in this buffer to the
+// unpublished chain (writer-local; NOT visible to the reader), then
+// rotate to a new buffer. Visibility of these bytes waits until FlushAsync.
 if _unflushedStart < _activeBufferWritten:
-    PublishActiveSegment()
+    AppendActiveSegmentToUnpublished()
 
-// Release the writer's reference to the current holder. Outstanding segments
-// retain their own references via the refcount (§6.5); the buffer returns to
-// the pool when the last of them is retired.
+// Release the writer's reference to the current holder. Segments appended
+// to the unpublished chain retain their own references via the refcount
+// (§6.5); the buffer returns to the pool when the last of them is retired
+// (or at Dispose, if the chain never gets spliced).
 ReleaseHolder(_activeBufferHolder)
 _activeBufferHolder = null
 
@@ -246,9 +267,9 @@ _activeBufferWritten  = 0
 _unflushedStart       = 0
 ```
 
-**Sub-call: `PublishActiveSegment()`** (§6.4).
+**Sub-call: `AppendActiveSegmentToUnpublished()`** (§6.4.1). Note that this is a *writer-local* operation — it does not release-store anything to `state.Tail`, `state.Head`, or any `seg.Next` that the reader might observe. The reader's view of published bytes does not change as a result of buffer rotation alone.
 
-Note that `GetMemory` never blocks and never touches shared state. It can allocate (buffer rental, segment rental) but in steady state all of these come from pools. It does not check backpressure; backpressure is entirely a `FlushAsync` concern.
+Note that `GetMemory` never blocks and never touches reader-visible shared state. It can allocate (buffer rental, segment rental) but in steady state all of these come from pools. It does not check backpressure; backpressure is entirely a `FlushAsync` concern.
 
 ### 6.2 `void Advance(int bytes)`
 
@@ -268,8 +289,12 @@ Algorithm:
 1. If ct.IsCancellationRequested:
        return ValueTask from FlushResult { IsCanceled = true, IsCompleted = readerCompleted }
 
-2. If _unflushedStart < _activeBufferWritten:
-       PublishActiveSegment()
+2. Append the current active buffer's unflushed bytes to the unpublished chain,
+   then splice the whole chain into state.Tail so the reader can see it:
+       if _unflushedStart < _activeBufferWritten:
+           AppendActiveSegmentToUnpublished()       // §6.4.1
+       if _unpublishedHead != null:
+           SpliceUnpublishedChain()                 // §6.4.2 — the publication point
 
 3. Load reader completion state (acquire):
        readerDone = Volatile.Read(ref state.ReaderCompletionState) == 2
@@ -286,81 +311,114 @@ Algorithm:
 6. Slow path: need to wait. See §8.4 for the exact awaiter arming sequence.
 ```
 
-Step 5's single acquire-load is the only synchronization on the fast path. No lock, no CAS.
+Step 5's single acquire-load is the only synchronization on the fast path after the splice. Step 2 performs the publication: a single splice covers all segments rotated out since the last flush plus the tail fragment of the current buffer. No lock, no CAS in the steady-state path.
 
-### 6.4 `PublishActiveSegment()` — the publication protocol
+### 6.4 The publication protocol
 
-This is the critical operation. It makes unflushed bytes visible to the reader.
+Publication happens in two phases, separated in time by arbitrary buffer rotations:
+
+- **§6.4.1 `AppendActiveSegmentToUnpublished()`** — writer-local only. Builds a `Segment` for the current active buffer's unflushed bytes and appends it to `_unpublishedHead`/`_unpublishedTail`. Invoked from `GetMemory` (on rotation) and from `FlushAsync`/`Complete` (before the splice).
+- **§6.4.2 `SpliceUnpublishedChain()`** — the release-store sequence that makes the entire unpublished chain visible to the reader in one shot. Invoked from `FlushAsync` and `Complete`.
+
+#### 6.4.1 `AppendActiveSegmentToUnpublished()`
 
 ```
 // Preconditions:
 //   _activeBufferHolder != null
 //   _unflushedStart < _activeBufferWritten
-//   _unpublishedTail is null (we publish eagerly in this algorithm)
 
-// Step 1: Rent a segment and initialize it from writer-local state.
-//         All writes here are to writer-local or not-yet-published fields,
-//         except the Interlocked.Increment on the shared Refcount. That
-//         increment must happen before the segment becomes reachable, so
-//         that a reader observing the segment also observes the matching
-//         increment (§6.5.3). Interlocked.Increment is a full fence (§5),
-//         so it is ordered globally before the release-stores in Step 2.
+// Step 1: Rent and initialize a segment. All writes below are to writer-local
+//         memory (the segment is not yet reachable by the reader), except for
+//         the Interlocked.Increment on the shared Refcount. That increment
+//         must happen before the segment becomes reader-reachable at splice
+//         time, so any reader that later observes the segment also observes
+//         the matching increment (§6.5.3). Interlocked.Increment is a full
+//         fence (§5), so it is globally ordered before the release-stores
+//         performed in §6.4.2.
 Interlocked.Increment(ref _activeBufferHolder.Refcount)
 seg = RentSegment()
-seg.Holder = _activeBufferHolder       // buffer may be shared with sibling segments
+seg.Holder = _activeBufferHolder       // buffer may be shared with sibling segments in the chain
 seg.BufferStart = _unflushedStart
 seg.WrittenLength = _activeBufferWritten - _unflushedStart
 seg.Memory = _activeBufferHolder.Owner.Memory.Slice(seg.BufferStart, seg.WrittenLength)
-seg.RunningIndex = _bytesWritten       // absolute byte position of this segment's start
-seg.Next = null                        // will never be rewritten to non-null by anyone
-                                       //   except us, below
+seg.RunningIndex = _bytesWritten + _unpublishedBytes
+                                       // absolute byte position of this segment's start,
+                                       // counting earlier segments in the chain that are
+                                       // also awaiting splice
+seg.Next = null                        // terminal until a later Append or splice sets it
 
-// Step 2: Link into the list.
-//         state.Tail is writer-owned. There is no concurrent writer of state.Tail
-//         or of tail.Next, because SPSC.
-prevTail = state.Tail                  // plain read; we are the only writer
+// Step 2: Link onto the writer-local chain. All writes here are plain —
+//         the reader cannot observe these fields until §6.4.2's release-stores
+//         establish the happens-before edge.
+if _unpublishedTail == null:
+    _unpublishedHead = seg
+else:
+    _unpublishedTail.Next = seg        // plain write; visibility deferred to splice
+_unpublishedTail = seg
+_unpublishedBytes += seg.WrittenLength
+
+// Step 3: Update writer-local accounting.
+_unflushedStart = _activeBufferWritten
+```
+
+Plain writes to `_unpublishedTail.Next` inside the chain are safe because the reader's only route to these segments is through a `Volatile.Read`/`Volatile.Write` release-acquire pair established in §6.4.2. The acquire-load of `state.Tail` (or `prevTail.Next`) at the splice point happens-before the reader's subsequent traversal, making every prior plain write to in-chain `Next` pointers and `seg.*` fields visible.
+
+#### 6.4.2 `SpliceUnpublishedChain()` — the publication point
+
+This is the critical operation. A single invocation publishes every segment currently in the unpublished chain to the reader atomically (in happens-before terms).
+
+```
+// Preconditions:
+//   _unpublishedHead != null (caller must check)
+
+// Step 1: Snapshot the current tail; identify whether this is the first splice
+//         of the pipe's lifetime.
+prevTail = state.Tail                  // plain read; we are the only writer of state.Tail
+
+// Step 2: Publish the chain by making its head reachable. Two cases.
 if prevTail is null:
-    // First segment ever. state.Tail was null; _head (reader-side) is also null.
-    // Publish seg as the new tail. Also record it as the permanent head so the
-    // reader can find the start of the list on first ReadAsync (§7.1 step 4).
+    // First splice ever. state.Head has been null up to this point; set it
+    // to the chain head so the reader can find the start of the list on its
+    // first ReadAsync (§7.1 step 4). Then set state.Tail to the chain tail.
     //
-    // CRITICAL ORDERING: all writes to seg.* above must be visible to the reader
-    // before the reader observes state.Head or state.Tail = seg.
+    // CRITICAL ORDERING: all writes to every segment in the chain (including
+    // intra-chain plain Next writes from §6.4.1 step 2) must be visible before
+    // the reader observes state.Head or state.Tail pointing into the chain.
     //
     // Head MUST be written before Tail. The reader reads Tail before Head
-    // (§7.1 steps 3–4); the acquire-load of Tail seeing this segment
+    // (§7.1 steps 3–4); the acquire-load of Tail seeing a chain segment
     // establishes a happens-before edge that makes the preceding release-store
     // of Head visible. Reversing the writer-side order would allow the reader
-    // to observe Tail = seg while Head is still null.
-    Volatile.Write(ref state.Head, seg)    // release-store #0 (first segment pointer)
-    Volatile.Write(ref state.Tail, seg)    // release-store #1
+    // to observe Tail = chainTail while Head is still null.
+    Volatile.Write(ref state.Head, _unpublishedHead)     // release-store #0 (first-ever head)
+    Volatile.Write(ref state.Tail, _unpublishedTail)     // release-store #1
 else:
-    // Not first segment. Link prevTail.Next -> seg, then advance Tail.
+    // Subsequent splice. Link prevTail.Next -> _unpublishedHead, then advance Tail.
     //
     // CRITICAL ORDERING:
-    //   (a) All writes to seg.* must be visible to the reader before the reader
-    //       observes prevTail.Next = seg.
-    //   (b) All writes to seg.* must ALSO be visible before state.Tail = seg.
+    //   (a) All writes to every segment in the chain (including intra-chain
+    //       plain Next writes) must be visible to the reader before the reader
+    //       observes prevTail.Next pointing into the chain.
+    //   (b) The same writes must ALSO be visible before state.Tail advances.
     //
-    // The reader can reach seg via two paths:
-    //   - Traversing from _head following Next pointers, where it will eventually
-    //     do Volatile.Read(prevTail.Next) and observe seg.
-    //   - Reading state.Tail directly (we use this as the upper bound for
-    //     traversal — see §7.1).
+    // The reader can reach chain segments via two paths:
+    //   - Traversing from _head via Volatile.Read(prevSeg.Next), eventually
+    //     observing prevTail.Next == _unpublishedHead, then following plain
+    //     Next pointers inside the chain.
+    //   - Reading state.Tail directly (the upper bound for traversal — §7.1/§7.2).
     //
-    // Both paths need seg.* to be fully initialized before they see seg. We achieve
+    // Both paths need full chain initialization to be visible first. We achieve
     // this with release-stores on BOTH prevTail.Next and state.Tail.
-    Volatile.Write(ref prevTail.Next, seg)    // release-store #1 (Next pointer)
-    Volatile.Write(ref state.Tail, seg)       // release-store #2 (Tail pointer)
+    Volatile.Write(ref prevTail.Next, _unpublishedHead)  // release-store #1
+    Volatile.Write(ref state.Tail, _unpublishedTail)     // release-store #2
 
-// Step 3: Update byte accounting.
-_bytesWritten += seg.WrittenLength
+// Step 3: Update byte accounting. _bytesWritten advances by the whole chain.
+_bytesWritten += _unpublishedBytes
 //
 // The reader observes new bytes by one of:
 //   (i)  Acquire-loading state.Tail and traversing. The segment lengths carry
 //        the byte count; the reader doesn't strictly need BytesWrittenPublished
-//        for availability, only for backpressure signaling (telling us it's
-//        drained).
+//        for availability, only for backpressure signaling.
 //   (ii) Acquire-loading state.BytesWrittenPublished to know how much total
 //        data is available without walking segments.
 //
@@ -368,8 +426,10 @@ _bytesWritten += seg.WrittenLength
 // coordination in §8:
 Volatile.Write(ref state.BytesWrittenPublished, _bytesWritten)    // release-store #3
 
-// Step 4: Update writer-local accounting.
-_unflushedStart = _activeBufferWritten
+// Step 4: Clear the unpublished chain — its segments are now reader-reachable.
+_unpublishedHead = null
+_unpublishedTail = null
+_unpublishedBytes = 0
 
 // Step 5: Signal the reader if it's waiting. See §8.2.
 MaybeSignalReaderAwaiter()
@@ -377,20 +437,22 @@ MaybeSignalReaderAwaiter()
 
 **Why three release-stores?** They ensure two distinct happens-before edges:
 
-1. `seg.*` writes happen-before any reader observation of `seg` (via `state.Head`, `prevTail.Next`, or `state.Tail`).
-2. `seg.WrittenLength` (and transitively all byte contents via `seg.Memory`) happen-before the reader's observation of `state.BytesWrittenPublished`.
+1. All writes across every segment in the chain (field initialization, intra-chain plain `Next` writes, refcount increments) happen-before any reader observation of any chain segment (via `state.Head`, `prevTail.Next`, or `state.Tail`).
+2. `seg.WrittenLength` for every chain segment (and transitively all byte contents via `seg.Memory`) happens-before the reader's observation of `state.BytesWrittenPublished`.
 
 Edge (1) is needed for readers that walk the list. Edge (2) is needed for readers that shortcut via the byte counter (used in the awaiter-signal decision).
 
-**Why is release-store #2 necessary if #1 already published `seg`?** Because the reader may have been parked with a cached `state.Tail` from *before* this publication, and on wakeup it needs a fresh upper bound. Setting `state.Tail` to `seg` is how the reader learns "there is at least this much available." Without it, a reader that woke up and traversed `_head.Next → ... → prevTail` would see `prevTail.Next == seg` (good) but would have no signal that `seg` is the *new* tail — it would have to follow `seg.Next` and get `null`, at which point it concludes `seg` is the tail. That actually works, but only if we can guarantee `seg.Next` is `null` at the time of the read, which requires us to have not yet started a next publication. To avoid depending on that timing, we publish `state.Tail` explicitly.
+**Why is release-store #2 necessary if #1 already published the chain?** Because the reader may have been parked with a cached `state.Tail` from *before* this splice, and on wakeup it needs a fresh upper bound. Setting `state.Tail` to `_unpublishedTail` is how the reader learns "there is at least this much available." Without it, a reader that woke up and traversed `_head.Next → ... → prevTail` would see `prevTail.Next == _unpublishedHead` (good) and could follow the chain to its terminus where `Next == null`, concluding that terminus is the tail. That works, but only if we can guarantee no *next* splice is concurrent — which in SPSC is true for the thread itself but depends on ordering between the splice and any subsequent `Append`. To avoid depending on that timing, we publish `state.Tail` explicitly.
 
 (There is a defensible alternative design where `state.Tail` is omitted and the reader always traverses to `next == null`. We keep `state.Tail` because it's also the upper bound used by `TryRead` to decide "is there new data?" without traversal.)
 
-**Ordering constraint between release-stores.** For the non-first case, release-stores #1 and #2 can be in either order, but both must precede release-store #3, because a reader observing `BytesWrittenPublished >= new value` must be able to find segments accounting for those bytes. The order shown (Next first, Tail second, Bytes third) is the conservative one. For the first publication, the same constraint holds: release-stores #0 (Head) and #1 (Tail) must both precede #3.
+**Ordering constraint between release-stores.** For the non-first case, release-stores #1 and #2 can be in either order, but both must precede release-store #3, because a reader observing `BytesWrittenPublished >= new value` must be able to find segments accounting for those bytes. The order shown (Next first, Tail second, Bytes third) is the conservative one. For the first splice, the same constraint holds: release-stores #0 (Head) and #1 (Tail) must both precede #3.
+
+**Single-segment chains.** When `_unpublishedHead == _unpublishedTail` (a chain of one), the algorithm degenerates to the single-segment publication pattern: release-store `prevTail.Next = seg`, release-store `state.Tail = seg`, release-store `BytesWrittenPublished`. This is the common case for workloads that flush more often than they rotate buffers.
 
 ### 6.5 Buffer lifetime management
 
-The publication algorithm permits multiple segments to share a single backing buffer: after `PublishActiveSegment`, `_activeBufferWritten < _activeBufferCapacity`, and the next `Advance`/`FlushAsync` cycle produces another segment drawing from the same buffer. This is essential for avoiding pool churn under small flushes — without sharing, a 100-byte flush with a 4 KiB `MinimumSegmentSize` would consume an entire buffer.
+The publication algorithm permits multiple segments to share a single backing buffer: after `AppendActiveSegmentToUnpublished` (§6.4.1), `_activeBufferWritten < _activeBufferCapacity`, and the next `Advance`/`FlushAsync` cycle produces another segment drawing from the same buffer. This is essential for avoiding pool churn under small flushes — without sharing, a 100-byte flush with a 4 KiB `MinimumSegmentSize` would consume an entire buffer.
 
 Because multiple segments may hold references to the same buffer, the buffer cannot be returned to the pool when any one segment is retired. Its lifetime is the union of the lifetimes of all referencing segments plus the writer's active use.
 
@@ -421,7 +483,7 @@ holder.Refcount = 1                   // writer's own reference
 _activeBufferHolder = holder
 ```
 
-**Segment creation (writer, in `PublishActiveSegment`, before the release-stores that publish it):**
+**Segment creation (writer, in `AppendActiveSegmentToUnpublished` §6.4.1, before the release-stores that publish the chain in §6.4.2):**
 ```
 Interlocked.Increment(ref _activeBufferHolder.Refcount)
 seg.Holder = _activeBufferHolder
@@ -454,15 +516,17 @@ if Interlocked.Decrement(ref holder.Refcount) == 0:
 
 We show that the refcount protocol never permits a buffer to be returned to the pool while either the writer or any non-retired segment still references it, and that it always returns the buffer exactly once.
 
-**Visibility of the writer's refcount increment.** In `PublishActiveSegment` (§6.4), the writer executes `Interlocked.Increment(ref _activeBufferHolder.Refcount)` in step 1, before the release-stores in step 2 that make the segment reachable to the reader (via `prevTail.Next` or `state.Tail`). By the `Interlocked` full-fence axiom (§5), every memory operation program-order before the `Interlocked.Increment` is globally ordered before every operation program-order after it. In particular, the updated `Refcount` value is globally ordered before the subsequent release-stores of `prevTail.Next` and `state.Tail`. Therefore any reader thread that observes the segment as reachable also observes the already-incremented `Refcount`.
+**Visibility of the writer's refcount increment.** In `AppendActiveSegmentToUnpublished` (§6.4.1), the writer executes `Interlocked.Increment(ref _activeBufferHolder.Refcount)` in step 1. The segment is then linked onto the writer-local chain (still invisible to the reader) and — at a later moment, possibly after many more `Append` calls — the entire chain is made reader-reachable by the release-stores in `SpliceUnpublishedChain` (§6.4.2). By the `Interlocked` full-fence axiom (§5), every memory operation program-order before the `Interlocked.Increment` is globally ordered before every operation program-order after it. In particular, the updated `Refcount` value is globally ordered before any subsequent release-store of `prevTail.Next`, `state.Tail`, or `state.Head` in the splice. Therefore any reader thread that observes the segment as reachable (whether that observation comes from an acquire-load on the splice's release-stores, or from an acquire-load on a later splice after further activity) also observes the already-incremented `Refcount`.
 
 **Invariant: `Refcount ≥ 1` while the buffer is writer-active.** Let "writer-active" mean the interval between `RentActiveBuffer` setting `_activeBufferHolder = holder` and `ReleaseHolder(holder)` dropping the writer's own reference. At rental, `Refcount` is initialized to 1 (the writer's own reference). During writer-active time:
 
-- Every `Interlocked.Increment` in `PublishActiveSegment` raises `Refcount` by 1 *before* the segment it creates is reachable by the reader.
-- Every reader `ReleaseHolder(seg.Holder)` decrements `Refcount` by 1. The reader only reaches this code via `RetireSegment`, which only runs on segments that are reachable from `_head` via the singly-linked chain — i.e., segments that have been published. By the visibility argument above, the matching increment has already executed and is globally visible.
+- Every `Interlocked.Increment` in `AppendActiveSegmentToUnpublished` raises `Refcount` by 1. The segment created by that call may reach the reader only at a later `SpliceUnpublishedChain` call — but whether published or still in the writer-local chain, the increment has already happened.
+- Every reader `ReleaseHolder(seg.Holder)` decrements `Refcount` by 1. The reader only reaches this code via `RetireSegment`, which only runs on segments that are reachable from `_head` via the singly-linked chain — i.e., segments that have been *published* (spliced). By the visibility argument above, the matching increment has already executed and is globally visible.
 - Therefore every decrement is preceded (in the happens-before order) by a matching increment on the same holder, so the sum `1 + (increments) - (decrements)` observed at any point during writer-active time is at least 1.
 
-**Visibility of the reader's refcount decrement.** Before the reader calls `ReleaseHolder(seg.Holder)`, it must first hold a reference to `seg.Holder`. The reader obtains this reference by a plain load of `seg.Holder` inside `RetireSegment`. This plain load is valid — that is, it observes the value written by the writer during segment initialization in §6.4 step 1 — because the segment `seg` was reached by an earlier acquire-load: either `Volatile.Read(ref state.Head)` in `ReadAsync` (for the first segment, §7.1 step 4) or `Volatile.Read(ref prevSeg.Next)` in sequence traversal (for subsequent segments). Both acquire-loads are paired with writer-side release-stores that were program-order after the writer's initialization of `seg.Holder`; the resulting happens-before edge makes the plain load of `seg.Holder` well-defined.
+**Visibility of the reader's refcount decrement.** Before the reader calls `ReleaseHolder(seg.Holder)`, it must first hold a reference to `seg.Holder`. The reader obtains this reference by a plain load of `seg.Holder` inside `RetireSegment`. This plain load is valid — that is, it observes the value written by the writer during segment initialization in §6.4.1 step 1 — because the segment `seg` was reached by an earlier acquire-load: either `Volatile.Read(ref state.Head)` in `ReadAsync` (for the first segment, §7.1 step 4) or `Volatile.Read(ref prevSeg.Next)` in sequence traversal (for subsequent segments). Both acquire-loads are paired with writer-side release-stores performed in §6.4.2 (the splice); those release-stores were program-order after the writer's initialization of `seg.Holder` in §6.4.1, so the resulting happens-before edge makes the plain load of `seg.Holder` well-defined.
+
+For intra-chain segments (those not at a splice boundary), the reader's traversal reaches them via `Volatile.Read(ref prevSeg.Next)` on in-chain `Next` pointers written plain by the writer in §6.4.1. The happens-before edge for these plain writes comes from the splice's release-store of `prevTail.Next` (or `state.Head` for the first splice): any reader that observes the splice-point pointer observes all program-order-earlier writes on the writer thread, which includes every `seg.Holder` and every intra-chain plain `Next` write.
 
 The reader's `Interlocked.Decrement(ref seg.Holder.Refcount)` is, by the §5 axiom, a full fence. It is globally ordered after the reader's plain load of `seg.Holder` (which is program-order before it). It is also globally ordered after all of the reader's prior consumption of `seg`'s bytes (same reason). The reader only calls `RetireSegment` on segments it has fully consumed per `AdvanceTo` — the caller's `consumed` position has moved past them, meaning the caller's contract obligation (to not access the retired portion of the prior `ReadOnlySequence<byte>`) has taken effect. Therefore a reader that decrements `Refcount` to 0 and proceeds to `Pool.Return(holder.Owner)` has demonstrably finished all reads of the buffer contents before returning the buffer. The pool-return does not race with in-flight reader access to the buffer.
 
@@ -486,8 +550,11 @@ Goal §1.1 bullet 2 is read as: **no interlocked operations on per-byte hot path
 ### 6.6 `void Complete(Exception? exception)`
 
 ```
-1. If _unflushedStart < _activeBufferWritten:
-       PublishActiveSegment()
+1. Flush any pending bytes to the reader before signaling completion:
+       if _unflushedStart < _activeBufferWritten:
+           AppendActiveSegmentToUnpublished()    // §6.4.1
+       if _unpublishedHead != null:
+           SpliceUnpublishedChain()              // §6.4.2
 
 2. If _activeBufferHolder != null:
        ReleaseHolder(_activeBufferHolder)       // §6.5.2; frees buffer if no
@@ -502,6 +569,8 @@ Goal §1.1 bullet 2 is read as: **no interlocked operations on per-byte hot path
 
 5. Signal reader awaiter (§8.2).
 ```
+
+Step 1 ensures that a caller who wrote bytes and then called `Complete` (without an explicit `FlushAsync`) still delivers those bytes to the reader. The reader, on observing `WriterCompletionState == 2`, is guaranteed by the release-acquire edge on `WriterCompletionState` to also see the final splice's `state.Tail` and `state.BytesWrittenPublished` values.
 
 ### 6.7 `void CancelPendingFlush()`
 
@@ -526,7 +595,7 @@ Algorithm (shared core, with `TryRead` skipping the await):
 
 4. If _head == null and tail != null:
        // First read ever. Acquire-load the permanent head pointer set by the
-       // writer's first publication (§6.4).
+       // writer's first splice (§6.4.2, first-splice case).
        _head = Volatile.Read(ref state.Head)
        _headConsumedOffset = 0
 
@@ -556,13 +625,13 @@ Algorithm (shared core, with `TryRead` skipping the await):
    ReadAsync: arm the read awaiter (§8.3) and return its ValueTask.
 ```
 
-**Step 3 load order — completion before tail.** The reader must acquire `WriterCompletionState` before `Tail`. The writer's `Complete` (§6.6) release-stores `Tail` (via the final `PublishActiveSegment`) before release-storing `WriterCompletionState = 2`. When the reader acquires `WriterCompletionState == 2`, the happens-before edge guarantees that the subsequent `Tail` load sees the writer's final publication. If the loads were reversed, the reader could observe a stale `Tail` paired with fresh completion, report `IsCompleted = true` with an empty buffer, and silently drop the final segment's bytes. The same order is used in §8.3 step C for the same reason.
+**Step 3 load order — completion before tail.** The reader must acquire `WriterCompletionState` before `Tail`. The writer's `Complete` (§6.6) release-stores `Tail` (via the final `SpliceUnpublishedChain`) before release-storing `WriterCompletionState = 2`. When the reader acquires `WriterCompletionState == 2`, the happens-before edge guarantees that the subsequent `Tail` load sees the writer's final publication. If the loads were reversed, the reader could observe a stale `Tail` paired with fresh completion, report `IsCompleted = true` with an empty buffer, and silently drop the final segment's bytes. The same order is used in §8.3 step C for the same reason.
 
-**First-read initialization (step 4):** the writer publishes `state.Head` exactly once, during the first `PublishActiveSegment` call (§6.4). It is a permanent pointer to the first segment ever published and is never updated again. On the reader's first `ReadAsync`, `_head` is null and `tail` is non-null (at least one segment exists). The reader initializes `_head` by acquire-loading `state.Head`.
+**First-read initialization (step 4):** the writer publishes `state.Head` exactly once, during the first `SpliceUnpublishedChain` call (§6.4.2 step 2, first-splice case). It is a permanent pointer to the first segment ever published and is never updated again for this lifecycle. On the reader's first `ReadAsync`, `_head` is null and `tail` is non-null (at least one segment exists). The reader initializes `_head` by acquire-loading `state.Head`.
 
-This is correct regardless of how many segments the writer has published before the reader's first read: `state.Head` always points to the first segment, and the reader traverses the complete chain from there. The earlier design of setting `_head = tail` was incorrect when the writer published multiple segments before the first read — it lost all segments except the most recent.
+This is correct regardless of how many segments — or how many spliced chains — the writer has published before the reader's first read: `state.Head` always points to the first segment, and the reader traverses the complete chain from there. The earlier design of setting `_head = tail` was incorrect when the writer published multiple segments before the first read — it lost all segments except the most recent.
 
-The release-acquire edge (writer's `Volatile.Write(ref state.Head, seg)` in §6.4 paired with the reader's `Volatile.Read(ref state.Head)`) ensures that all of the first segment's fields are visible to the reader. The reader then traverses forward from `_head` via `Volatile.Read(ref seg.Next)` as usual (§7.2).
+The release-acquire edge (writer's `Volatile.Write(ref state.Head, _unpublishedHead)` in §6.4.2 paired with the reader's `Volatile.Read(ref state.Head)`) ensures that all of the first chain's segment fields — including intra-chain plain `Next` writes — are visible to the reader. The reader then traverses forward from `_head` via `Volatile.Read(ref seg.Next)` as usual (§7.2).
 
 ### 7.2 The traversal invariant
 
@@ -590,16 +659,39 @@ The `ReadOnlySequence<byte>` constructor with `endSegment`/`endIndex` enforces t
                        // first iteration uses _headConsumedOffset;
                        // subsequent iterations treat full segment
        next = Volatile.Read(ref current.Next)    // acquire
-       if current != currentTail:                // §10.7: never retire state.Tail
+
+       // §10.7: safe to retire if current is proven to not be state.Tail.
+       // It is proven if EITHER:
+       //   - our acquired currentTail differs from current, OR
+       //   - current.Next is non-null (the writer writes seg.Next before
+       //     advancing state.Tail past seg, so Next != null implies the
+       //     writer has published a successor and will never again write
+       //     current.Next).
+       if current != currentTail || next != null:
            RetireSegment(current)
        current = next
        _headConsumedOffset = 0
 
    // current == consumedSeg. It is partially (or fully) consumed.
-   offsetInCurrent = consumedIdx
-   retiredBytes += offsetInCurrent - _headConsumedOffset
-   _head = current
-   _headConsumedOffset = offsetInCurrent
+   // If fully consumed and a successor is published, we can retire it too
+   // (otherwise it's either still state.Tail or nothing's past it to land on).
+   if consumedIdx == consumedSeg.WrittenLength:
+       nextAfterConsumed = Volatile.Read(ref consumedSeg.Next)    // acquire
+       if nextAfterConsumed != null:
+           retiredBytes += consumedSeg.WrittenLength - _headConsumedOffset
+           RetireSegment(consumedSeg)
+           _head = nextAfterConsumed
+           _headConsumedOffset = 0
+       else:
+           // consumedSeg may be state.Tail; keep it.
+           retiredBytes += consumedSeg.WrittenLength - _headConsumedOffset
+           _head = consumedSeg
+           _headConsumedOffset = consumedIdx    // == WrittenLength
+   else:
+       // Partially consumed. Must keep.
+       retiredBytes += consumedIdx - _headConsumedOffset
+       _head = consumedSeg
+       _headConsumedOffset = consumedIdx
 
 3. _bytesRead += retiredBytes
 
@@ -616,6 +708,10 @@ The `ReadOnlySequence<byte>` constructor with `endSegment`/`endIndex` enforces t
 
 7. _readInProgress = false
 ```
+
+**Why `current.Next != null` is a safe retire signal.** The writer's splice (§6.4.2) writes `prevTail.Next = _unpublishedHead` *before* advancing `state.Tail` to `_unpublishedTail`. Therefore, if a reader observes `seg.Next != null` for some segment `seg`, the writer has already passed the point where it would modify `seg.Next`; the next splice will snapshot `prevTail = state.Tail` to a later segment, never to `seg`. The writer will not touch `seg` again. The reader may safely return `seg` to the segment pool even though — transiently, between the splice's two release-stores — `state.Tail` might still equal `seg`. The window is harmless: the writer's in-flight release-store of `state.Tail` simply overwrites the field; it does not dereference `seg`.
+
+This permits retiring a fully-consumed tail segment as soon as its successor has been published, closing the "stale tail lingers until next publication" gap.
 
 **`RetireSegment(seg)`:**
 ```
@@ -662,7 +758,7 @@ Transitions are via `Interlocked.CompareExchange` in the arming and signaling pa
 
 ### 8.2 Writer signaling reader (`MaybeSignalReaderAwaiter`)
 
-Called from `PublishActiveSegment` step 5 and `Complete` step 5. Preceded (in program order) by the release-stores that publish the segment (`Volatile.Write(ref state.Tail, seg)` and `Volatile.Write(ref state.BytesWrittenPublished, ...)`).
+Called from `SpliceUnpublishedChain` step 5 (§6.4.2) and `Complete` step 5 (§6.6). Preceded (in program order) by the release-stores that publish the chain (`Volatile.Write(ref state.Tail, _unpublishedTail)` and `Volatile.Write(ref state.BytesWrittenPublished, ...)`).
 
 ```csharp
 // StoreLoad fence. Without this, the load of ReaderAwaiterState below could
@@ -904,23 +1000,40 @@ Symmetric for reader-to-writer exception propagation on `FlushAsync`.
 
 ### 10.5 Reset
 
-`Reset()` requires both ends completed, with no operations in flight. Performs the same segment cleanup walk as `Dispose()` (§10.6): starts from `_head` if non-null, otherwise from `state.Head` (§10.6 step 1). Releases holders and returns buffers and segments to their pools. Zeroes all fields including `state.Head`. Re-initializes both awaiters (incrementing `Version`).
+`Reset()` requires both ends completed, with no operations in flight. Performs the same segment cleanup walk as `Dispose()` (§10.6) over both the unpublished chain (writer-local) and the published chain. Releases holders and returns buffers and segments to their pools. Zeroes all `state.*` fields: `Head`, `Tail`, `BytesWrittenPublished`, `BytesReadPublished`, `WriterCompletionState`, `ReaderCompletionState`, `WriterException`, `ReaderException`, `ReaderAwaiterState` (back to `Idle = 0`), `WriterAwaiterState` (back to `Idle = 0`). Zeroes writer-local `_bytesWritten`, `_unpublishedBytes`, `_unflushedStart`, `_activeBufferWritten`, `_activeBufferCapacity`; nulls `_unpublishedHead`, `_unpublishedTail`, `_activeBufferHolder`. Zeroes reader-local `_bytesRead`, `_examinedPosition`, `_headConsumedOffset`; nulls `_head`, `_lastReturnedBuffer`. Re-initializes both awaiters (incrementing `Version`).
 
 ### 10.6 Disposal and finalization
 
-`SpscPipe` implements `IDisposable`. `Dispose()` performs a deterministic cleanup of any segments and buffers still outstanding — including segments the reader never retired (reader `Complete` delegates all cleanup here, §7.4) and any orphaned segments published after reader completion.
+`SpscPipe` implements `IDisposable`. `Dispose()` performs a deterministic cleanup of any segments and buffers still outstanding — including segments the reader never retired (reader `Complete` delegates all cleanup here, §7.4), any orphaned published segments the reader never processed, and any segments in the writer-local unpublished chain (the writer may have appended to the chain without ever calling `FlushAsync`/`Complete`).
 
 ```
 Dispose():
-1. Determine walk root:
+1. Walk the unpublished chain (writer-local; invisible to the reader).
+   These segments hold refcount references on their BufferHolders but are
+   not reachable from state.Head/state.Tail.
+       current = _unpublishedHead
+       while current != null:
+           if current.Holder != null:
+               ReleaseHolder(current.Holder)
+               current.Holder = null
+           next = current.Next              // plain read; writer-local chain
+           current.Reset()
+           SegmentPool.Return(current)
+           current = next
+       _unpublishedHead = null
+       _unpublishedTail = null
+       _unpublishedBytes = 0
+
+2. Determine the published-chain walk root:
        start = _head ?? state.Head
    _head is non-null if the reader ever called ReadAsync. It points to the
-   first non-retired segment — the chain from here through state.Tail and
-   beyond covers all live segments, including any orphans the writer published
-   after reader completion. If _head is null (reader never read), state.Head
-   is still valid (never retired) and serves as the fallback.
+   first non-retired published segment — the chain from here through
+   state.Tail covers all live published segments, including any orphans
+   the writer published after reader completion. If _head is null (reader
+   never read), state.Head is still valid (never retired) and serves as
+   the fallback.
 
-2. Walk from start forward, following Next pointers, until null.
+3. Walk from start forward, following Next pointers, until null.
    For each segment:
        if seg.Holder != null:
            ReleaseHolder(seg.Holder)    // §6.5.2
@@ -928,28 +1041,36 @@ Dispose():
        seg.Reset()
        SegmentPool.Return(seg)
 
-3. If _activeBufferHolder != null (writer never rotated/completed):
+4. If _activeBufferHolder != null (writer never rotated/completed):
        ReleaseHolder(_activeBufferHolder)
        _activeBufferHolder = null
 
-4. Null out state.Head, state.Tail. Zero byte counters.
+5. Null out state.Head, state.Tail. Zero byte counters and completion
+   states. Clear WriterException, ReaderException.
 ```
 
 `Dispose()` is safe to call after both sides have completed, or after only one side has completed (e.g., the writer completed but the reader abandoned). It is **not** safe to call concurrently with active reader or writer operations — the caller must ensure no operations are in flight.
 
-**Finalizer.** `SpscPipe` includes a weak safety-net finalizer that calls the same cleanup walk. For `ArrayPool<byte>.Shared`-backed buffers this prevents pool pressure under abandoned pipes. For custom `MemoryPool<byte>` implementations backed by pinned or native memory (§13), it prevents genuine resource leaks. The finalizer is suppressed by `Dispose()` via `GC.SuppressFinalize(this)`. Note: the finalizer reads `_head` (reader-local) and `_activeBufferHolder` (writer-local) without explicit `Volatile.Read`. This relies on the GC's stop-the-world phase inducing a full memory barrier before the finalizer thread runs — a property held in practice by the .NET runtime but not formally documented. If this reliance is unacceptable, the finalizer should use `Volatile.Read` for its initial traversal loads.
+**Finalizer.** `SpscPipe` includes a weak safety-net finalizer that calls the same cleanup walk (including the unpublished-chain walk). For `ArrayPool<byte>.Shared`-backed buffers this prevents pool pressure under abandoned pipes. For custom `MemoryPool<byte>` implementations backed by pinned or native memory (§13), it prevents genuine resource leaks. The finalizer is suppressed by `Dispose()` via `GC.SuppressFinalize(this)`. Note: the finalizer reads `_head`, `_unpublishedHead`, `_unpublishedTail`, and `_activeBufferHolder` without explicit `Volatile.Read`. This relies on the GC's stop-the-world phase inducing a full memory barrier before the finalizer thread runs — a property held in practice by the .NET runtime but not formally documented. If this reliance is unacceptable, the finalizer should use `Volatile.Read` for its initial traversal loads.
 
-**`Reset()` vs `Dispose()`:** `Reset()` (§10.5) performs the same segment/holder cleanup walk (starting from `_head ?? state.Head`), then re-initializes the pipe for reuse. `Dispose()` performs cleanup only and leaves the pipe in a terminal state. Both share the same internal walk logic.
+**`Reset()` vs `Dispose()`:** `Reset()` (§10.5) performs the same cleanup walks (unpublished + published), then re-initializes the pipe for reuse. `Dispose()` performs cleanup only and leaves the pipe in a terminal state. Both share the same internal walk logic.
 
 ### 10.7 Tail-segment retirement invariant
 
-The segment referenced by `state.Tail` is never returned to the segment pool while `state.Tail` references it. The writer relies on `prevTail = state.Tail` followed by `Volatile.Write(ref prevTail.Next, newSeg)` during publication (§6.4); if the reader had retired that segment and returned it to the pool, the write would corrupt whatever consumer now holds the recycled object.
+A segment may be retired by the reader iff the writer is provably done writing to its `Next` field — equivalently, iff the writer will never again execute `prevTail = seg` when entering `SpliceUnpublishedChain` (§6.4.2). That holds exactly when:
+
+- `seg != state.Tail` as observed via an acquire-load of `state.Tail`; **or**
+- `Volatile.Read(ref seg.Next) != null` — the writer's splice writes `seg.Next` before advancing `state.Tail` past `seg`, so observing `seg.Next` as non-null implies the writer has already published a successor and will never select `seg` as `prevTail` again.
+
+Conversely, a segment whose `Next` is `null` and which matches our last acquired `state.Tail` may currently be (or is about to be written by) the writer. Retiring such a segment would risk corrupting whatever consumer the segment pool gives it to, because the writer may still execute `Volatile.Write(ref seg.Next, ...)` on it.
 
 This invariant is maintained by:
 
-- **`AdvanceTo` (§7.3):** acquires `state.Tail` and does not retire any segment identity-equal to it. In practice, `consumedSeg` is always at or before `state.Tail` in the chain, so the loop body never reaches the tail — the check is a mechanical safety net.
+- **`AdvanceTo` (§7.3):** acquires `state.Tail` into `currentTail` at entry and retires a segment `seg` only when `seg != currentTail || Volatile.Read(ref seg.Next) != null`. The `Next != null` arm lets the reader retire a fully-consumed tail as soon as its successor is published, avoiding the "stale tail" artifact.
 - **Reader `Complete` (§7.4):** does not retire segments at all; cleanup is delegated to `Dispose` / `Reset`.
 - **`Dispose` / `Reset` (§10.6, §10.5):** run only when no operations are in flight, so `state.Tail` is never concurrently accessed by the writer.
+
+**Why the transient `state.Tail == seg ∧ seg.Next != null` window is harmless.** Between the splice's two release-stores (first `prevTail.Next = _unpublishedHead`, then `state.Tail = _unpublishedTail`), an observer can see `state.Tail == seg` and `seg.Next == _unpublishedHead` simultaneously. If the reader, holding a cached `currentTail == seg` from a prior acquire-load, observes `seg.Next != null` and retires `seg`, the writer's in-flight `Volatile.Write(ref state.Tail, _unpublishedTail)` still succeeds: it merely overwrites the `state.Tail` field with a new value and does not dereference `seg`. No subsequent writer operation will dereference `seg` either, because future splices snapshot `prevTail = state.Tail = _unpublishedTail`, never `seg`.
 
 ---
 
@@ -957,10 +1078,11 @@ This invariant is maintained by:
 
 | Location | Writer | Reader | Ordering |
 |---|---|---|---|
-| `state.Tail` | W | R | release-store (writer) / acquire-load (reader) |
-| `state.Head` | W (once per lifecycle) | R (once per lifecycle) | release-store (writer, first publication) / acquire-load (reader, first read); zeroed by `Reset()` |
-| `seg.Next` (for any seg) | W (once) | R | release-store (writer) / acquire-load (reader) |
-| `seg.*` initialization fields | W | R | plain; visibility covered by release-store of `Tail` or `prevSeg.Next` |
+| `state.Tail` | W | R | release-store (writer, in §6.4.2) / acquire-load (reader) |
+| `state.Head` | W (once per lifecycle) | R (once per lifecycle) | release-store (writer, first splice in §6.4.2) / acquire-load (reader, first read); zeroed by `Reset()` |
+| `prevTail.Next` (splice-point write; `prevTail` is the pre-splice `state.Tail`) | W (once per segment's lifetime) | R | release-store (writer, in §6.4.2) / acquire-load (reader) |
+| `seg.Next` (intra-chain links within an unpublished chain) | W (plain, in §6.4.1) | R (acquire-load) | plain write; visibility covered by the splice's release-store of `prevTail.Next` or `state.Head` |
+| `seg.*` initialization fields (BufferStart, WrittenLength, Memory, RunningIndex, Holder) | W | R | plain; visibility covered by the splice's release-store of `prevTail.Next`, `state.Head`, or `state.Tail` |
 | `state.BytesWrittenPublished` | W | R | release-store / acquire-load |
 | `state.BytesReadPublished` | R | W | release-store / acquire-load |
 | `state.WriterCompletionState` | W | R | release-store / acquire-load |
@@ -969,12 +1091,12 @@ This invariant is maintained by:
 | `state.ReaderException` | R | W | plain; visibility covered by completion-state release-store |
 | `state.ReaderAwaiterState` | CAS / full fence | CAS / full fence | `Interlocked`; full fence required between arm and re-check (§8.3) and between publish and awaiter-read (§8.2) |
 | `state.WriterAwaiterState` | CAS / full fence | CAS / full fence | `Interlocked`; symmetric to `ReaderAwaiterState` (§8.4) |
-| `BufferHolder.Refcount` | `Interlocked.Increment` | `Interlocked.Decrement` | `Interlocked` supplies atomicity and full fence (§5 axiom); writer's increment is ordered globally before its subsequent release-stores that publish the segment (§6.5.3) |
-| `seg.Holder` | W | R | plain; visibility covered by release-store of `prevSeg.Next` or `state.Tail` |
+| `BufferHolder.Refcount` | `Interlocked.Increment` (in §6.4.1) | `Interlocked.Decrement` (in `RetireSegment`) | `Interlocked` supplies atomicity and full fence (§5 axiom); writer's increment is ordered globally before the splice's release-stores that publish the chain (§6.5.3) |
+| `seg.Holder` | W (plain, in §6.4.1) | R (plain) | plain; visibility covered by the splice's release-store of `prevTail.Next`, `state.Head`, or `state.Tail` |
 
 Explicit full-fence requirements (`Interlocked.MemoryBarrier()` or equivalent Interlocked op, by the §5 axiom) are at:
 
-- Writer after publication, before reading reader-awaiter state (§8.2).
+- Writer after splice, before reading reader-awaiter state (§8.2).
 - Reader after arming read-awaiter, before re-checking `state.Tail` / `state.WriterCompletionState` (§8.3).
 - Reader after publishing `BytesReadPublished`, before reading writer-awaiter state (§8.4).
 - Writer after arming write-awaiter, before re-checking `BytesReadPublished` / `state.ReaderCompletionState` (§8.4).
