@@ -164,13 +164,15 @@ internal sealed class SpscPipeReader : PipeReader
 }
 
 // Signal struct for the read awaiter. The writer must not build a ReadResult
-// (which requires reader-local state); instead it signals with minimal flags.
+// (which requires reader-local state); instead it signals with a minimal flag.
 // SpscPipeReader implements IValueTaskSource<ReadResult> and translates the
 // signal into a real ReadResult on the reader's continuation thread (§8.7).
+// Only IsCanceled is needed: the reader re-executes steps 3–7 (which
+// acquire-load WriterCompletionState fresh) for non-canceled signals, and
+// canceled results do not need a precise IsCompleted value.
 internal readonly struct ReadSignal
 {
     internal bool IsCanceled { get; init; }
-    internal bool IsCompleted { get; init; }
 }
 ```
 
@@ -325,10 +327,10 @@ if prevTail is null:
     // CRITICAL ORDERING: all writes to seg.* above must be visible to the reader
     // before the reader observes state.Head or state.Tail = seg.
     //
-    // Head MUST be written before Tail. The reader reads Tail first (§7.1 step 3),
-    // then reads Head (§7.1 step 4). The reader's acquire-load of Tail seeing
-    // this segment establishes a happens-before edge that makes the preceding
-    // release-store of Head visible. Reversing this order would allow the reader
+    // Head MUST be written before Tail. The reader reads Tail before Head
+    // (§7.1 steps 3–4); the acquire-load of Tail seeing this segment
+    // establishes a happens-before edge that makes the preceding release-store
+    // of Head visible. Reversing the writer-side order would allow the reader
     // to observe Tail = seg while Head is still null.
     Volatile.Write(ref state.Head, seg)    // release-store #0 (first segment pointer)
     Volatile.Write(ref state.Tail, seg)    // release-store #1
@@ -678,12 +680,10 @@ if (awaiterState == Idle) return;
 var prev = Interlocked.CompareExchange(
     ref state.ReaderAwaiterState, Signaled, Armed);
 if (prev == Armed):
-    // We won the race. Signal the reader with completion flags only.
-    // The reader builds the real ReadResult from reader-local state when
-    // the continuation resumes on the reader's scheduled thread (§8.7).
-    var writerDone = Volatile.Read(ref state.WriterCompletionState) == 2;
-    _reader._readAwaiter.SetResult(new ReadSignal(
-        IsCanceled: false, IsCompleted: writerDone));
+    // We won the race. Signal the reader. The reader builds the real
+    // ReadResult from reader-local state when the continuation resumes
+    // on the reader's scheduled thread (§8.7).
+    _reader._readAwaiter.SetResult(new ReadSignal(IsCanceled: false));
 ```
 
 The `Interlocked.MemoryBarrier()` by the §5 axiom is a full sequentially-consistent fence: every store program-order before it is globally ordered before every load program-order after it. This orders the publication stores globally before the awaiter-state load, which is what the double-check protocol requires on this side.
@@ -725,6 +725,7 @@ Interlocked.MemoryBarrier();
 writerDone = Volatile.Read(ref state.WriterCompletionState) == 2;    // acquire
 tail = Volatile.Read(ref state.Tail);    // acquire
 
+// TailIndicatesNewDataPast: tail != null && tail.RunningIndex + tail.WrittenLength > _examinedPosition
 if (TailIndicatesNewDataPast(_examinedPosition, tail) || writerDone):
     // Data is actually available. Try to un-arm.
     var prev2 = Interlocked.CompareExchange(
@@ -744,7 +745,7 @@ _readCtr = ct.UnsafeRegister(static (s, t) =>
     var prev = Interlocked.CompareExchange(
         ref r.state.ReaderAwaiterState, Signaled, Armed);
     if (prev == Armed):
-        r._readAwaiter.SetResult(new ReadSignal(IsCanceled: true, IsCompleted: false));
+        r._readAwaiter.SetResult(new ReadSignal(IsCanceled: true));
 }, this);
 
 // SpscPipeReader implements IValueTaskSource<ReadResult>; its GetResult
@@ -852,7 +853,7 @@ Specifically:
 - The waiter's `ValueTask` completes when the continuation runs.
 - `Version` disambiguates reuse of the `ValueTaskSource` — each arm cycle increments it via `Reset()`.
 
-**Reader-side translation.** The reader's `ManualResetValueTaskSourceCore` carries `ReadSignal` (§4.4), not `ReadResult`. `SpscPipeReader` implements `IValueTaskSource<ReadResult>` and bridges the gap: its `GetResult` retrieves the `ReadSignal` from the core, resets `ReaderAwaiterState` to `Idle`, disposes the cancellation registration, and — for non-canceled signals — builds the real `ReadResult` by re-executing the read logic (§7.1 steps 3–7) from reader-local state. This runs on the reader's scheduled continuation thread, so accessing reader-local fields is safe under the SPSC invariant.
+**Reader-side translation.** The reader's `ManualResetValueTaskSourceCore` carries `ReadSignal` (§4.4), not `ReadResult`. `ReadSignal` contains only `IsCanceled`; no other fields are needed because the reader re-acquires all shared state itself. `SpscPipeReader` implements `IValueTaskSource<ReadResult>` and bridges the gap: its `GetResult` retrieves the `ReadSignal` from the core, resets `ReaderAwaiterState` to `Idle`, disposes the cancellation registration, and — for non-canceled signals — builds the real `ReadResult` by re-executing the read logic (§7.1 steps 3–7) from reader-local state. For canceled signals, it returns a canceled `ReadResult` directly. This runs on the reader's scheduled continuation thread, so accessing reader-local fields is safe under the SPSC invariant.
 
 The writer-side flush awaiter does not need this treatment: `FlushResult` depends only on writer-local and shared state that the reader (the signaler) can safely read.
 
