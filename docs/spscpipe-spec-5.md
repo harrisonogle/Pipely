@@ -1,7 +1,7 @@
 # SpscPipe — Lock-Free SPSC Pipe Specification
 
 **Status:** Draft v2 (supersedes the ring-of-descriptors draft)
-**Target framework:** .NET 10+
+**Target framework:** .NET 10+, 64-bit process (`Volatile.Write` on `long` fields requires 64-bit atomicity)
 **Scope:** A lock-free, single-producer / single-consumer replacement for `System.IO.Pipelines.Pipe`, preserving the public contracts of `PipeReader` and `PipeWriter`. Uses an unbounded linked list of pooled segments with byte-count backpressure.
 
 ---
@@ -96,7 +96,7 @@ internal sealed class Segment : ReadOnlySequenceSegment<byte>
 
 ### 4.2 Shared state layout
 
-All cross-thread fields live in a `State` object with explicit cache-line padding. A 64-byte cache line is assumed; on ARM64 platforms with 128-byte lines the layout is wasteful but correct.
+All cross-thread fields live in a `State` object with explicit cache-line padding. A 64-byte cache line is assumed; on ARM64 platforms with 128-byte lines the layout is wasteful but correct. The `FieldOffset` layout prevents false sharing between groups *within* the struct. However, it does not guarantee 64-byte alignment of the struct itself relative to physical cache lines — the CLR aligns heap objects to pointer boundaries (8 bytes on 64-bit), not cache-line boundaries. In practice, the padding between groups absorbs misalignment; worst case, one cache line straddles two groups, but no two groups share a single cache line.
 
 ```csharp
 [StructLayout(LayoutKind.Explicit, Size = 384)]
@@ -105,7 +105,7 @@ internal struct State
     // ---- Cache line 0: writer-published fields ----
     [FieldOffset(64)]  internal Segment? Tail;                // writer writes, reader acquires
     [FieldOffset(72)]  internal long BytesWrittenPublished;   // writer writes, reader acquires
-    [FieldOffset(80)]  internal int WriterCompletionState;    // 0=active, 1=completing, 2=completed
+    [FieldOffset(80)]  internal int WriterCompletionState;    // 0=active, 2=completed
     [FieldOffset(88)]  internal ExceptionDispatchInfo? WriterException;
     [FieldOffset(96)]  internal Segment? Head;                // first segment ever published; writer writes once, reader acquires once
 
@@ -118,7 +118,7 @@ internal struct State
     [FieldOffset(192)] internal int ReaderAwaiterState;       // see §8
     [FieldOffset(200)] internal int WriterAwaiterState;       // see §8
 
-    // ---- Cache line 3: trailing pad to prevent false-sharing with adjacent allocations ----
+    // ---- Cache line 3: trailing pad to reduce false-sharing with adjacent heap allocations ----
 }
 ```
 
@@ -137,7 +137,6 @@ internal sealed class SpscPipeWriter : PipeWriter
     private int _activeBufferCapacity;    // cached Memory.Length
     private int _unflushedStart;          // start offset of unflushed bytes within active buffer
     private long _bytesWritten;           // mirror of BytesWrittenPublished, pre-release
-    private long _cachedBytesRead;        // cached snapshot of BytesReadPublished
 
     // Awaiter for FlushAsync backpressure:
     private ManualResetValueTaskSourceCore<FlushResult> _flushAwaiter;
@@ -154,8 +153,6 @@ internal sealed class SpscPipeReader : PipeReader
     private int _headConsumedOffset;      // bytes consumed within _head beyond BufferStart
     private long _examinedPosition;       // absolute byte position of last examined boundary
     private long _bytesRead;              // mirror of BytesReadPublished, pre-release
-    private long _cachedBytesWritten;     // cached snapshot of BytesWrittenPublished
-    private Segment? _cachedTail;         // cached snapshot of State.Tail (upper bound for traversal)
 
     // State tracking for AdvanceTo validation:
     private bool _readInProgress;
@@ -327,6 +324,12 @@ if prevTail is null:
     //
     // CRITICAL ORDERING: all writes to seg.* above must be visible to the reader
     // before the reader observes state.Head or state.Tail = seg.
+    //
+    // Head MUST be written before Tail. The reader reads Tail first (§7.1 step 3),
+    // then reads Head (§7.1 step 4). The reader's acquire-load of Tail seeing
+    // this segment establishes a happens-before edge that makes the preceding
+    // release-store of Head visible. Reversing this order would allow the reader
+    // to observe Tail = seg while Head is still null.
     Volatile.Write(ref state.Head, seg)    // release-store #0 (first segment pointer)
     Volatile.Write(ref state.Tail, seg)    // release-store #1
 else:
@@ -539,9 +542,7 @@ Algorithm (shared core, with `TryRead` skipping the await):
        buffer = new ReadOnlySequence<byte>(_head, _headConsumedOffset,
                                            endSeg, endIdx)
        result = new ReadResult(buffer, isCanceled: false,
-                               isCompleted: writerDone
-                                            && availableEndPosition
-                                               == (_bytesRead + buffer.Length))
+                               isCompleted: writerDone)
        _readInProgress = true
        _lastReturnedBuffer = buffer
        return ValueTask.FromResult(result)
@@ -648,16 +649,13 @@ This section specifies how the writer waits for backpressure relief, and how the
 
 ### 8.1 Awaiter state machine
 
-Each awaiter (one per side) is an `int` with four states:
+Each awaiter (one per side) is an `int` with three states:
 
 - `0 = Idle`: no wait in progress.
-- `1 = Arming`: the waiter has decided to wait and is in the middle of arming.
-- `2 = Armed`: the waiter is parked; the signaler must wake it.
-- `3 = Signaled`: the signaler has posted a wake; the waiter will observe it on next check.
+- `1 = Armed`: the waiter is parked; the signaler must wake it.
+- `2 = Signaled`: the signaler has posted a wake; the waiter will observe it on next check.
 
-Transitions are via `Interlocked.CompareExchange` in the arming and signaling paths. The waiter is the sole transitioner from `Idle → Arming → Armed → Idle`; the signaler transitions `Armed → Signaled` or arrives while `Idle`/`Arming` and sets a flag.
-
-We simplify to three states in practice — `Idle`, `Armed`, `Signaled` — and use a companion "signal observed while arming" mechanism via re-check.
+Transitions are via `Interlocked.CompareExchange` in the arming and signaling paths. The waiter transitions `Idle → Armed → Idle`; the signaler transitions `Armed → Signaled`. The intermediate "arming" phase (deciding to wait, then re-checking for data before committing to park) is handled procedurally in §8.3 steps A–C, not as a discrete state value.
 
 ### 8.2 Writer signaling reader (`MaybeSignalReaderAwaiter`)
 
@@ -766,7 +764,7 @@ The race: both threads do their store, then their load. Both observe the *old* v
 
 `Interlocked.MemoryBarrier()`, by the §5 axiom, is a full sequentially-consistent fence and thus orders the preceding store globally before the subsequent load. Both sides need their own fence; the writer's symmetric fence is in §8.2.
 
-Note that the `Interlocked.CompareExchange` in Step A is also a full fence by the same axiom. One could in principle rely on that fence to cover Step C's load instead of inserting an additional barrier. We keep the explicit `Interlocked.MemoryBarrier()` in Step B for three reasons: (1) the intervening branch (`if (prev != Idle) ...`) would otherwise make the ordering argument depend on the compiler not eliding the fence across a conditional return; (2) making the fence explicit at the point of need aids local reasoning; (3) the cost is a single fence either way, since a CAS on a just-modified cache line is approximately as expensive as a standalone fence on modern hardware.
+Note that the `Interlocked.CompareExchange` in Step A is also a full fence by the same axiom. One could in principle rely on that fence to cover Step C's load instead of inserting an additional barrier. We keep the explicit `Interlocked.MemoryBarrier()` in Step B for two reasons: (1) making the fence explicit at the point of need aids local reasoning; (2) the cost is a single fence either way, since a CAS on a just-modified cache line is approximately as expensive as a standalone fence on modern hardware.
 
 ### 8.4 Writer arming the flush awaiter — symmetric
 
@@ -936,7 +934,7 @@ Dispose():
 
 `Dispose()` is safe to call after both sides have completed, or after only one side has completed (e.g., the writer completed but the reader abandoned). It is **not** safe to call concurrently with active reader or writer operations — the caller must ensure no operations are in flight.
 
-**Finalizer.** `SpscPipe` includes a weak safety-net finalizer that calls the same cleanup walk. For `ArrayPool<byte>.Shared`-backed buffers this prevents pool pressure under abandoned pipes. For custom `MemoryPool<byte>` implementations backed by pinned or native memory (§13), it prevents genuine resource leaks. The finalizer is suppressed by `Dispose()` via `GC.SuppressFinalize(this)`.
+**Finalizer.** `SpscPipe` includes a weak safety-net finalizer that calls the same cleanup walk. For `ArrayPool<byte>.Shared`-backed buffers this prevents pool pressure under abandoned pipes. For custom `MemoryPool<byte>` implementations backed by pinned or native memory (§13), it prevents genuine resource leaks. The finalizer is suppressed by `Dispose()` via `GC.SuppressFinalize(this)`. Note: the finalizer reads `_head` (reader-local) and `_activeBufferHolder` (writer-local) without explicit `Volatile.Read`. This relies on the GC's stop-the-world phase inducing a full memory barrier before the finalizer thread runs — a property held in practice by the .NET runtime but not formally documented. If this reliance is unacceptable, the finalizer should use `Volatile.Read` for its initial traversal loads.
 
 **`Reset()` vs `Dispose()`:** `Reset()` (§10.5) performs the same segment/holder cleanup walk (starting from `_head ?? state.Head`), then re-initializes the pipe for reuse. `Dispose()` performs cleanup only and leaves the pipe in a terminal state. Both share the same internal walk logic.
 
@@ -957,7 +955,7 @@ This invariant is maintained by:
 | Location | Writer | Reader | Ordering |
 |---|---|---|---|
 | `state.Tail` | W | R | release-store (writer) / acquire-load (reader) |
-| `state.Head` | W (once) | R (once) | release-store (writer, first publication only) / acquire-load (reader, first read only) |
+| `state.Head` | W (once per lifecycle) | R (once per lifecycle) | release-store (writer, first publication) / acquire-load (reader, first read); zeroed by `Reset()` |
 | `seg.Next` (for any seg) | W (once) | R | release-store (writer) / acquire-load (reader) |
 | `seg.*` initialization fields | W | R | plain; visibility covered by release-store of `Tail` or `prevSeg.Next` |
 | `state.BytesWrittenPublished` | W | R | release-store / acquire-load |
@@ -969,7 +967,7 @@ This invariant is maintained by:
 | `state.ReaderAwaiterState` | CAS / full fence | CAS / full fence | `Interlocked`; full fence required between arm and re-check (§8.3) and between publish and awaiter-read (§8.2) |
 | `state.WriterAwaiterState` | CAS / full fence | CAS / full fence | `Interlocked`; symmetric to `ReaderAwaiterState` (§8.4) |
 | `BufferHolder.Refcount` | `Interlocked.Increment` | `Interlocked.Decrement` | `Interlocked` supplies atomicity and full fence (§5 axiom); writer's increment is ordered globally before its subsequent release-stores that publish the segment (§6.5.3) |
-| `seg.Holder` | W | R | plain; visibility covered by release-store of `seg.Next` or `state.Tail` |
+| `seg.Holder` | W | R | plain; visibility covered by release-store of `prevSeg.Next` or `state.Tail` |
 
 Explicit full-fence requirements (`Interlocked.MemoryBarrier()` or equivalent Interlocked op, by the §5 axiom) are at:
 
