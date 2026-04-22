@@ -518,9 +518,9 @@ Algorithm (shared core, with `TryRead` skipping the await):
 
 2. If _readInProgress: throw (AdvanceTo not called).
 
-3. Acquire-load tail and completion:
-       tail = Volatile.Read(ref state.Tail)
+3. Acquire-load completion and tail (completion first — see ordering note below):
        writerDone = Volatile.Read(ref state.WriterCompletionState) == 2
+       tail = Volatile.Read(ref state.Tail)
 
 4. If _head == null and tail != null:
        // First read ever. Acquire-load the permanent head pointer set by the
@@ -553,6 +553,8 @@ Algorithm (shared core, with `TryRead` skipping the await):
 9. TryRead: return false.
    ReadAsync: arm the read awaiter (§8.3) and return its ValueTask.
 ```
+
+**Step 3 load order — completion before tail.** The reader must acquire `WriterCompletionState` before `Tail`. The writer's `Complete` (§6.6) release-stores `Tail` (via the final `PublishActiveSegment`) before release-storing `WriterCompletionState = 2`. When the reader acquires `WriterCompletionState == 2`, the happens-before edge guarantees that the subsequent `Tail` load sees the writer's final publication. If the loads were reversed, the reader could observe a stale `Tail` paired with fresh completion, report `IsCompleted = true` with an empty buffer, and silently drop the final segment's bytes. The same order is used in §8.3 step C for the same reason.
 
 **First-read initialization (step 4):** the writer publishes `state.Head` exactly once, during the first `PublishActiveSegment` call (§6.4). It is a permanent pointer to the first segment ever published and is never updated again. On the reader's first `ReadAsync`, `_head` is null and `tail` is non-null (at least one segment exists). The reader initializes `_head` by acquire-loading `state.Head`.
 
@@ -719,8 +721,9 @@ if (prev != Idle):
 Interlocked.MemoryBarrier();
 
 // Step C: Re-check whether data arrived or writer completed.
-tail = Volatile.Read(ref state.Tail);    // acquire
+// Completion loaded before Tail — same ordering as §7.1 step 3.
 writerDone = Volatile.Read(ref state.WriterCompletionState) == 2;    // acquire
+tail = Volatile.Read(ref state.Tail);    // acquire
 
 if (TailIndicatesNewDataPast(_examinedPosition, tail) || writerDone):
     // Data is actually available. Try to un-arm.
