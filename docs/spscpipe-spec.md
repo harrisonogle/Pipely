@@ -94,6 +94,8 @@ internal sealed class Segment : ReadOnlySequenceSegment<byte>
 
 `Next` is the base-class property; writes to it use `Volatile.Write` for release semantics (§7.2).
 
+**Segments are mutable, pooled objects.** A `Segment` instance is rented from a pool (§9), initialized via a write to every field, used as part of a published or unpublished chain, retired, and returned to the pool where it may be rented again for a different logical segment and re-initialized. The same object reference can therefore represent different logical segments across its lifetime, and a reader holding a stale reference to a retired segment may observe reinitialized fields. Any retirement rule (§7.3, §10.7) must sequence reader-side field reads *before* retirement; the rule's writer-side argument (writer will not touch `Next` again) is necessary but not sufficient.
+
 ### 4.2 Shared state layout
 
 All cross-thread fields live in a `State` struct with explicit cache-line padding. A 64-byte cache line is assumed; on ARM64 platforms with 128-byte lines the layout is still correct, just wasteful.
@@ -648,7 +650,19 @@ The `ReadOnlySequence<byte>` constructor with `endSegment`/`endIndex` enforces t
    and consumed <= examined. Throw InvalidOperationException or
    ArgumentOutOfRangeException on violation.
 
-2. retiredBytes = 0
+2. Snapshot the examined position BEFORE any retirement.  The retire walk
+   in step 3 may return examinedSeg to the segment pool (when examined ==
+   consumed and consumedSeg is fully consumed with a published successor),
+   where the writer can immediately rent and reinitialize the same object.
+   Reading examinedSeg.RunningIndex after that would observe fields from
+   an entirely different logical segment.  Every reader-side field read
+   must precede the retirement that may recycle the object (§4.1 on
+   pooled mutability, §10.7 on lifetime).
+       examinedSeg = (Segment)examined.GetObject()
+       examinedIdx = examined.GetInteger()
+       newExaminedPosition = examinedSeg.RunningIndex + examinedIdx
+
+3. retiredBytes = 0
    current = _head
    consumedSeg = (Segment)consumed.GetObject()
    consumedIdx = consumed.GetInteger()
@@ -693,12 +707,8 @@ The `ReadOnlySequence<byte>` constructor with `endSegment`/`endIndex` enforces t
        _head = consumedSeg
        _headConsumedOffset = consumedIdx
 
-3. _bytesRead += retiredBytes
-
-4. Compute new examined position:
-   examinedSeg = (Segment)examined.GetObject()
-   examinedIdx = examined.GetInteger()
-   _examinedPosition = examinedSeg.RunningIndex + examinedIdx
+4. _bytesRead += retiredBytes
+   _examinedPosition = newExaminedPosition   // snapshot from step 2
 
 5. Release-store the updated byte count:
    Volatile.Write(ref state.BytesReadPublished, _bytesRead)
@@ -708,6 +718,8 @@ The `ReadOnlySequence<byte>` constructor with `endSegment`/`endIndex` enforces t
 
 7. _readInProgress = false
 ```
+
+**Step 2 ordering is load-bearing.** When `consumed == examined` (the common case — callers pass `buffer.End` for both) and `consumedSeg` is fully consumed with a published successor, step 3 calls `RetireSegment(consumedSeg)`. That same object is both `consumedSeg` and `examinedSeg`; after retirement it is in the segment pool and may be re-rented by the writer's next `AppendActiveSegmentToUnpublished` call, which overwrites `RunningIndex`, `WrittenLength`, and other fields via `Segment.Initialize`. Computing `_examinedPosition` after that point reads fields from a different logical segment than the reader intended. Snapshotting in step 2 fixes the ordering: all reader-side field reads complete before any retirement makes the object pool-eligible.
 
 **Why `current.Next != null` is a safe retire signal.** The writer's splice (§6.4.2) writes `prevTail.Next = _unpublishedHead` *before* advancing `state.Tail` to `_unpublishedTail`. Therefore, if a reader observes `seg.Next != null` for some segment `seg`, the writer has already passed the point where it would modify `seg.Next`; the next splice will snapshot `prevTail = state.Tail` to a later segment, never to `seg`. The writer will not touch `seg` again. The reader may safely return `seg` to the segment pool even though — transiently, between the splice's two release-stores — `state.Tail` might still equal `seg`. The window is harmless: the writer's in-flight release-store of `state.Tail` simply overwrites the field; it does not dereference `seg`.
 
@@ -940,13 +952,25 @@ The awaiter state machine already handles cancellation as just another signaler.
 
 ### 8.7 `ManualResetValueTaskSourceCore` interaction
 
-The awaiter state we maintain (`ReaderAwaiterState`, `WriterAwaiterState`) is a separate coordination layer *on top* of `ManualResetValueTaskSourceCore<T>`. The latter handles the continuation delivery (running the `await` continuation with the configured scheduler); our state machine handles the "do I need to signal?" decision.
+`ManualResetValueTaskSourceCore<T>` (hereafter MRVTS) is assumed as an axiomatic primitive. We rely on its documented semantics rather than reconstructing them from first principles or abstracting it as an opaque `IValueTaskSource<T>`. The `IValueTaskSource<T>` interface appears only where we need to wrap MRVTS to do signal-to-result translation on the reader side (§8.7 "Reader-side translation" below); the lower-level state machine is MRVTS's.
+
+**Assumed MRVTS semantics** (from the .NET API contract):
+
+- `Reset()` transitions the instance from `Succeeded` / `Faulted` back to `Pending` and increments `Version`. It must be called while the previous result is not being awaited.
+- `SetResult(TResult)` requires the instance to be in `Pending` state; otherwise it throws. It atomically stores the result and transitions the instance to `Succeeded`.
+- `SetException(Exception)` is analogous but transitions to `Faulted`.
+- `GetResult(short token)` validates `token == Version`. If validation fails, it throws. Otherwise it returns the stored result (for `Succeeded`) or rethrows the stored exception (for `Faulted`). MRVTS does not clear state in `GetResult` — the caller must invoke `Reset()` before the next use.
+- `OnCompleted(callback, state, short token, flags)` registers the continuation (or invokes it inline if the result is already available), validating `token == Version`.
+- `RunContinuationsAsynchronously = true` forces continuations to run via the default `ThreadPool`; with `false`, they run inline on the thread that calls `SetResult`.
+- All internal synchronization is via `Interlocked` operations; the memory model is at least sequentially consistent across `SetResult` → continuation → `GetResult`.
+
+The awaiter state we maintain (`ReaderAwaiterState`, `WriterAwaiterState`) is a separate coordination layer *on top* of MRVTS. MRVTS handles continuation delivery; our state machine handles the "do I need to signal?" decision.
 
 Specifically:
-- When the waiter transitions `Idle → Armed`, it calls `_awaiter.Reset()` and prepares to return `new ValueTask<T>(source, _awaiter.Version)`, where `source` is the containing class implementing `IValueTaskSource<T>`.
+- When the waiter transitions `Idle → Armed`, it calls `_awaiter.Reset()` (advancing `Version`) and prepares to return `new ValueTask<T>(source, _awaiter.Version)`, where `source` is the containing class implementing `IValueTaskSource<T>`.
 - When the signaler wins the CAS `Armed → Signaled`, it calls `_awaiter.SetResult(...)`, which schedules the continuation.
 - The waiter's `ValueTask` completes when the continuation runs.
-- `Version` disambiguates reuse of the `ValueTaskSource` — each arm cycle increments it via `Reset()`.
+- `Version` disambiguates reuse of the `ValueTaskSource` — each arm cycle increments it via `Reset()`, so a stale `SetResult` for a previous version has no path to deliver to the new awaiter cycle.
 
 **Reader-side translation.** The reader's `ManualResetValueTaskSourceCore` carries `ReadSignal` (§4.4), not `ReadResult`. `ReadSignal` contains only `IsCanceled`; no other fields are needed because the reader re-acquires all shared state itself. `SpscPipeReader` implements `IValueTaskSource<ReadResult>` and bridges the gap: its `GetResult` retrieves the `ReadSignal` from the core, resets `ReaderAwaiterState` to `Idle`, disposes the cancellation registration, and — for non-canceled signals — builds the real `ReadResult` by re-executing the read logic (§7.1 steps 3–7) from reader-local state. For canceled signals, it returns a canceled `ReadResult` directly. This runs on the reader's scheduled continuation thread, so accessing reader-local fields is safe under the SPSC invariant.
 
@@ -1063,6 +1087,11 @@ A segment may be retired by the reader iff the writer is provably done writing t
 - `Volatile.Read(ref seg.Next) != null` — the writer's splice writes `seg.Next` before advancing `state.Tail` past `seg`, so observing `seg.Next` as non-null implies the writer has already published a successor and will never select `seg` as `prevTail` again.
 
 **Anchor point.** The invariant is held at splice-entry, not at every memory-state moment. The materialization point is the writer's plain read `prevTail = state.Tail` at the top of `SpliceUnpublishedChain` — that is the one place where a retired `prevTail` would cause the writer to execute `Volatile.Write(ref seg.Next, ...)` on a recycled segment. Between the two release-stores of an in-progress splice, the writer's internal view of `state.Tail` briefly lags its Part1 store, and a reader may validly retire the lagging segment in that window (its successor is already published, so the second disjunct above applies). This transient is harmless because the writer does not re-read `state.Tail` until its current splice completes and its view advances to `_unpublishedTail`; by the time the next splice begins, the observed `prevTail` has moved past the retired segment. A stronger formulation — "`writerTailView` is never a retired segment" — would be incorrect, not just overly conservative.
+
+**Reader-side lifetime is a separate obligation.** The two disjuncts above are necessary but not sufficient for retirement safety. They establish that the *writer* will not touch `seg` again, but retirement also ends the segment's lifetime from the *reader's* perspective: once the reader returns `seg` to the segment pool, the writer is free to rent the same object and reinitialize its fields (§4.1 on pooled mutability). Any later reader-side read of `seg.RunningIndex`, `seg.WrittenLength`, `seg.Memory`, or any other field would observe reinitialized values, i.e., fields belonging to a different logical segment. The retirement rule therefore has two parts, both required:
+
+1. **Writer-side:** the two disjuncts above — writer is provably done writing to `seg.Next`.
+2. **Reader-side:** every reader-side read of `seg`'s fields that this `AdvanceTo` call depends on has already completed. In practice, this means any computation that reads fields of `consumedSeg` or `examinedSeg` (notably the `_examinedPosition` snapshot) must be sequenced *before* the retirement walk. §7.3 enforces this ordering in its step 2.
 
 Conversely, a segment whose `Next` is `null` and which matches our last acquired `state.Tail` may currently be (or is about to be written by) the writer. Retiring such a segment would risk corrupting whatever consumer the segment pool gives it to, because the writer may still execute `Volatile.Write(ref seg.Next, ...)` on it.
 
