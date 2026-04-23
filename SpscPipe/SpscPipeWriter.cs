@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Runtime.ExceptionServices;
 using System.Threading.Tasks.Sources;
 using SpscPipe.Internal;
 
@@ -199,10 +200,17 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
 
         ref var state = ref _pipe._state;
 
-        // Step 3–4: reader completion shortcuts.
+        // Step 3–4: reader completion shortcut.  §10.4: if reader completed
+        // with an exception, throw it on this FlushAsync (symmetric to the
+        // reader's behavior on WriterException).
         var readerDone = Volatile.Read(ref state.ReaderCompletionState) == 2;
         if (readerDone)
+        {
+            var ex = state.ReaderException;
+            if (ex is not null)
+                ex.Throw();
             return ValueTask.FromResult(new FlushResult(isCanceled: false, isCompleted: true));
+        }
 
         // Step 5: backpressure check.
         var bytesRead = Volatile.Read(ref state.BytesReadPublished);
@@ -234,7 +242,12 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
                 // Retry fast-path check.
                 var readerDone = Volatile.Read(ref state.ReaderCompletionState) == 2;
                 if (readerDone)
+                {
+                    var exCompletion = state.ReaderException;
+                    if (exCompletion is not null)
+                        exCompletion.Throw();
                     return ValueTask.FromResult(new FlushResult(isCanceled: false, isCompleted: true));
+                }
 
                 var bytesRead = Volatile.Read(ref state.BytesReadPublished);
                 if (_bytesWritten - bytesRead < _pipe.Options.PauseWriterThreshold)
@@ -260,6 +273,12 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
                 if (prev2 == AwaiterStates.Armed)
                 {
                     // Successfully un-armed.
+                    if (readerDone2)
+                    {
+                        var exCompletion = state.ReaderException;
+                        if (exCompletion is not null)
+                            exCompletion.Throw();
+                    }
                     return ValueTask.FromResult(
                         new FlushResult(isCanceled: false, isCompleted: readerDone2));
                 }
@@ -286,9 +305,92 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
             _flushAwaiter.SetResult(new FlushResult(isCanceled: true, isCompleted: false));
     }
 
-    // §6.6 — checkpoint 4
+    // §6.6.  Flushes any pending bytes so the reader sees them, releases
+    // the writer's own reference to the active buffer, stores the optional
+    // exception, release-stores the completion state, and wakes a parked
+    // reader.  The splice in step 1 may itself signal the reader; the final
+    // signal in step 5 is a no-op if the awaiter is already Idle.
     public override void Complete(Exception? exception = null)
-        => throw new NotImplementedException();
+    {
+        // Step 1: splice any pending bytes so the reader can see them.
+        if (_activeBufferHolder is not null && _unflushedStart < _activeBufferWritten)
+            AppendActiveSegmentToUnpublished();
+
+        if (_unpublishedHead is not null)
+            SpliceUnpublishedChain();
+
+        // Step 2: drop the writer's own reference to the active buffer
+        // (§6.5.2).  Any still-outstanding segments keep their references
+        // via the refcount; the buffer returns to the pool when the last
+        // reader-retirement drives Refcount to 0.
+        if (_activeBufferHolder is not null)
+        {
+            _pipe.ReleaseHolder(_activeBufferHolder);
+            _activeBufferHolder = null;
+        }
+
+        ref var state = ref _pipe._state;
+
+        // Step 3: plain write of exception; visible via the release-acquire
+        // edge on WriterCompletionState below (§10.4).
+        if (exception is not null)
+            state.WriterException = ExceptionDispatchInfo.Capture(exception);
+
+        // Step 4: release-store completion.  After this, a reader acquire-
+        // loading WriterCompletionState == 2 is guaranteed to observe the
+        // WriterException plain write above.
+        Volatile.Write(ref state.WriterCompletionState, 2);
+
+        // Step 5: wake a parked reader.  The fence-guarded CAS in
+        // MaybeSignalReaderAwaiter only SetResults when the reader is
+        // actually Armed, so a double-signal across step 1 and step 5
+        // is benign (second signal no-ops if the first already won).
+        MaybeSignalReaderAwaiter();
+    }
+
+    // Cleanup walk used by SpscPipe.Dispose and SpscPipe.Reset.  Walks the
+    // writer-local unpublished chain releasing each segment's holder and
+    // returning the segment to the pool, then releases the active buffer's
+    // own reference.  Must only run when no writer operations are in flight.
+    internal void DoCleanup()
+    {
+        var current = _unpublishedHead;
+        while (current is not null)
+        {
+            var next = current._next;   // plain read — no concurrent access at cleanup
+            if (current.Holder is not null)
+            {
+                _pipe.ReleaseHolder(current.Holder);
+                current.Holder = null;
+            }
+            _pipe._segmentPool.Return(current);
+            current = next;
+        }
+        _unpublishedHead = null;
+        _unpublishedTail = null;
+        _unpublishedBytes = 0;
+
+        if (_activeBufferHolder is not null)
+        {
+            _pipe.ReleaseHolder(_activeBufferHolder);
+            _activeBufferHolder = null;
+        }
+
+        _activeBufferWritten  = 0;
+        _activeBufferCapacity = 0;
+        _unflushedStart       = 0;
+        _bytesWritten         = 0;
+    }
+
+    internal void ReInitForReuse()
+    {
+        _flushCtr.Dispose();
+        _flushCtr = default;
+        _flushAwaiter = new ManualResetValueTaskSourceCore<FlushResult>
+        {
+            RunContinuationsAsynchronously = true,
+        };
+    }
 
     // IValueTaskSource<FlushResult> (§8.7 symmetric — no ReadSignal bridge
     // needed since FlushResult is buildable from shared state) --------------
@@ -302,9 +404,10 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
 
     FlushResult IValueTaskSource<FlushResult>.GetResult(short token)
     {
+        FlushResult result;
         try
         {
-            return _flushAwaiter.GetResult(token);
+            result = _flushAwaiter.GetResult(token);
         }
         finally
         {
@@ -312,5 +415,17 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
             _flushCtr = default;
             Volatile.Write(ref _pipe._state.WriterAwaiterState, AwaiterStates.Idle);
         }
+
+        // §10.4: if the signal delivered a completed result (reader finished),
+        // surface ReaderException if one was set.  IsCanceled results bypass
+        // the exception — cancellation is its own signal, not a completion.
+        if (result.IsCompleted && !result.IsCanceled)
+        {
+            var ex = _pipe._state.ReaderException;
+            if (ex is not null)
+                ex.Throw();
+        }
+
+        return result;
     }
 }

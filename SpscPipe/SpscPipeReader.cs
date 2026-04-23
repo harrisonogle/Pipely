@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Runtime.ExceptionServices;
 using System.Threading.Tasks.Sources;
 using SpscPipe.Internal;
 
@@ -129,45 +130,50 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
 
         ref var state = ref _pipe._state;
 
+        // §7.1 step 3: completion before Tail.
         var writerDone = Volatile.Read(ref state.WriterCompletionState) == 2;
         var tail = Volatile.Read(ref state.Tail);
 
+        // §7.1 step 4: first-read head initialization.
         if (_head is null && tail is not null)
         {
             _head = Volatile.Read(ref state.Head);
             _headConsumedOffset = 0;
         }
 
-        if (tail is null)
-        {
-            if (writerDone)
-            {
-                result = new ReadResult(default, isCanceled: false, isCompleted: true);
-                _readInProgress = true;
-                _lastReturnedBuffer = default;
-                return true;
-            }
-            result = default;
-            return false;
-        }
-
-        Debug.Assert(_head is not null);
-
-        var availableEndPosition = tail.RunningIndex + tail.WrittenLength;
+        // §7.1 step 5–6.
+        var availableEndPosition = tail is null ? 0L : tail.RunningIndex + tail.WrittenLength;
         var hasNewData = availableEndPosition > _examinedPosition;
 
-        if (!hasNewData && !writerDone)
+        // §7.1 step 7: new data — return with the full available buffer.
+        if (hasNewData)
         {
-            result = default;
-            return false;
+            Debug.Assert(_head is not null && tail is not null);
+            var buffer = new ReadOnlySequence<byte>(_head!, _headConsumedOffset, tail!, tail!.WrittenLength);
+            result = new ReadResult(buffer, isCanceled: false, isCompleted: writerDone);
+            _readInProgress = true;
+            _lastReturnedBuffer = buffer;
+            return true;
         }
 
-        var buffer = new ReadOnlySequence<byte>(_head!, _headConsumedOffset, tail, tail.WrittenLength);
+        // §7.1 step 8: no new data, writer completed.  §10.4: if the writer
+        // completed with an exception, throw it now (after all bytes are
+        // drained from the reader's view).  Otherwise return empty+completed.
+        if (writerDone)
+        {
+            var ex = state.WriterException;
+            if (ex is not null)
+                ex.Throw();   // throws; does not return
 
-        result = new ReadResult(buffer, isCanceled: false, isCompleted: writerDone);
-        _readInProgress = true;
-        _lastReturnedBuffer = buffer;
-        return true;
+            result = new ReadResult(default, isCanceled: false, isCompleted: true);
+            _readInProgress = true;
+            _lastReturnedBuffer = default;
+            return true;
+        }
+
+        // §7.1 step 9: no data, no completion — sync path fails; caller arms.
+        result = default;
+        return false;
     }
 
     // §7.3 + §8.4 signal ---------------------------------------------------------
@@ -178,6 +184,16 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
     {
         if (!_readInProgress)
             throw new InvalidOperationException("AdvanceTo called without a matching ReadAsync/TryRead.");
+
+        // Empty-completed case: the last ReadResult was an empty completion
+        // marker (no segments).  Both consumed and examined are default
+        // SequencePositions; there is nothing to retire or examine.
+        if (_lastReturnedBuffer.IsEmpty)
+        {
+            _readInProgress = false;
+            _lastReturnedBuffer = default;
+            return;
+        }
 
         ref var state = ref _pipe._state;
         var currentTail = Volatile.Read(ref state.Tail);
@@ -276,10 +292,17 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
         if (Volatile.Read(ref state.WriterAwaiterState) == AwaiterStates.Idle)
             return;
 
-        // §8.5 hysteresis: only signal if outstanding is below resume.
-        var outstanding = Volatile.Read(ref state.BytesWrittenPublished) - _bytesRead;
-        if (outstanding >= _pipe.Options.ResumeWriterThreshold)
-            return;
+        // §8.5 hysteresis applies only to normal drain signals.  When the
+        // reader has completed, bypass the hysteresis — the writer should
+        // wake regardless of how much is outstanding so it can observe
+        // ReaderCompletionState and return/throw from FlushAsync.
+        var readerDone = Volatile.Read(ref state.ReaderCompletionState) == 2;
+        if (!readerDone)
+        {
+            var outstanding = Volatile.Read(ref state.BytesWrittenPublished) - _bytesRead;
+            if (outstanding >= _pipe.Options.ResumeWriterThreshold)
+                return;
+        }
 
         var prev = Interlocked.CompareExchange(
             ref state.WriterAwaiterState,
@@ -288,7 +311,6 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
 
         if (prev == AwaiterStates.Armed)
         {
-            var readerDone = Volatile.Read(ref state.ReaderCompletionState) == 2;
             _pipe._writer._flushAwaiter.SetResult(
                 new FlushResult(isCanceled: false, isCompleted: readerDone));
         }
@@ -307,9 +329,64 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
             _readAwaiter.SetResult(new ReadSignal { IsCanceled = true });
     }
 
-    // §7.4 — checkpoint 4
+    // §7.4.  Reader.Complete does NOT retire segments — cleanup is delegated
+    // to SpscPipe.Dispose or SpscPipe.Reset.  This avoids retiring segments
+    // that state.Tail still references (§10.7) and eliminates the race
+    // window where the writer publishes between a reader-side retirement
+    // walk and the writer observing ReaderCompletionState.
     public override void Complete(Exception? exception = null)
-        => throw new NotImplementedException();
+    {
+        ref var state = ref _pipe._state;
+
+        // Plain write of exception; visible via the release-acquire edge on
+        // ReaderCompletionState below (§10.4).
+        if (exception is not null)
+            state.ReaderException = ExceptionDispatchInfo.Capture(exception);
+
+        Volatile.Write(ref state.ReaderCompletionState, 2);
+
+        // Wake the writer if parked.
+        MaybeSignalWriterAwaiter();
+    }
+
+    // Cleanup walk used by SpscPipe.Dispose and SpscPipe.Reset.  Walks the
+    // reader-visible published chain starting from _head (if read has
+    // begun) or state.Head (if not), releasing each segment's holder and
+    // returning the segment to the pool.  Must only run when no reader
+    // operations are in flight.
+    internal void DoCleanup()
+    {
+        var current = _head ?? _pipe._state.Head;
+        while (current is not null)
+        {
+            var next = current._next;   // plain read — no concurrent access at cleanup
+            if (current.Holder is not null)
+            {
+                _pipe.ReleaseHolder(current.Holder);
+                current.Holder = null;
+            }
+            _pipe._segmentPool.Return(current);
+            current = next;
+        }
+
+        _head = null;
+        _headConsumedOffset = 0;
+        _examinedPosition = 0;
+        _bytesRead = 0;
+        _readInProgress = false;
+        _lastReturnedBuffer = default;
+    }
+
+    // Re-initialize reader for reuse after Reset.
+    internal void ReInitForReuse()
+    {
+        _readCtr.Dispose();
+        _readCtr = default;
+        _readAwaiter = new ManualResetValueTaskSourceCore<ReadSignal>
+        {
+            RunContinuationsAsynchronously = true,
+        };
+    }
 
     // IValueTaskSource<ReadResult> bridge (§8.7) ---------------------------------
 

@@ -92,7 +92,54 @@ public sealed class SpscPipe : IDisposable
 
     internal SpscPipeOptions Options => _options;
 
-    // §10.5 Reset and §10.6 Dispose are implemented in checkpoint 4.
-    public void Reset()   => throw new NotImplementedException();
-    public void Dispose() => throw new NotImplementedException();
+    // §10.5.  Requires both ends completed, with no operations in flight.
+    // Performs the same cleanup walks as Dispose, then re-initializes the
+    // pipe for reuse.
+    public void Reset()
+    {
+        if (_state.WriterCompletionState != 2 || _state.ReaderCompletionState != 2)
+            throw new InvalidOperationException(
+                "Reset requires both the writer and reader to have completed.");
+
+        _writer.DoCleanup();
+        _reader.DoCleanup();
+
+        _state = default;
+
+        _writer.ReInitForReuse();
+        _reader.ReInitForReuse();
+    }
+
+    // §10.6 Dispose — walks unpublished (writer-local) and published
+    // chains, releasing holders and returning segments to pools.  Then
+    // zeros state and suppresses the finalizer.  Not safe to call
+    // concurrently with active reader or writer operations; the caller
+    // must ensure no ops are in flight.
+    public void Dispose()
+    {
+        _writer.DoCleanup();
+        _reader.DoCleanup();
+        _state = default;
+        GC.SuppressFinalize(this);
+    }
+
+    // §10.6 Finalizer — weak safety net for abandoned pipes.  Particularly
+    // important for custom MemoryPool<byte> implementations backed by
+    // pinned/native memory; for ArrayPool<byte>.Shared-backed buffers the
+    // GC would eventually reclaim anyway.  Reads writer/reader state
+    // without explicit Volatile.Read; relies on the GC's stop-the-world
+    // phase to induce the necessary memory barrier before the finalizer
+    // thread runs.
+    ~SpscPipe()
+    {
+        try
+        {
+            _writer.DoCleanup();
+            _reader.DoCleanup();
+        }
+        catch
+        {
+            // Finalizers must not throw.
+        }
+    }
 }
