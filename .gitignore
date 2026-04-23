@@ -427,3 +427,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# TLA+ / TLC model-checker output
+spec/tla/states/
