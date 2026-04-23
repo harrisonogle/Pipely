@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO.Pipelines;
 using SpscPipe.Internal;
 
@@ -23,6 +24,7 @@ public sealed class SpscPipe : IDisposable
 
     internal readonly SegmentPool       _segmentPool;
     internal readonly BufferHolderPool  _bufferHolderPool;
+    internal readonly MemoryPool<byte>  _memoryPool;
 
     public SpscPipe() : this(s_defaultOptions) { }
 
@@ -60,9 +62,25 @@ public sealed class SpscPipe : IDisposable
 
         _segmentPool      = new SegmentPool(poolSize);
         _bufferHolderPool = new BufferHolderPool(poolSize);
+        _memoryPool       = options.Pool ?? MemoryPool<byte>.Shared;
 
         _reader = new SpscPipeReader(this);
         _writer = new SpscPipeWriter(this);
+    }
+
+    // §6.5.2 shared ReleaseHolder helper.  Called by the writer during
+    // buffer rotation / Complete, and by the reader during segment
+    // retirement.  Interlocked.Decrement is a full fence by the §5 axiom,
+    // which orders all prior writes/reads on this thread globally before
+    // the decrement — so if this thread drives the count to 0, no other
+    // thread holds an outstanding reference to the buffer.
+    internal void ReleaseHolder(BufferHolder holder)
+    {
+        if (Interlocked.Decrement(ref holder.Refcount) == 0)
+        {
+            holder.Owner!.Dispose();  // returns the buffer to MemoryPool<byte>
+            _bufferHolderPool.Return(holder);
+        }
     }
 
     public PipeReader Reader => _reader;

@@ -25,10 +25,48 @@ internal sealed class Segment : ReadOnlySequenceSegment<byte>
     // AppendActiveSegmentToUnpublished before publication.
     internal int WrittenLength;
 
-    // Internal Next pointer; accessed via Volatile.Read/Write in checkpoint 2
-    // (§7.2 acquire, §6.4.2 release-store).  base.Next is kept in sync for
-    // ReadOnlySequence<byte> external consumers.
+    // Internal Next pointer.  base.Next is kept in sync for external
+    // ReadOnlySequence<byte> consumers; _next carries the release/acquire
+    // semantics SpscPipe needs internally.
     internal Segment? _next;
+
+    // Fills all fields at rental time (§6.4.1 step 1).  base.Next's
+    // protected setter forces this to live on Segment rather than in the
+    // writer.  Plain stores — no release needed until the splice publishes
+    // the segment via its own release-store.
+    internal void Initialize(BufferHolder holder, int bufferStart, int writtenLength, long runningIndex)
+    {
+        Holder = holder;
+        BufferStart = bufferStart;
+        WrittenLength = writtenLength;
+        Memory = holder.Owner!.Memory.Slice(bufferStart, writtenLength);
+        RunningIndex = runningIndex;
+        _next = null;
+        base.Next = null;
+    }
+
+    // §7.2 acquire-load: paired with SetNextRelease on the writer side.
+    // Release/acquire happens-before edge guarantees the caller observes
+    // every writer write that preceded the release-store of _next.
+    internal Segment? AcquireNext() => Volatile.Read(ref _next);
+
+    // §6.4.2 release-store #1 (subsequent-splice case).  Sets base.Next
+    // first (atomic reference store, for ROSeq<byte> enumerators) then
+    // release-stores _next (what reader-side acquire-loads observe).
+    internal void SetNextRelease(Segment? next)
+    {
+        base.Next = next;
+        Volatile.Write(ref _next, next);
+    }
+
+    // §6.4.1 step 2: plain intra-chain Next write.  Used while the chain
+    // is still writer-local; the reader cannot reach these segments until
+    // the splice's release-store establishes the happens-before edge.
+    internal void SetNextPlain(Segment? next)
+    {
+        base.Next = next;
+        _next = next;
+    }
 
     // Resets all fields for pool return.  Called from SegmentPool.Return.
     internal void Reset()
