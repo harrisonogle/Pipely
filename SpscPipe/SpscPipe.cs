@@ -19,8 +19,12 @@ public sealed class SpscPipe : IDisposable
     // initialization here zeroes all fields per Init in the TLA+ model.
     internal State _state = default;
 
-    private readonly SpscPipeReader _reader;
-    private readonly SpscPipeWriter _writer;
+    // Internal so each side can reach the other's awaiter field for
+    // cross-side SetResult calls (§8.2 writer-signals-reader, §8.4
+    // reader-signals-writer).  Exposed via Reader / Writer properties
+    // below for external consumers.
+    internal readonly SpscPipeReader _reader;
+    internal readonly SpscPipeWriter _writer;
 
     internal readonly SegmentPool       _segmentPool;
     internal readonly BufferHolderPool  _bufferHolderPool;

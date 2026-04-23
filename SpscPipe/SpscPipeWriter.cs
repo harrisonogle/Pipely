@@ -1,33 +1,47 @@
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Threading.Tasks.Sources;
 using SpscPipe.Internal;
 
 namespace SpscPipe;
 
-// §6 Writer facade.  PipeWriter implementation bound to an SpscPipe.
-// Checkpoint 2 scope: happy-path GetMemory/Advance/FlushAsync and the
-// publication protocol (§6.4.1, §6.4.2) + §10.7-aware retirement on
-// the reader side.  No backpressure, no awaiter coordination, no
-// cancellation — all of those arrive in checkpoint 3.
-internal sealed class SpscPipeWriter : PipeWriter
+// §6 Writer facade.  Also implements IValueTaskSource<FlushResult> — the
+// FlushResult payload is buildable from shared state (unlike ReadResult),
+// so no ReadSignal-style bridge is required.
+internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
 {
     private readonly SpscPipe _pipe;
 
     // §4.3 writer-local state ----------------------------------------------------
 
-    // Unpublished chain (writer-local; reader cannot see until splice).
     private Segment? _unpublishedHead;
     private Segment? _unpublishedTail;
     private long     _unpublishedBytes;
 
-    // Active buffer (currently being filled).
     private BufferHolder? _activeBufferHolder;
     private int           _activeBufferWritten;
     private int           _activeBufferCapacity;
     private int           _unflushedStart;
 
-    // Mirror of state.BytesWrittenPublished, advanced at each splice.
     private long _bytesWritten;
+
+    // §8 awaiter state.
+    internal ManualResetValueTaskSourceCore<FlushResult> _flushAwaiter =
+        new() { RunContinuationsAsynchronously = true };
+
+    private CancellationTokenRegistration _flushCtr;
+
+    private static readonly Action<object?, CancellationToken> s_cancelCallback =
+        static (state, _) =>
+        {
+            var w = (SpscPipeWriter)state!;
+            var prev = Interlocked.CompareExchange(
+                ref w._pipe._state.WriterAwaiterState,
+                AwaiterStates.Signaled,
+                AwaiterStates.Armed);
+            if (prev == AwaiterStates.Armed)
+                w._flushAwaiter.SetResult(new FlushResult(isCanceled: true, isCompleted: false));
+        };
 
     internal SpscPipeWriter(SpscPipe pipe) => _pipe = pipe;
 
@@ -50,15 +64,9 @@ internal sealed class SpscPipeWriter : PipeWriter
         if (remaining >= desiredSize)
             return _activeBufferHolder.Owner!.Memory.Slice(_activeBufferWritten);
 
-        // Not enough room.  Any unflushed bytes on the current buffer become
-        // a segment in the unpublished chain; then rotate to a new buffer.
         if (_unflushedStart < _activeBufferWritten)
             AppendActiveSegmentToUnpublished();
 
-        // Drop the writer's own reference to the current holder.  Segments
-        // appended to the unpublished chain retain their own references
-        // (§6.5); the buffer returns to the pool when the last of them is
-        // retired (or at Dispose, if the chain never gets spliced).
         _pipe.ReleaseHolder(_activeBufferHolder);
         _activeBufferHolder = null;
 
@@ -73,7 +81,7 @@ internal sealed class SpscPipeWriter : PipeWriter
         var owner = _pipe._memoryPool.Rent(size);
         var holder = _pipe._bufferHolderPool.Rent();
         holder.Owner = owner;
-        holder.Refcount = 1;            // writer's own reference (§6.5.2)
+        holder.Refcount = 1;
         _activeBufferHolder   = holder;
         _activeBufferCapacity = owner.Memory.Length;
         _activeBufferWritten  = 0;
@@ -91,10 +99,6 @@ internal sealed class SpscPipeWriter : PipeWriter
     }
 
     // §6.4.1 ---------------------------------------------------------------------
-    // Writer-local only.  Builds a Segment for the current active buffer's
-    // unflushed bytes and appends it to the unpublished chain.  The reader
-    // cannot observe this segment until SpliceUnpublishedChain makes the
-    // chain reachable via a release-store.
     private void AppendActiveSegmentToUnpublished()
     {
         Debug.Assert(_activeBufferHolder is not null);
@@ -102,11 +106,9 @@ internal sealed class SpscPipeWriter : PipeWriter
 
         var holder = _activeBufferHolder!;
 
-        // §6.5.2 + §6.5.3: the Interlocked.Increment is a full fence by the
-        // §5 axiom, so it is globally ordered before any subsequent release-
-        // store in SpliceUnpublishedChain that makes this segment reader-
-        // reachable.  Any reader that later observes the segment also
-        // observes the incremented Refcount.
+        // §6.5.2 + §6.5.3: full-fence increment, ordered globally before
+        // the release-stores in SpliceUnpublishedChain that make the
+        // segment reader-reachable.
         Interlocked.Increment(ref holder.Refcount);
 
         var seg = _pipe._segmentPool.Rent();
@@ -117,13 +119,10 @@ internal sealed class SpscPipeWriter : PipeWriter
             runningIndex:  _bytesWritten + _unpublishedBytes);
 
         if (_unpublishedTail is null)
-        {
             _unpublishedHead = seg;
-        }
         else
-        {
-            _unpublishedTail.SetNextPlain(seg);  // §6.4.1 step 2: plain intra-chain write
-        }
+            _unpublishedTail.SetNextPlain(seg);
+
         _unpublishedTail = seg;
         _unpublishedBytes += seg.WrittenLength;
 
@@ -131,85 +130,187 @@ internal sealed class SpscPipeWriter : PipeWriter
     }
 
     // §6.4.2 ---------------------------------------------------------------------
-    // The publication point.  A single invocation publishes every segment
-    // currently in the unpublished chain to the reader atomically (in
-    // happens-before terms).  The three release-stores in the order below
-    // are LOAD-BEARING on weak memory (ARM64); verified by TLC in
-    // spec/tla/Publication.tla.  Do not reorder.
     private void SpliceUnpublishedChain()
     {
         Debug.Assert(_unpublishedHead is not null);
 
         ref var state = ref _pipe._state;
 
-        // Step 1: snapshot current tail.  Plain read — the writer is the
-        // sole writer of state.Tail, so buffer-forwarding delivers the
-        // latest value without a Volatile.Read.
         var prevTail = state.Tail;
 
         if (prevTail is null)
         {
-            // First splice ever.
-            // CRITICAL ORDERING: Head MUST be written before Tail.  The
-            // reader reads Tail before Head (§7.1 step 3–4); the acquire-
-            // load of Tail seeing a chain segment establishes a happens-
-            // before edge that makes the preceding release-store of Head
-            // visible.  Reversing the order would permit the reader to
-            // observe Tail = chainTail while Head is still null.
             Volatile.Write(ref state.Head, _unpublishedHead);   // §6.4.2 release-store #0 (first-ever head)
             Volatile.Write(ref state.Tail, _unpublishedTail);   // §6.4.2 release-store #1
         }
         else
         {
-            // Subsequent splice.  Link prevTail.Next to chain head first,
-            // then advance state.Tail.  Order matters for the same reason:
-            // Publication.tla fence-flip experiment produces a
-            // ChainConsistent counterexample in 4 steps when reversed.
             prevTail.SetNextRelease(_unpublishedHead);          // §6.4.2 release-store #1 (prevTail.Next)
             Volatile.Write(ref state.Tail, _unpublishedTail);   // §6.4.2 release-store #2
         }
 
-        // Step 3: publish BytesWrittenPublished.  Must come after the chain
-        // pointers so a reader observing the counter can find segments
-        // accounting for the bytes.
         _bytesWritten += _unpublishedBytes;
         Volatile.Write(ref state.BytesWrittenPublished, _bytesWritten);   // §6.4.2 release-store #3
 
-        // Step 4: clear the unpublished chain — its segments are now
-        // reader-reachable.
         _unpublishedHead = null;
         _unpublishedTail = null;
         _unpublishedBytes = 0;
 
-        // Step 5: MaybeSignalReaderAwaiter — arrives in checkpoint 3.
+        // Step 5: signal the reader if it's parked.
+        MaybeSignalReaderAwaiter();
     }
 
-    // §6.3 -----------------------------------------------------------------------
+    // §8.2 writer-signals-reader.  Called from SpliceUnpublishedChain.
+    // Preceded in program order by the release-stores of state.Tail and
+    // state.BytesWrittenPublished; the MemoryBarrier below is the StoreLoad
+    // fence that prevents the reader's arm from being unseen by this load
+    // of ReaderAwaiterState.  Confirmed load-bearing by
+    // AwaiterHandshake.tla's ENABLE_WRITER_FENCE=FALSE counterexample.
+    private void MaybeSignalReaderAwaiter()
+    {
+        Interlocked.MemoryBarrier();
+
+        ref var state = ref _pipe._state;
+
+        if (Volatile.Read(ref state.ReaderAwaiterState) == AwaiterStates.Idle)
+            return;
+
+        var prev = Interlocked.CompareExchange(
+            ref state.ReaderAwaiterState,
+            AwaiterStates.Signaled,
+            AwaiterStates.Armed);
+
+        if (prev == AwaiterStates.Armed)
+            _pipe._reader._readAwaiter.SetResult(new ReadSignal { IsCanceled = false });
+    }
+
+    // §6.3 + §8.4 ---------------------------------------------------------------
     public override ValueTask<FlushResult> FlushAsync(CancellationToken cancellationToken = default)
     {
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromResult(new FlushResult(isCanceled: true, isCompleted: false));
 
-        // Step 2: fold the current active buffer's unflushed bytes into the
-        // chain, then splice.
+        // Step 2: publish pending bytes.
         if (_activeBufferHolder is not null && _unflushedStart < _activeBufferWritten)
             AppendActiveSegmentToUnpublished();
 
         if (_unpublishedHead is not null)
             SpliceUnpublishedChain();
 
-        // Step 3–4: completion check (reader side — always false in this
-        // checkpoint, the reader can't Complete yet).  Checkpoint 4.
+        ref var state = ref _pipe._state;
 
-        // Step 5–6: backpressure check + slow path — checkpoint 3.
-        return ValueTask.FromResult(new FlushResult(isCanceled: false, isCompleted: false));
+        // Step 3–4: reader completion shortcuts.
+        var readerDone = Volatile.Read(ref state.ReaderCompletionState) == 2;
+        if (readerDone)
+            return ValueTask.FromResult(new FlushResult(isCanceled: false, isCompleted: true));
+
+        // Step 5: backpressure check.
+        var bytesRead = Volatile.Read(ref state.BytesReadPublished);
+        var outstanding = _bytesWritten - bytesRead;
+        if (outstanding < _pipe.Options.PauseWriterThreshold)
+            return ValueTask.FromResult(new FlushResult(isCanceled: false, isCompleted: false));
+
+        // Step 6: slow path — arm the flush awaiter.  §8.4.
+        return ArmFlushAwaiter(cancellationToken);
     }
 
-    // §6.7 — checkpoint 3
+    private ValueTask<FlushResult> ArmFlushAwaiter(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            _flushAwaiter.Reset();
+
+            ref var state = ref _pipe._state;
+
+            // Step A: CAS Idle → Armed.  Full fence by §5 axiom.
+            var prev = Interlocked.CompareExchange(
+                ref state.WriterAwaiterState,
+                AwaiterStates.Armed,
+                AwaiterStates.Idle);
+
+            if (prev != AwaiterStates.Idle)
+            {
+                Volatile.Write(ref state.WriterAwaiterState, AwaiterStates.Idle);
+                // Retry fast-path check.
+                var readerDone = Volatile.Read(ref state.ReaderCompletionState) == 2;
+                if (readerDone)
+                    return ValueTask.FromResult(new FlushResult(isCanceled: false, isCompleted: true));
+
+                var bytesRead = Volatile.Read(ref state.BytesReadPublished);
+                if (_bytesWritten - bytesRead < _pipe.Options.PauseWriterThreshold)
+                    return ValueTask.FromResult(new FlushResult(isCanceled: false, isCompleted: false));
+                continue;
+            }
+
+            // Step B: full fence.  Redundant with Step A's CAS per §8.3
+            // footnote — elided for the correct-code path.
+
+            // Step C: re-check backpressure.
+            var readerDone2 = Volatile.Read(ref state.ReaderCompletionState) == 2;
+            var bytesRead2 = Volatile.Read(ref state.BytesReadPublished);
+            var outstanding = _bytesWritten - bytesRead2;
+
+            if (outstanding < _pipe.Options.PauseWriterThreshold || readerDone2)
+            {
+                var prev2 = Interlocked.CompareExchange(
+                    ref state.WriterAwaiterState,
+                    AwaiterStates.Idle,
+                    AwaiterStates.Armed);
+
+                if (prev2 == AwaiterStates.Armed)
+                {
+                    // Successfully un-armed.
+                    return ValueTask.FromResult(
+                        new FlushResult(isCanceled: false, isCompleted: readerDone2));
+                }
+
+                Volatile.Write(ref state.WriterAwaiterState, AwaiterStates.Idle);
+            }
+
+            // Step D: register cancellation, return ValueTask.
+            _flushCtr = cancellationToken.UnsafeRegister(s_cancelCallback, this);
+
+            return new ValueTask<FlushResult>(this, _flushAwaiter.Version);
+        }
+    }
+
+    // §6.7
     public override void CancelPendingFlush()
-        => throw new NotImplementedException();
+    {
+        ref var state = ref _pipe._state;
+        var prev = Interlocked.CompareExchange(
+            ref state.WriterAwaiterState,
+            AwaiterStates.Signaled,
+            AwaiterStates.Armed);
+        if (prev == AwaiterStates.Armed)
+            _flushAwaiter.SetResult(new FlushResult(isCanceled: true, isCompleted: false));
+    }
 
     // §6.6 — checkpoint 4
     public override void Complete(Exception? exception = null)
         => throw new NotImplementedException();
+
+    // IValueTaskSource<FlushResult> (§8.7 symmetric — no ReadSignal bridge
+    // needed since FlushResult is buildable from shared state) --------------
+
+    ValueTaskSourceStatus IValueTaskSource<FlushResult>.GetStatus(short token)
+        => _flushAwaiter.GetStatus(token);
+
+    void IValueTaskSource<FlushResult>.OnCompleted(
+        Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+        => _flushAwaiter.OnCompleted(continuation, state, token, flags);
+
+    FlushResult IValueTaskSource<FlushResult>.GetResult(short token)
+    {
+        try
+        {
+            return _flushAwaiter.GetResult(token);
+        }
+        finally
+        {
+            _flushCtr.Dispose();
+            _flushCtr = default;
+            Volatile.Write(ref _pipe._state.WriterAwaiterState, AwaiterStates.Idle);
+        }
+    }
 }

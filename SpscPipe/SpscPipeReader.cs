@@ -1,17 +1,15 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Threading.Tasks.Sources;
 using SpscPipe.Internal;
 
 namespace SpscPipe;
 
-// §7 Reader facade.  PipeReader implementation bound to an SpscPipe.
-// Checkpoint 2 scope: happy-path ReadAsync/TryRead/AdvanceTo with
-// §10.7-aware retirement.  No awaiter, no cancellation parking — a
-// ReadAsync that finds no data and no completion throws (tests must
-// produce before consuming in checkpoint 2).  Awaiter arrives in
-// checkpoint 3, lifecycle in checkpoint 4.
-internal sealed class SpscPipeReader : PipeReader
+// §7 Reader facade.  Implements IValueTaskSource<ReadResult> so the
+// awaiter's internal payload (ReadSignal) can be translated to a real
+// ReadResult on the reader's scheduled continuation thread (§8.7).
+internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
 {
     private readonly SpscPipe _pipe;
 
@@ -25,27 +23,105 @@ internal sealed class SpscPipeReader : PipeReader
     private bool                   _readInProgress;
     private ReadOnlySequence<byte> _lastReturnedBuffer;
 
+    // §8.7 awaiter carries ReadSignal, not ReadResult.  Continuations run
+    // asynchronously (ThreadPool) so the writer's SetResult does not block
+    // on the reader's continuation.
+    internal ManualResetValueTaskSourceCore<ReadSignal> _readAwaiter =
+        new() { RunContinuationsAsynchronously = true };
+
+    private CancellationTokenRegistration _readCtr;
+
+    // Static cancel callback to avoid per-arm-cycle delegate allocation.
+    private static readonly Action<object?, CancellationToken> s_cancelCallback =
+        static (state, _) =>
+        {
+            var r = (SpscPipeReader)state!;
+            var prev = Interlocked.CompareExchange(
+                ref r._pipe._state.ReaderAwaiterState,
+                AwaiterStates.Signaled,
+                AwaiterStates.Armed);
+            if (prev == AwaiterStates.Armed)
+                r._readAwaiter.SetResult(new ReadSignal { IsCanceled = true });
+        };
+
     internal SpscPipeReader(SpscPipe pipe) => _pipe = pipe;
 
-    // §7.1 -----------------------------------------------------------------------
+    // §7.1 + §8.3 ---------------------------------------------------------------
     public override ValueTask<ReadResult> ReadAsync(CancellationToken cancellationToken = default)
     {
-        if (cancellationToken.IsCancellationRequested)
-            return ValueTask.FromResult(new ReadResult(default, isCanceled: true, isCompleted: false));
+        while (true)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return ValueTask.FromResult(new ReadResult(default, isCanceled: true, isCompleted: false));
 
-        if (TryReadCore(out var result))
-            return ValueTask.FromResult(result);
+            // Sync fast path (§7.1 steps 3–8).
+            if (TryReadCore(out var syncResult))
+                return ValueTask.FromResult(syncResult);
 
-        // Checkpoint 3 replaces this with awaiter arming.
-        throw new NotImplementedException(
-            "Awaiter coordination lands in checkpoint 3; until then, ReadAsync requires " +
-            "data to have been flushed (or the writer completed) before the call.");
+            // Slow path: arm the read awaiter.  §8.3.
+            _readAwaiter.Reset();
+
+            ref var state = ref _pipe._state;
+
+            // Step A: CAS Idle → Armed.  Also a full fence by §5 axiom,
+            // which subsumes Step B below.
+            var prev = Interlocked.CompareExchange(
+                ref state.ReaderAwaiterState,
+                AwaiterStates.Armed,
+                AwaiterStates.Idle);
+
+            if (prev != AwaiterStates.Idle)
+            {
+                // A prior signal left the state as Signaled (a stale signal
+                // not yet consumed), or an illegal concurrent reader violated
+                // SPSC.  Reset to Idle and re-run the sync path — under
+                // correct signaling, data should now be available.
+                Volatile.Write(ref state.ReaderAwaiterState, AwaiterStates.Idle);
+                continue;
+            }
+
+            // Step B: redundant MemoryBarrier per §8.3 footnote — Step A CAS
+            // already provides the full fence.  Keeping it elided for clarity
+            // in the correct-code path; the TLA+ model (AwaiterHandshake.tla)
+            // confirms Step B is unnecessary given Step A.
+
+            // Step C: re-check whether data arrived or writer completed.
+            // Order: completion before Tail, per §7.1 step 3.
+            var writerDone = Volatile.Read(ref state.WriterCompletionState) == 2;
+            var tail = Volatile.Read(ref state.Tail);
+            var hasNewData = tail is not null &&
+                             tail.RunningIndex + tail.WrittenLength > _examinedPosition;
+
+            if (hasNewData || writerDone)
+            {
+                var prev2 = Interlocked.CompareExchange(
+                    ref state.ReaderAwaiterState,
+                    AwaiterStates.Idle,
+                    AwaiterStates.Armed);
+
+                if (prev2 == AwaiterStates.Armed)
+                {
+                    // Successfully un-armed.  Redo sync path.
+                    continue;
+                }
+
+                // prev2 == Signaled: signaler beat us between Step A and now.
+                // SetResult has run; fall through and return the ValueTask,
+                // which will complete synchronously.
+                Volatile.Write(ref state.ReaderAwaiterState, AwaiterStates.Idle);
+            }
+
+            // Step D: register cancellation and return the awaiter's
+            // ValueTask.  UnsafeRegister avoids capturing ExecutionContext
+            // on the hot path.
+            _readCtr = cancellationToken.UnsafeRegister(s_cancelCallback, this);
+
+            return new ValueTask<ReadResult>(this, _readAwaiter.Version);
+        }
     }
 
     public override bool TryRead(out ReadResult result) => TryReadCore(out result);
 
-    // Shared ReadAsync / TryRead core.  Returns true if a non-empty ReadResult
-    // (data or completion) is available synchronously.
     private bool TryReadCore(out ReadResult result)
     {
         if (_readInProgress)
@@ -53,24 +129,15 @@ internal sealed class SpscPipeReader : PipeReader
 
         ref var state = ref _pipe._state;
 
-        // §7.1 step 3 — order matters: completion before Tail, so a reader
-        // that observes "writer completed" is guaranteed to also see the
-        // writer's final Tail publication (no dropped final segment).
-        // (WriterCompletionState stays 0 throughout checkpoint 2; the
-        // ordering rule still applies once checkpoint 4 lands Complete.)
         var writerDone = Volatile.Read(ref state.WriterCompletionState) == 2;
         var tail = Volatile.Read(ref state.Tail);
 
-        // §7.1 step 4: first-read initialization.  state.Head is set once
-        // by the writer's first splice and never updated again for this
-        // lifecycle.
         if (_head is null && tail is not null)
         {
             _head = Volatile.Read(ref state.Head);
             _headConsumedOffset = 0;
         }
 
-        // No tail means the writer has not yet spliced anything.
         if (tail is null)
         {
             if (writerDone)
@@ -86,8 +153,6 @@ internal sealed class SpscPipeReader : PipeReader
 
         Debug.Assert(_head is not null);
 
-        // §7.1 step 5–6: determine whether there is new data past
-        // _examinedPosition.
         var availableEndPosition = tail.RunningIndex + tail.WrittenLength;
         var hasNewData = availableEndPosition > _examinedPosition;
 
@@ -97,7 +162,6 @@ internal sealed class SpscPipeReader : PipeReader
             return false;
         }
 
-        // §7.1 step 7 / step 8: build the ReadResult.
         var buffer = new ReadOnlySequence<byte>(_head!, _headConsumedOffset, tail, tail.WrittenLength);
 
         result = new ReadResult(buffer, isCanceled: false, isCompleted: writerDone);
@@ -106,7 +170,7 @@ internal sealed class SpscPipeReader : PipeReader
         return true;
     }
 
-    // §7.3 -----------------------------------------------------------------------
+    // §7.3 + §8.4 signal ---------------------------------------------------------
     public override void AdvanceTo(SequencePosition consumed)
         => AdvanceTo(consumed, consumed);
 
@@ -115,8 +179,6 @@ internal sealed class SpscPipeReader : PipeReader
         if (!_readInProgress)
             throw new InvalidOperationException("AdvanceTo called without a matching ReadAsync/TryRead.");
 
-        // §10.7: acquire state.Tail once at entry.  This anchors the
-        // retirement check to a consistent snapshot for the whole walk.
         ref var state = ref _pipe._state;
         var currentTail = Volatile.Read(ref state.Tail);
 
@@ -127,19 +189,14 @@ internal sealed class SpscPipeReader : PipeReader
         if (consumedIdx < 0 || consumedIdx > consumedSeg.WrittenLength)
             throw new ArgumentOutOfRangeException(nameof(consumed));
 
-        // Step 2: walk _head → consumedSeg, retiring segments that pass §10.7.
         long retiredBytes = 0;
         var current = _head;
 
         while (current is not null && !ReferenceEquals(current, consumedSeg))
         {
             retiredBytes += current.WrittenLength - _headConsumedOffset;
-            var next = current.AcquireNext();    // §7.2 acquire-load
+            var next = current.AcquireNext();
 
-            // §10.7: retire iff current != acquired tail OR current.Next != null.
-            // The second disjunct catches the transient mid-splice window
-            // where state.Tail still points to current but its successor
-            // has already been published — see spec §10.7 "Anchor point".
             if (!ReferenceEquals(current, currentTail) || next is not null)
                 RetireSegment(current);
 
@@ -152,11 +209,9 @@ internal sealed class SpscPipeReader : PipeReader
                 "AdvanceTo's consumed position is not reachable from the current _head. " +
                 "Positions must come from the most recent Read result.");
 
-        // current == consumedSeg.
         if (consumedIdx == consumedSeg.WrittenLength)
         {
-            // Fully consumed current segment — retire if a successor is published.
-            var nextAfter = consumedSeg.AcquireNext();   // §7.2 acquire-load
+            var nextAfter = consumedSeg.AcquireNext();
             retiredBytes += consumedSeg.WrittenLength - _headConsumedOffset;
 
             if (nextAfter is not null)
@@ -167,14 +222,12 @@ internal sealed class SpscPipeReader : PipeReader
             }
             else
             {
-                // consumedSeg may be state.Tail; keep it.
                 _head = consumedSeg;
-                _headConsumedOffset = consumedIdx;   // == WrittenLength
+                _headConsumedOffset = consumedIdx;
             }
         }
         else
         {
-            // Partially consumed — must keep.
             retiredBytes += consumedIdx - _headConsumedOffset;
             _head = consumedSeg;
             _headConsumedOffset = consumedIdx;
@@ -182,37 +235,123 @@ internal sealed class SpscPipeReader : PipeReader
 
         _bytesRead += retiredBytes;
 
-        // Step 4: update examined position.
         var examinedSeg = examined.GetObject() as Segment;
         var examinedIdx = examined.GetInteger();
         if (examinedSeg is null)
             throw new ArgumentException("SequencePosition.GetObject() did not return a Segment.", nameof(examined));
         _examinedPosition = examinedSeg.RunningIndex + examinedIdx;
 
-        // Step 5: publish BytesReadPublished.  Acquire-acquire pairing on
-        // the writer side (§8.4) when backpressure arrives in checkpoint 3.
         Volatile.Write(ref state.BytesReadPublished, _bytesRead);
-
-        // Step 6: signal writer awaiter — checkpoint 3.
 
         _readInProgress = false;
         _lastReturnedBuffer = default;
+
+        // §8.4 reader-signals-writer.  Deferred to after publishing
+        // _bytesRead so the writer's wake-up check sees the fresh value.
+        MaybeSignalWriterAwaiter();
     }
 
-    // §10.7 retirement.  Retires the segment object and releases the
-    // writer-side refcount on its buffer holder.
     private void RetireSegment(Segment seg)
     {
         var holder = seg.Holder!;
-        _pipe._segmentPool.Return(seg);   // resets all fields and returns to pool
+        _pipe._segmentPool.Return(seg);
         _pipe.ReleaseHolder(holder);
     }
 
-    // §7.5 — checkpoint 3
+    // §8.4 reader-signals-writer.  Called after AdvanceTo publishes
+    // BytesReadPublished.  Matches §8.2 structure but with a hysteresis
+    // check (§8.5) so the writer is only woken once drained below the
+    // resume threshold — avoids wake/park thrash on single-byte retires.
+    private void MaybeSignalWriterAwaiter()
+    {
+        // StoreLoad fence.  Without this, the load of WriterAwaiterState
+        // below could reorder before the release-store of BytesReadPublished
+        // in AdvanceTo, permitting the lost-wakeup race §8.3 analyzes.
+        // Confirmed load-bearing by the AwaiterHandshake.tla fence-removal
+        // experiment (symmetric to §8.2).
+        Interlocked.MemoryBarrier();
+
+        ref var state = ref _pipe._state;
+
+        if (Volatile.Read(ref state.WriterAwaiterState) == AwaiterStates.Idle)
+            return;
+
+        // §8.5 hysteresis: only signal if outstanding is below resume.
+        var outstanding = Volatile.Read(ref state.BytesWrittenPublished) - _bytesRead;
+        if (outstanding >= _pipe.Options.ResumeWriterThreshold)
+            return;
+
+        var prev = Interlocked.CompareExchange(
+            ref state.WriterAwaiterState,
+            AwaiterStates.Signaled,
+            AwaiterStates.Armed);
+
+        if (prev == AwaiterStates.Armed)
+        {
+            var readerDone = Volatile.Read(ref state.ReaderCompletionState) == 2;
+            _pipe._writer._flushAwaiter.SetResult(
+                new FlushResult(isCanceled: false, isCompleted: readerDone));
+        }
+    }
+
+    // §7.5
     public override void CancelPendingRead()
-        => throw new NotImplementedException();
+    {
+        // Same signal semantics as the token-registered callback: Armed → Signaled.
+        ref var state = ref _pipe._state;
+        var prev = Interlocked.CompareExchange(
+            ref state.ReaderAwaiterState,
+            AwaiterStates.Signaled,
+            AwaiterStates.Armed);
+        if (prev == AwaiterStates.Armed)
+            _readAwaiter.SetResult(new ReadSignal { IsCanceled = true });
+    }
 
     // §7.4 — checkpoint 4
     public override void Complete(Exception? exception = null)
         => throw new NotImplementedException();
+
+    // IValueTaskSource<ReadResult> bridge (§8.7) ---------------------------------
+
+    ValueTaskSourceStatus IValueTaskSource<ReadResult>.GetStatus(short token)
+        => _readAwaiter.GetStatus(token);
+
+    void IValueTaskSource<ReadResult>.OnCompleted(
+        Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+        => _readAwaiter.OnCompleted(continuation, state, token, flags);
+
+    ReadResult IValueTaskSource<ReadResult>.GetResult(short token)
+    {
+        ReadSignal signal;
+        try
+        {
+            signal = _readAwaiter.GetResult(token);
+        }
+        finally
+        {
+            // Clean up cancellation registration and reset awaiter state for
+            // the next arm cycle.  Done before we re-run TryReadCore so the
+            // awaiter is ready whether we return sync-completed or the caller
+            // immediately re-arms.
+            _readCtr.Dispose();
+            _readCtr = default;
+            Volatile.Write(ref _pipe._state.ReaderAwaiterState, AwaiterStates.Idle);
+        }
+
+        if (signal.IsCanceled)
+            return new ReadResult(default, isCanceled: true, isCompleted: false);
+
+        // Non-canceled signal: re-execute read logic from reader-local state.
+        // Safe under SPSC — this continuation runs on the reader's scheduler
+        // thread, not concurrent with the reader's main flow.
+        if (TryReadCore(out var result))
+            return result;
+
+        // A signal must correspond to "data available or writer completed";
+        // TryReadCore not returning true here means either: (a) the data was
+        // consumed between signal and resume (impossible under SPSC), or
+        // (b) a spurious signal was delivered (also impossible under the
+        // protocol verified in AwaiterHandshake.tla).
+        throw new InvalidOperationException("Spurious wake in ReadAsync — awaiter protocol invariant violated.");
+    }
 }
