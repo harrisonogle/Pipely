@@ -21,6 +21,7 @@ internal struct State
     [FieldOffset(192)] internal long BytesReadPublished;
     [FieldOffset(200)] internal int ReaderCompletionState;
     [FieldOffset(208)] internal ExceptionDispatchInfo? ReaderException;
+    [FieldOffset(216)] internal long ExaminedPublished;       // reader writes, writer acquires (§8.2.1)
 
     // Group 2 (offsets 320..447): awaiter coordination.
     [FieldOffset(320)] internal int ReaderAwaiterState;       // Idle=0, Armed=1, Signaled=2

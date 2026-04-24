@@ -162,7 +162,7 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
     //  §8.2  MaybeSignalReaderAwaiter
     // ------------------------------------------------------------------
 
-    private void MaybeSignalReaderAwaiter()
+    private void MaybeSignalReaderAwaiter(bool isComplete = false)
     {
         // §8.2 StoreLoad fence.
         Interlocked.MemoryBarrier();                                                 // §8.2 StoreLoad fence
@@ -179,6 +179,24 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
                     _pipe._state.BytesWrittenPublished,
                     _bytesWritten);
             }
+            return;
+        }
+
+        // §8.2.1 reader-caught-up skip.  If the reader has already examined
+        // past everything we have published, the signal would be redundant
+        // and a parked reader would wake to find no new data — a spurious
+        // wake.  Bypassed on Complete so a parked reader still observes
+        // the completion transition.  Load order (AwaiterState then
+        // ExaminedPublished) relies on TSO load-load ordering: seeing
+        // Armed implies the reader's arm CAS happened-before this load,
+        // which in turn happened-after the reader's most recent
+        // ExaminedPublished release (same thread, program order).
+        var examinedPublished =
+            Volatile.Read(ref _pipe._state.ExaminedPublished);                       // §8.2.1 acquire
+        if (!isComplete && examinedPublished >= _bytesWritten)
+        {
+            _pipe.Diag?.Log("W.SignalSkipCaughtUp",
+                examinedPublished, _bytesWritten, 0, 0);
             return;
         }
 
@@ -368,8 +386,10 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
         // Step 4: release-store completion.
         Volatile.Write(ref _pipe._state.WriterCompletionState, CompletionState.Completed);  // §6.6 step 4 release
 
-        // Step 5: signal reader awaiter.
-        MaybeSignalReaderAwaiter();
+        // Step 5: signal reader awaiter — with isComplete=true to bypass the
+        // §8.2.1 reader-caught-up skip (a parked reader must observe the
+        // completion transition regardless of examined position).
+        MaybeSignalReaderAwaiter(isComplete: true);
     }
 
     // Cleanup helpers used by SpscPipe.Dispose (§10.6).

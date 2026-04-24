@@ -287,6 +287,7 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
         _bytesRead += retiredBytes;
         _examinedPosition = newExaminedPosition;
 
+        Volatile.Write(ref _pipe._state.ExaminedPublished, _examinedPosition);       // §7.3 step 5 release (§8.2.1 input)
         Volatile.Write(ref _pipe._state.BytesReadPublished, _bytesRead);             // §7.3 step 5 release
 
         _readInProgress = false;
