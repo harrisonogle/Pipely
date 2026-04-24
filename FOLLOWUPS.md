@@ -106,3 +106,106 @@ The §8.2.1 rationale in `docs/spscpipe-spec.md` still references the
 user-reachable value. With the §3 coercion (`Resume = 0 → 1`) landed
 in `SpscPipeOptions`, that case no longer reaches pipe internals.
 Minor rewording, not a correctness issue.
+
+---
+
+## Reference: verified reproducers
+
+Preserving for future regression-testing.
+
+### §8.2.1 spurious-wake race (pre-fix)
+
+To observe the race that commit `c6fe04f` fixes, revert that commit
+and run:
+
+```bash
+dotnet run --project tests/SpscPipe.Stress/SpscPipe.Stress.csproj -c Release \
+    -- --iterations 100000 --seed 2 --timeout 30
+```
+
+Prior to the fix this reproduced within the first ~20 seconds
+(observed at iteration 19,752 and 63,307 on different runs — timing-
+dependent but reliable). The stress harness in commit `53fbf16`
+included diagnostic instrumentation (`DiagLog`) that captured the
+writer-signal / reader-park / GetResult-spurious sequence; that
+instrumentation was removed in commit `c4f12de` but is recoverable
+from git if you want the timeline again.
+
+The specific stress config that tripped it: random MinimumSegmentSize
+in [4,63], random PauseWriterThreshold in [8,255], random
+ResumeWriterThreshold in [1,Pause], random totalBytes in [0,4095],
+chaos budget [0,15]. No single "minimal" reproducer — the race is
+inherent to the protocol scheduling.
+
+### Differential TLA+ configs that demonstrate load-bearing behaviour
+
+Each produces its documented counterexample in <1s:
+
+```bash
+cd spec/tla
+tlc -config MRVTS_ResetRace.cfg MRVTSStandalone.tla          # ResetDiscipline
+tlc -config Publication_SpliceReorder.cfg Publication.tla    # ChainConsistent
+tlc -config Publication_ExaminedAfterRetire.cfg Publication.tla   # NoStaleFieldReadAfterRetire
+tlc -config Awaiter_NoFence.cfg Awaiter.tla                  # NoSpuriousWake (fence)
+tlc -config Awaiter_NoCaughtUpCheck.cfg Awaiter.tla          # NoSpuriousWake (§8.2.1)
+tlc -config Backpressure_NoBypass.cfg Backpressure.tla       # NoLostWakeupOnReaderComplete
+tlc -config Backpressure_WeakHysteresis.cfg Backpressure.tla # HysteresisCorrectness
+```
+
+## TLA+ modelling notes
+
+Gotchas that bit this project and would bite anyone reusing the
+pattern.
+
+### Module composition with `EXTENDS`
+
+`EXTENDS M` pulls in *all* of M's operators *and* `VARIABLES`.  If
+M has a standalone state machine, extenders inherit those variables
+and must include them in their own `vars` tuple and `Init` / `Next`
+relations, or TLC fails with "variable not assigned."
+
+Solution: split M into an operators-only module and a separate
+standalone-driver module that `EXTENDS` it.  `Awaiter.tla` and
+`Backpressure.tla` EXTEND `MRVTS.tla` (pure operators);
+`MRVTSStandalone.tla` is the separate driver that EXTENDS `MRVTS.tla`.
+
+### Quantifier binding order
+
+```tla
+\E x \in S, y \in T : P(x, y)   (* y's set cannot reference x *)
+```
+
+vs.
+
+```tla
+\E x \in S : \E y \in f(x) : P(x, y)   (* y's set can reference x *)
+```
+
+TLC's SANY parser does not propagate the leftmost binding into
+subsequent set expressions in the comma form.  Use nested `\E`.
+
+### `Nat` in schema records
+
+`[field: Nat, ...]` works at the schema level for `\in`-checks if TLC
+can decide membership without enumerating the set.  But if a
+`CHOOSE` or similar primitive tries to materialize the set, TLC errs.
+Use bounded ranges (`field: 0..MaxN`) in any schema TLC might
+enumerate.
+
+### State-space blow-up from atomic vs. buffered releases
+
+Adding a reader-side store buffer (`bufR`) to `Awaiter.tla` increased
+the verified state space by ~100× for no added coverage of the race
+under study.  Atomic releases are sound where a fence on the writer
+side (or an arm-CAS fence on the reader side) orders them before
+subsequent loads that establish happens-before.  Documented in
+`Awaiter.tla`'s header; keep that decision if you extend the model.
+
+### Plain writes + pooled objects
+
+When modelling a pooled mutable object (e.g., `Segment`), plain
+writes to its fields from the writer must go through the same FIFO
+store buffer as release-stores to observable fields that point at it.
+Omitting this produces the spurious "stale tail with new fields"
+counterexample that `Publication.tla` documents in comments on
+`W_AllocSegment`.
