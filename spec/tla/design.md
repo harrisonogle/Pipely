@@ -378,14 +378,24 @@ producedCount, armsCompleted, cancelsFired
 
 ### Actions
 
-**Writer.**
-- `W_Publish`: release-store tailPublished (buffered). Then calls
-  `MaybeSignalReader`.
-- `W_Complete`: splice pending (abstract), release-store
-  WriterCompletionState = 2 and (optionally) WriterException. Then
-  `MaybeSignalReader`.
-- `W_MaybeSignalReader`: fence, load ReaderAwaiterState. If Armed, CAS
-  Armed→Signaled and MRVTS.SetResult(ReadSignal(IsCanceled=false)).
+**Writer.**  Publish and signal are separate actions (`W_Publish` and
+`W_Signal`, gated by `wpc ∈ {Ready, WtrSignaling}`) — they execute
+sequentially on the writer thread but reader-thread actions can
+interleave between them.  An earlier revision fused them into one
+atomic `W_PublishAndSignal`; that fusion hid the race spec §8.2.1
+closes.
+
+- `W_Publish`: advance `writerBytesWritten` synchronously; emit the
+  TailPublished release-store either as a direct commit (with writer
+  fence) or via `bufW` (differential). Transition `wpc` to
+  `WtrSignaling`.
+- `W_Signal`: fence; load `memAwaiterState`; apply the §8.2.1 reader-
+  caught-up skip (`memExaminedPublished ≥ writerBytesWritten`, bypassed
+  on `writerCompleted`); CAS `Armed → Signaled` and call SetResult.
+- `W_Complete`: release-store WriterCompletionState = 2 and
+  (optionally) WriterException. Signal unconditionally (the §8.2.1
+  skip's `~writerCompleted` guard ensures Complete always wakes the
+  parked reader).
 
 **Reader.**
 - `R_ReadAsync`: sync-path (TryReadCore). If data or completion, return
@@ -417,7 +427,10 @@ producedCount, armsCompleted, cancelsFired
   `readerExaminedPosition` actually being visible, (b) completion state
   being 2, or (c) IsCanceled=true. Throwing the "spurious wake"
   InvalidOperationException is a model-level invariant violation (we
-  should never reach that branch in correct execution).
+  should never reach that branch in correct execution). The §8.2.1
+  reader-caught-up skip in `W_Signal` is the protocol feature that
+  makes this invariant hold; the `EnableReaderCaughtUpCheck=FALSE`
+  differential produces a counterexample.
 - `ExceptionPropagation`: if writer completes with exception and reader
   drains all data, reader's next `R_GetResult` throws that exception
   (bridge contract from §10.4).
@@ -430,11 +443,19 @@ producedCount, armsCompleted, cancelsFired
 
 ### Differential experiments
 
-- Remove writer-side `Interlocked.MemoryBarrier()` in `W_MaybeSignalReader`.
-  Expect lost-wakeup counterexample (same as old model's fence-flip).
-- Skip the §7.3 step-2 snapshot (compute examined after retire) in tandem
-  with pool re-rent in Publication.tla. (Would require cross-module check;
-  may be easier to encode in Publication.tla alone.)
+- `EnableWriterFence = FALSE`: drop the writer-side fence between
+  `W_Publish`'s release-store drain and `W_Signal`'s AwaiterState
+  load. Expect `NoSpuriousWake` to fail (the writer's signal-check
+  observes an Armed reader while the writer's own stores remain
+  undrained).
+- `EnableReaderCaughtUpCheck = FALSE`: `W_Signal` skips the §8.2.1
+  reader-caught-up check. Expect `NoSpuriousWake` to fail — this is
+  the race uncovered by Phase 3 stress testing, where the reader's
+  sync-path consumes a publish and then arms, and the writer's
+  delayed signal for that same publish is stale.
+- Skip the §7.3 step-2 snapshot (compute examined after retire) in
+  tandem with pool re-rent in Publication.tla. (Cross-module;
+  encoded in Publication.tla alone.)
 
 ---
 

@@ -31,8 +31,9 @@ and produce the expected counterexample.
 | `Publication.cfg` | 10,417 | All invariants hold |
 | `Publication_SpliceReorder.cfg` | 114 | `ChainConsistent` violated (expected) |
 | `Publication_ExaminedAfterRetire.cfg` | 6,729 | `NoStaleFieldReadAfterRetire` violated (expected) |
-| `Awaiter.cfg` | 2,817 | All invariants + temporal hold |
-| `Awaiter_NoFence.cfg` | 625 | `NoSpuriousWake` violated (expected) |
+| `Awaiter.cfg` | 3,093 | All invariants + temporal hold |
+| `Awaiter_NoFence.cfg` | 541 | `NoSpuriousWake` violated (expected) |
+| `Awaiter_NoCaughtUpCheck.cfg` | 858 | `NoSpuriousWake` violated (expected) |
 | `Backpressure.cfg` | 826 | All invariants + temporal hold |
 | `Backpressure_NoBypass.cfg` | 704 | `NoLostWakeupOnReaderComplete` violated (expected, temporal) |
 | `Backpressure_WeakHysteresis.cfg` | 503 | `HysteresisCorrectness` violated (expected) |
