@@ -1,3 +1,7 @@
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Diagnostics;
+
 namespace SpscPipe.Benchmarks;
 
 internal static class LatencyHarness
@@ -42,10 +46,86 @@ internal static class LatencyHarness
         Console.WriteLine("| -------- | ----------: | -------: | -------: | -------: | ---------: | -------: |");
     }
 
-    // Filled in by Task 8.
+    private const int    WarmupMessages = 10_000;
+    private static readonly double NsPerTick = 1_000_000_000.0 / Stopwatch.Frequency;
+
     private static void RunCell(Impl impl, int size, Mode mode, long messages)
     {
-        Console.WriteLine($"| {impl,-8} | {size,11} | {0,8} | {0,8} | {0,8} | {0,10} | {0,8} |");
+        var (pause, resume) = ConfigFor(mode);
+        var cfg = new PipeConfig(MinimumSegmentSize: 4096,
+                                 PauseWriterThreshold: pause,
+                                 ResumeWriterThreshold: resume);
+
+        // Warmup: pay JIT and pool-rent costs out of band.
+        var warmupHist = new Histogram();
+        RunOne(impl, size, cfg, WarmupMessages, warmupHist);
+
+        var hist = new Histogram();
+        RunOne(impl, size, cfg, messages, hist);
+
+        var p50  = hist.Percentile(0.50);
+        var p90  = hist.Percentile(0.90);
+        var p99  = hist.Percentile(0.99);
+        var p999 = hist.Percentile(0.999);
+        var max  = hist.Max;
+        Console.WriteLine($"| {impl,-8} | {size,11} | {p50,8} | {p90,8} | {p99,8} | {p999,10} | {max,8} |");
+    }
+
+    private static void RunOne(Impl impl, int messageSize, PipeConfig cfg, long messages, Histogram hist)
+    {
+        using var pipe = AdapterFactory.Build(impl, cfg);
+
+        var producer = Task.Run(() => Producer(pipe, messageSize, messages));
+        var consumer = Task.Run(() => Consumer(pipe, messageSize, hist));
+
+        Task.WhenAll(producer, consumer).GetAwaiter().GetResult();
+    }
+
+    private static async Task Producer(IPipeAdapter pipe, int messageSize, long messages)
+    {
+        for (long i = 0; i < messages; i++)
+        {
+            var span = pipe.Writer.GetSpan(messageSize);
+            BinaryPrimitives.WriteInt64LittleEndian(span, Stopwatch.GetTimestamp());
+            pipe.Writer.Advance(messageSize);
+            var fr = await pipe.Writer.FlushAsync();
+            if (fr.IsCompleted || fr.IsCanceled) break;
+        }
+        pipe.Writer.Complete();
+    }
+
+    private static async Task Consumer(IPipeAdapter pipe, int messageSize, Histogram hist)
+    {
+        while (true)
+        {
+            var rr = await pipe.Reader.ReadAsync();
+            if (rr.IsCanceled) break;
+            var buffer = rr.Buffer;
+
+            while (buffer.Length >= messageSize)
+            {
+                long ts  = ReadTimestamp(buffer);
+                long now = Stopwatch.GetTimestamp();
+                long ns  = (long)((now - ts) * NsPerTick);
+                hist.Record(ns);
+                buffer = buffer.Slice(messageSize);
+            }
+
+            pipe.Reader.AdvanceTo(buffer.Start, rr.Buffer.End);
+            if (rr.IsCompleted && buffer.IsEmpty) break;
+        }
+        pipe.Reader.Complete();
+    }
+
+    private static long ReadTimestamp(ReadOnlySequence<byte> buffer)
+    {
+        var first = buffer.First.Span;
+        if (first.Length >= 8)
+            return BinaryPrimitives.ReadInt64LittleEndian(first);
+
+        Span<byte> scratch = stackalloc byte[8];
+        buffer.Slice(0, 8).CopyTo(scratch);
+        return BinaryPrimitives.ReadInt64LittleEndian(scratch);
     }
 
     internal static (long Pause, long Resume) ConfigFor(Mode mode) => mode switch
