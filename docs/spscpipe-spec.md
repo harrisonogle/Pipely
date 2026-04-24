@@ -120,7 +120,8 @@ internal struct State
     [FieldOffset(192)] internal long BytesReadPublished;      // reader writes, writer acquires
     [FieldOffset(200)] internal int ReaderCompletionState;
     [FieldOffset(208)] internal ExceptionDispatchInfo? ReaderException;
-    // (216-319 are pad within Group 1)
+    [FieldOffset(216)] internal long ExaminedPublished;       // reader writes, writer acquires (§8.2)
+    // (224-319 are pad within Group 1)
 
     // ---- Group 2 (320-447): awaiter coordination ----
     [FieldOffset(320)] internal int ReaderAwaiterState;       // see §8
@@ -710,8 +711,16 @@ The `ReadOnlySequence<byte>` constructor with `endSegment`/`endIndex` enforces t
 4. _bytesRead += retiredBytes
    _examinedPosition = newExaminedPosition   // snapshot from step 2
 
-5. Release-store the updated byte count:
+5. Release-store the updated positions:
+   Volatile.Write(ref state.ExaminedPublished, _examinedPosition)
    Volatile.Write(ref state.BytesReadPublished, _bytesRead)
+   ExaminedPublished is consumed by the writer's `MaybeSignalReaderAwaiter`
+   (§8.2) to skip redundant signals when the reader has already caught up
+   past the writer's most recent publication. The order of the two
+   release-stores is not semantically load-bearing — neither side requires
+   a happens-before edge between them. Both are reader-written and writer-
+   read; the writer's acquire-load of either participates in the §8.2
+   reader-caught-up check independently.
 
 6. Signal writer awaiter if it's waiting and we've drained below
    ResumeWriterThreshold. See §8.4.
@@ -783,6 +792,17 @@ Interlocked.MemoryBarrier();
 var awaiterState = Volatile.Read(ref state.ReaderAwaiterState);
 if (awaiterState == Idle) return;
 
+// Reader-caught-up skip (§8.2.1).  If the reader has already examined
+// past everything we have published, a signal for this publication
+// would be redundant — the reader's next re-check would find nothing
+// and a spurious wake would result.  Complete bypasses this check so
+// a parked reader still observes the completion transition.
+var examinedPublished = Volatile.Read(ref state.ExaminedPublished);
+bool writerJustCompleted =
+    Volatile.Read(ref state.WriterCompletionState) == 2;
+if (!writerJustCompleted && examinedPublished >= _bytesWritten):
+    return;
+
 // Try to transition Armed -> Signaled.
 var prev = Interlocked.CompareExchange(
     ref state.ReaderAwaiterState, Signaled, Armed);
@@ -798,6 +818,24 @@ The `Interlocked.MemoryBarrier()` by the §5 axiom is a full sequentially-consis
 The `Interlocked.CompareExchange` is on the signaling path only — rare, only when the reader was actually parked. Not on the per-byte hot path.
 
 Cost of `Interlocked.MemoryBarrier()`: on x86 it lowers to a locked instruction (~20–30 cycles); on ARM64 to `dmb ish` (~10–20 cycles). Executed once per publication, not per byte.
+
+#### 8.2.1 Reader-caught-up skip
+
+Without the `ExaminedPublished` check, a spurious wake is reachable by the following sequence:
+
+1. Writer performs a publish: release-stores of `state.Tail`, `state.BytesWrittenPublished`, etc.; the stores drain.
+2. Reader's sync-path `ReadAsync`/`TryRead` (§7.1) acquires the new `state.Tail`, returns a buffer, the caller processes it and calls `AdvanceTo` moving `examined` to the writer's new tail end.
+3. Reader's next `ReadAsync` finds `hasNewData = false` (reader has caught up), enters the slow path (§8.3), arms (`CAS Idle → Armed`), re-checks still sees no new data, and parks.
+4. Writer — in the same `MaybeSignalReaderAwaiter` call from step 1 — reaches its `MemoryBarrier` + load of `ReaderAwaiterState` *after* step 3. It observes `Armed`. Without the `ExaminedPublished` check it would CAS `Armed → Signaled` and call `SetResult`.
+5. Reader wakes, re-runs the §7.1 sync path, finds nothing past `examined` and no completion — a spurious wake.
+
+The race exists because the publish and the signal-load are not atomic with respect to reader-side activity: the writer's `MemoryBarrier` makes its prior stores globally visible but does not block the reader's own thread from acting on them in the window before the writer's load. The reader-caught-up check closes the race: if the reader's most recently published `ExaminedPublished` already equals or exceeds the writer's `_bytesWritten`, the signal is redundant and is skipped.
+
+The writer's load of `ExaminedPublished` follows the load of `ReaderAwaiterState` in program order. When the reader armed via `CAS Idle → Armed` (a full fence by §5), any reader-side release-store that program-order preceded the arm CAS — including the `ExaminedPublished` release from the most recent `AdvanceTo` — is globally ordered before the `Armed` state becomes observable. The writer's subsequent load of `ExaminedPublished` therefore observes at least the value the reader had at arm time.
+
+On the Complete path the reader is supposed to wake regardless — the signal carries the completion transition, not new data. The `writerJustCompleted` bypass preserves this: once `WriterCompletionState == 2`, the signal always fires, and the reader's re-check sees `writerDone = true` and returns an empty-completed `ReadResult` (or throws, per §10.4, if the writer exited with an exception and all bytes are drained).
+
+This check makes `MaybeSignalReaderAwaiter` not symmetric with `MaybeSignalWriterAwaiter` (§8.4), which uses the `ResumeWriterThreshold` hysteresis for an analogous purpose. Both sides share the shape "skip the signal when the awaiting thread wouldn't gain anything from waking," but the reader side measures this via a simple byte-position comparison while the writer side uses a configured hysteresis band.
 
 ### 8.3 Reader arming the read awaiter
 
@@ -974,6 +1012,8 @@ Specifically:
 
 **Reader-side translation.** The reader's `ManualResetValueTaskSourceCore` carries `ReadSignal` (§4.4), not `ReadResult`. `ReadSignal` contains only `IsCanceled`; no other fields are needed because the reader re-acquires all shared state itself. `SpscPipeReader` implements `IValueTaskSource<ReadResult>` and bridges the gap: its `GetResult` retrieves the `ReadSignal` from the core, resets `ReaderAwaiterState` to `Idle`, disposes the cancellation registration, and — for non-canceled signals — builds the real `ReadResult` by re-executing the read logic (§7.1 steps 3–7) from reader-local state. For canceled signals, it returns a canceled `ReadResult` directly. This runs on the reader's scheduled continuation thread, so accessing reader-local fields is safe under the SPSC invariant.
 
+With the §8.2.1 reader-caught-up skip in place, `GetResult`'s re-run of the sync path is guaranteed to find either new data past `_examinedPosition` or `writerDone = true` (or `IsCanceled = true` from the signal). "Spurious wake" — the re-run finding nothing — is a protocol violation and may legitimately be surfaced as an `InvalidOperationException` in the bridge. This guarantee depends on the §8.2.1 check; without it, the §8.2.1 race produces observable spurious wakes.
+
 The writer-side flush awaiter does not need this treatment: `FlushResult` depends only on writer-local and shared state that the reader (the signaler) can safely read.
 
 `ManualResetValueTaskSourceCore` is itself using `Interlocked.CompareExchange` internally for its continuation slot. That's unavoidable for any `IValueTaskSource`-backed awaiter and is considered acceptable; the "no Interlocked on hot path" goal applies to our bespoke coordination, not to the .NET async infrastructure.
@@ -1024,7 +1064,7 @@ Symmetric for reader-to-writer exception propagation on `FlushAsync`.
 
 ### 10.5 Reset
 
-`Reset()` requires both ends completed, with no operations in flight. Performs the same segment cleanup walk as `Dispose()` (§10.6) over both the unpublished chain (writer-local) and the published chain. Releases holders and returns buffers and segments to their pools. Zeroes all `state.*` fields: `Head`, `Tail`, `BytesWrittenPublished`, `BytesReadPublished`, `WriterCompletionState`, `ReaderCompletionState`, `WriterException`, `ReaderException`, `ReaderAwaiterState` (back to `Idle = 0`), `WriterAwaiterState` (back to `Idle = 0`). Zeroes writer-local `_bytesWritten`, `_unpublishedBytes`, `_unflushedStart`, `_activeBufferWritten`, `_activeBufferCapacity`; nulls `_unpublishedHead`, `_unpublishedTail`, `_activeBufferHolder`. Zeroes reader-local `_bytesRead`, `_examinedPosition`, `_headConsumedOffset`; nulls `_head`, `_lastReturnedBuffer`. Re-initializes both awaiters (incrementing `Version`).
+`Reset()` requires both ends completed, with no operations in flight. Performs the same segment cleanup walk as `Dispose()` (§10.6) over both the unpublished chain (writer-local) and the published chain. Releases holders and returns buffers and segments to their pools. Zeroes all `state.*` fields: `Head`, `Tail`, `BytesWrittenPublished`, `BytesReadPublished`, `ExaminedPublished`, `WriterCompletionState`, `ReaderCompletionState`, `WriterException`, `ReaderException`, `ReaderAwaiterState` (back to `Idle = 0`), `WriterAwaiterState` (back to `Idle = 0`). Zeroes writer-local `_bytesWritten`, `_unpublishedBytes`, `_unflushedStart`, `_activeBufferWritten`, `_activeBufferCapacity`; nulls `_unpublishedHead`, `_unpublishedTail`, `_activeBufferHolder`. Zeroes reader-local `_bytesRead`, `_examinedPosition`, `_headConsumedOffset`; nulls `_head`, `_lastReturnedBuffer`. Re-initializes both awaiters (incrementing `Version`).
 
 ### 10.6 Disposal and finalization
 
@@ -1116,6 +1156,7 @@ This invariant is maintained by:
 | `seg.*` initialization fields (BufferStart, WrittenLength, Memory, RunningIndex, Holder) | W | R | plain; visibility covered by the splice's release-store of `prevTail.Next`, `state.Head`, or `state.Tail` |
 | `state.BytesWrittenPublished` | W | R | release-store / acquire-load |
 | `state.BytesReadPublished` | R | W | release-store / acquire-load |
+| `state.ExaminedPublished` | R | W | release-store (reader, in §7.3 step 5) / acquire-load (writer, in §8.2 reader-caught-up check) |
 | `state.WriterCompletionState` | W | R | release-store / acquire-load |
 | `state.ReaderCompletionState` | R | W | release-store / acquire-load |
 | `state.WriterException` | W | R | plain; visibility covered by completion-state release-store |
