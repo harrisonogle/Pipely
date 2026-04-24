@@ -36,6 +36,9 @@ public sealed class SpscPipe : IDisposable
     public PipeReader Reader => _reader;
     public PipeWriter Writer => _writer;
 
+    internal SpscPipeReader ReaderInternal => _reader;
+    internal SpscPipeWriter WriterInternal => _writer;
+
     public void Reset() => throw new NotImplementedException("§10.5");
 
     // §10.6 cleanup implemented in checkpoint 4.  For checkpoints 2-3
