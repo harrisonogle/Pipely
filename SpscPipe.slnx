@@ -5,5 +5,6 @@
   <Folder Name="/tests/">
     <Project Path="tests/SpscPipe.Stress/SpscPipe.Stress.csproj" />
     <Project Path="tests/SpscPipe.Tests/SpscPipe.Tests.csproj" />
+    <Project Path="tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj" />
   </Folder>
 </Solution>
