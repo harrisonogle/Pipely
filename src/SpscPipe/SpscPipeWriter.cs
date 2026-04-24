@@ -164,21 +164,48 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
 
     private void MaybeSignalReaderAwaiter()
     {
-        // §8.2 StoreLoad fence.  Preceding release-stores (Tail, BWP, and
-        // for first splice Head) must be globally visible before the
-        // AwaiterState load, or the double-check protocol (§8.3) leaves
-        // a lost-wakeup window.
+        // §8.2 StoreLoad fence.
         Interlocked.MemoryBarrier();                                                 // §8.2 StoreLoad fence
 
         var awaiterState = Volatile.Read(ref _pipe._state.ReaderAwaiterState);       // §8.2 acquire
-        if (awaiterState == AwaiterState.Idle) return;
+        if (awaiterState == AwaiterState.Idle)
+        {
+            if (_pipe.Diag is not null)
+            {
+                var tail = _pipe._state.Tail;
+                _pipe.Diag.Log("W.SignalSkipIdle",
+                    tail is null ? -1 : tail.RunningIndex,
+                    tail is null ? 0 : tail.WrittenLength,
+                    _pipe._state.BytesWrittenPublished,
+                    _bytesWritten);
+            }
+            return;
+        }
 
         var prev = Interlocked.CompareExchange(
             ref _pipe._state.ReaderAwaiterState,
             AwaiterState.Signaled, AwaiterState.Armed);                               // §8.2 signal CAS (full fence)
         if (prev == AwaiterState.Armed)
         {
+            if (_pipe.Diag is not null)
+            {
+                var tail = _pipe._state.Tail;
+                _pipe.Diag.Log("W.SignalFire",
+                    tail is null ? -1 : tail.RunningIndex,
+                    tail is null ? 0 : tail.WrittenLength,
+                    _pipe._state.BytesWrittenPublished,
+                    _bytesWritten);
+            }
             _pipe.ReaderInternal.SetSignal(new ReadSignal { IsCanceled = false });   // §8.2 SetResult via bridge
+        }
+        else if (_pipe.Diag is not null)
+        {
+            var tail = _pipe._state.Tail;
+            _pipe.Diag.Log("W.SignalRace",
+                tail is null ? -1 : tail.RunningIndex,
+                tail is null ? 0 : tail.WrittenLength,
+                _pipe._state.BytesWrittenPublished,
+                prev);
         }
     }
 
