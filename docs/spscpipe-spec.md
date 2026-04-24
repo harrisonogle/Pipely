@@ -69,7 +69,15 @@ public sealed class SpscPipeOptions
 }
 ```
 
-Invariants: `0 ≤ ResumeWriterThreshold ≤ PauseWriterThreshold`, `MinimumSegmentSize ≥ 1`. Validated in the constructor.
+Validation and coercion, matching `System.IO.Pipelines.PipeOptions`:
+
+- `MinimumSegmentSize ≥ 1` — validated.
+- `PauseWriterThreshold ≥ 0` — validated. `PauseWriterThreshold == 0` means **unlimited**: `FlushAsync` never parks, and the pipe's buffered-data bound is effectively uncapped (§6.3 step 5 takes an early return).
+- `ResumeWriterThreshold ≥ 0` — validated. `ResumeWriterThreshold == 0` is **coerced to 1** in the `init` setter, because the §8.4/§8.5 signal condition `outstanding < ResumeWriterThreshold` is unreachable at zero (`outstanding ≥ 0` always) and would leave a paused writer un-resumable. Setting Resume to 1 means "signal only after all outstanding bytes are consumed."
+- When `PauseWriterThreshold > 0`: `ResumeWriterThreshold ≤ PauseWriterThreshold` — validated.
+- When `PauseWriterThreshold == 0`: the `Resume ≤ Pause` constraint is not enforced (Resume is irrelevant under an unlimited pipe).
+
+The BCL `-1` sentinel for "apply the default" is not supported: this type uses init-only properties with defaults, so callers omit the property to get the default. Passing `-1` explicitly throws.
 
 ---
 
