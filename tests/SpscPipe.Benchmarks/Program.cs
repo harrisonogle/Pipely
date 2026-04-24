@@ -35,12 +35,7 @@ internal static class Program
         return summaries.Any(s => s.HasCriticalValidationErrors) ? 2 : 0;
     }
 
-    private static int RunLatency(string[] args)
-    {
-        // Filled in by Task 7.
-        Console.WriteLine("latency mode: not yet implemented");
-        return 0;
-    }
+    private static int RunLatency(string[] args) => LatencyHarness.Run(args);
 
     private static void PrintUsage() =>
         Console.WriteLine("""
