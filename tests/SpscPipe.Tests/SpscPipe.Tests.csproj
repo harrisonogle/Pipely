@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\SpscPipe\SpscPipe.csproj" />
+    <ProjectReference Include="..\SpscPipe.Benchmarks\SpscPipe.Benchmarks.csproj" />
   </ItemGroup>
 
 </Project>
