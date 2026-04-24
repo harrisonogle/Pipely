@@ -78,6 +78,16 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
 
         if (writerDone)
         {
+            // §10.4: if the writer completed with an exception and the
+            // reader has drained all available bytes, throw on this
+            // ReadAsync.  WriterException is a plain read whose visibility
+            // is carried by the release-acquire edge on
+            // WriterCompletionState that we just observed.
+            var exInfo = _pipe._state.WriterException;
+            if (exInfo is not null)
+            {
+                exInfo.Throw();   // §10.4
+            }
             result = new ReadResult(default, isCanceled: false, isCompleted: true);
             _readInProgress = true;
             _lastReturnedBuffer = default;
@@ -315,11 +325,67 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
     }
 
     // ------------------------------------------------------------------
-    //  §7.4  Complete — checkpoint 4
+    //  §7.4  Complete
     // ------------------------------------------------------------------
 
     public override void Complete(Exception? exception = null)
-        => throw new NotImplementedException("§7.4 — checkpoint 4");
+    {
+        // Step 1: capture exception (plain write; visibility via completion).
+        if (exception is not null)
+        {
+            _pipe._state.ReaderException =
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(exception);
+        }
+
+        // Step 2: release-store completion.
+        Volatile.Write(ref _pipe._state.ReaderCompletionState, CompletionState.Completed);  // §7.4 step 2 release
+
+        // Step 3: signal writer awaiter, BYPASSING hysteresis (§8.5).  On
+        // reader completion the writer should wake regardless of
+        // Outstanding; otherwise a writer parked with outstanding in
+        // [Resume, Pause) stays asleep forever.
+        SignalWriterAwaiterOnComplete();
+
+        // Per §7.4: reader Complete does NOT retire segments.  All segment
+        // and holder cleanup is delegated to SpscPipe.Dispose or Reset.
+    }
+
+    private void SignalWriterAwaiterOnComplete()
+    {
+        Interlocked.MemoryBarrier();                                                  // §8.4 reader-side fence
+
+        var awaiterState = Volatile.Read(ref _pipe._state.WriterAwaiterState);        // §8.4 acquire
+        if (awaiterState == AwaiterState.Idle) return;
+
+        // §8.5 bypass: on reader-complete, skip the outstanding < Resume
+        // check.  Otherwise a writer parked at Outstanding ≥ Resume stays
+        // asleep.
+        var prev = Interlocked.CompareExchange(
+            ref _pipe._state.WriterAwaiterState,
+            AwaiterState.Signaled, AwaiterState.Armed);                                // §8.5 bypass signal CAS (full fence)
+        if (prev == AwaiterState.Armed)
+        {
+            _pipe.WriterInternal.SetFlushSignal(new FlushResult(
+                isCanceled: false, isCompleted: true));
+        }
+    }
+
+    // Internal accessor for lifecycle cleanup (§10.6).
+    internal Segment? Head => _head;
+
+    // §10.5 Reset: re-init reader-local state for reuse after SpscPipe.Reset.
+    internal void Reset()
+    {
+        _head = null;
+        _headConsumedOffset = 0;
+        _examinedPosition = 0;
+        _bytesRead = 0;
+        _readInProgress = false;
+        _lastReturnedBuffer = default;
+        _readAwaiter.Reset();
+        _readCtr.Dispose();
+        _readCtr = default;
+    }
 
     // ------------------------------------------------------------------
     //  §7.5  CancelPendingRead

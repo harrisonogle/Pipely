@@ -25,6 +25,11 @@ internal sealed class Segment : ReadOnlySequenceSegment<byte>
     // Private backing field used for release/acquire on seg.Next per §7.2.
     private Segment? _next;
 
+    // Typed plain-read of _next for lifecycle cleanup (no acquire needed:
+    // caller holds no races because Dispose/Reset run with no in-flight
+    // operations per §10.5/§10.6).
+    internal Segment? TypedNext => _next;
+
     // Release-store of Next for use by the writer's splice (§6.4.2).
     internal void SetNextRelease(Segment? next)
     {
