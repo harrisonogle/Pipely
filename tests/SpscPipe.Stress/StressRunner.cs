@@ -52,11 +52,9 @@ internal sealed class StressRunner
 
         // Pick pipe options at random each iteration to widen coverage.
         var pause = rng.Next(8, 256);
-        // Resume must be >= 1: with Resume=0 the reader's signal condition
-        // (outstanding < Resume) is never satisfied, producing a real
-        // deadlock if the writer parks.  The spec permits 0 but it's a
-        // degenerate choice; avoid it in stress.
-        var resume = rng.Next(1, pause + 1);
+        // Resume = 0 is coerced to 1 by SpscPipeOptions (§3, matching BCL
+        // PipeOptions); safe to include in the stress range.
+        var resume = rng.Next(0, pause + 1);
         var opts = new SpscPipeOptions
         {
             MinimumSegmentSize    = rng.Next(4, 64),
