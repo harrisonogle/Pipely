@@ -265,7 +265,15 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
             return new ValueTask<FlushResult>(new FlushResult(isCanceled: false, isCompleted: true));
         }
 
-        // Step 5: backpressure check.
+        // Step 5: backpressure check.  PauseWriterThreshold=0 means
+        // "unlimited" — the pipe never parks the writer.  This matches
+        // BCL's 2023+ PipeOptions documentation.  Early return avoids
+        // loading BytesReadPublished and keeps the writer on the
+        // synchronous fast path regardless of outstanding bytes.
+        if (_pipe.Options.PauseWriterThreshold == 0)
+        {
+            return new ValueTask<FlushResult>(new FlushResult(isCanceled: false, isCompleted: false));
+        }
         var bytesRead = Volatile.Read(ref _pipe._state.BytesReadPublished);          // §6.3 step 5 acquire
         var outstanding = _bytesWritten - bytesRead;
         if (outstanding < _pipe.Options.PauseWriterThreshold)

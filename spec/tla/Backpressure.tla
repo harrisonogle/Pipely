@@ -19,6 +19,13 @@
 (*     R_MaybeSignalWriter.  NoLostWakeupOnReaderComplete expected to fail. *)
 (*   - EnableResumeHysteresis = FALSE: signal when outstanding < Pause      *)
 (*     instead of < Resume.  HysteresisCorrectness expected to fail.        *)
+(*                                                                          *)
+(* Scope note.  `Pause = 0` (spec §3: unlimited pipe) is out of scope for   *)
+(* this module: when Pause is zero the writer never enters the arming path  *)
+(* modelled here (§6.3 step 5 early-returns before arming).  The ASSUME     *)
+(* below requires Pause > Resume and Resume >= 0; the `Pause = 0` case is   *)
+(* verified by construction — if no arming occurs, none of this module's    *)
+(* invariants are exercised, trivially holding.                             *)
 (***************************************************************************)
 
 EXTENDS MRVTS, Integers, Sequences, TLC

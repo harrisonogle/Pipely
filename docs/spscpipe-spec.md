@@ -314,6 +314,11 @@ Algorithm:
        return ValueTask from FlushResult { IsCanceled = false, IsCompleted = true }
 
 5. Backpressure check:
+       if PauseWriterThreshold == 0:
+           // Unlimited pipe — §3; matches BCL PipeOptions 2023+.
+           // The acquire-load of BytesReadPublished is skipped because
+           // the outcome is not used.
+           return ValueTask from FlushResult { IsCanceled = false, IsCompleted = false }
        bytesRead = Volatile.Read(ref state.BytesReadPublished)  // acquire
        outstanding = _bytesWritten - bytesRead
        if outstanding < PauseWriterThreshold:
