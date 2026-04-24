@@ -37,7 +37,28 @@ public sealed class SpscPipe : IDisposable
     public PipeWriter Writer => _writer;
 
     public void Reset() => throw new NotImplementedException("§10.5");
-    public void Dispose() => throw new NotImplementedException("§10.6");
+
+    // §10.6 cleanup implemented in checkpoint 4.  For checkpoints 2-3
+    // Dispose is a no-op; this lets `using` patterns in tests work
+    // without triggering NotImplementedException before the lifecycle
+    // checkpoint is reached.
+    public void Dispose() { /* §10.6 — checkpoint 4 */ }
+
+    // ----- Shared helpers ------------------------------------------------
+
+    // §6.5.2 ReleaseHolder.  Called from both writer (on buffer rotation +
+    // Complete) and reader (on RetireSegment).  Interlocked.Decrement is a
+    // full fence by the §5 axiom; its ordering with prior reads/writes on
+    // each side is argued in §6.5.3.
+    internal void ReleaseHolder(BufferHolder holder)
+    {
+        if (Interlocked.Decrement(ref holder.Refcount) == 0)   // §6.5.2 refcount-; §6.5.3 full fence
+        {
+            holder.Owner?.Dispose();
+            holder.Owner = null;
+            HolderPool.Return(holder);
+        }
+    }
 }
 
 // Adapts ArrayPool<byte>.Shared to the MemoryPool<byte> API.
