@@ -1,3 +1,5 @@
+using BenchmarkDotNet.Running;
+
 namespace SpscPipe.Benchmarks;
 
 internal static class Program
@@ -27,9 +29,10 @@ internal static class Program
 
     private static int RunBdn(string[] args)
     {
-        // Filled in by Task 5.
-        Console.WriteLine("bdn mode: not yet implemented");
-        return 0;
+        var summaries = BenchmarkSwitcher
+            .FromAssembly(typeof(Program).Assembly)
+            .Run(args);
+        return summaries.Any(s => s.HasCriticalValidationErrors) ? 2 : 0;
     }
 
     private static int RunLatency(string[] args)
