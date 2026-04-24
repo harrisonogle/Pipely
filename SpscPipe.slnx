@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SpscPipe/SpscPipe.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SpscPipe.Tests/SpscPipe.Tests.csproj" />
+  </Folder>
+</Solution>
