@@ -19,11 +19,6 @@ public sealed class SpscPipe : IDisposable
 
     internal readonly SpscPipeOptions Options;
 
-    // Audit-only diagnostic log.  Null in normal operation; set by the
-    // stress runner to record the chronological order of signals and
-    // TryRead observations.  Removed after the audit.
-    internal DiagLog? Diag;
-
     public SpscPipe() : this(new SpscPipeOptions()) { }
 
     public SpscPipe(SpscPipeOptions options)

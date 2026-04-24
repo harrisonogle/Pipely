@@ -66,7 +66,6 @@ internal sealed class StressRunner
         var chaosBudget = rng.Next(0, 16);
 
         using var pipe = new global::SpscPipe.SpscPipe(opts);
-        pipe.Diag = new DiagLog();
         using var cts = new CancellationTokenSource(_perIterTimeout);
 
         var producerRng = new Random(iterSeed ^ 0x1357);
@@ -116,8 +115,7 @@ internal sealed class StressRunner
                          $"totalBytes={totalBytes} opts=(seg={opts.MinimumSegmentSize}," +
                          $"pause={opts.PauseWriterThreshold},resume={opts.ResumeWriterThreshold})\n" +
                          $"producerEx: {producerEx}\n" +
-                         $"consumerEx: {consumerEx}\n\n" +
-                         $"DIAG TIMELINE:\n{pipe.Diag!.Dump()}"
+                         $"consumerEx: {consumerEx}"
             };
         }
 
@@ -134,7 +132,7 @@ internal sealed class StressRunner
             return new Failure
             {
                 Iteration = iteration, IterSeed = iterSeed,
-                Detail = $"consumer threw: {consumerEx}\n\nDIAG TIMELINE:\n{pipe.Diag!.Dump()}"
+                Detail = $"consumer threw: {consumerEx}"
             };
         }
 

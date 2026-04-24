@@ -42,11 +42,6 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
     //  §7.1  ReadAsync / TryRead
     // ------------------------------------------------------------------
 
-    internal long _diag_lastTryRead_examinedSeen;
-    internal long _diag_lastTryRead_availableEndSeen;
-    internal bool _diag_lastTryRead_writerDoneSeen;
-    internal Segment? _diag_lastTryRead_tailSeen;
-
     public override bool TryRead(out ReadResult result)
     {
         if (_readInProgress)
@@ -58,10 +53,6 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
         var writerDone = Volatile.Read(ref _pipe._state.WriterCompletionState)    // §7.1 step 3 acquire completion
                          == CompletionState.Completed;
         var tail = Volatile.Read(ref _pipe._state.Tail);                          // §7.1 step 3 acquire tail
-        _diag_lastTryRead_tailSeen = tail;
-        _diag_lastTryRead_writerDoneSeen = writerDone;
-        _diag_lastTryRead_examinedSeen = _examinedPosition;
-        _diag_lastTryRead_availableEndSeen = tail is null ? 0 : tail.RunningIndex + tail.WrittenLength;
 
         // §7.1 step 4: first-read head init.
         if (_head is null && tail is not null)
@@ -124,8 +115,6 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
 
     private ValueTask<ReadResult> ArmAndAwait(CancellationToken ct)
     {
-        _pipe.Diag?.Log("R.ArmStart", _examinedPosition, _bytesRead, 0, 0);
-
         // Prepare MRVTS for the new cycle.  Reset bumps Version, so any
         // signal from a prior (un-consumed) cycle cannot bleed into this
         // one (§8.7 Version discipline).
@@ -167,9 +156,6 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
         var availableEndPosition = tail is null ? 0 : tail.RunningIndex + tail.WrittenLength;
         var hasNewData = availableEndPosition > _examinedPosition;
 
-        _pipe.Diag?.Log("R.ArmReCheck", availableEndPosition, _examinedPosition,
-            writerDone ? 1 : 0, hasNewData ? 1 : 0);
-
         if (hasNewData || writerDone)
         {
             // Try to un-arm.
@@ -178,18 +164,14 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
                 AwaiterState.Idle, AwaiterState.Armed);                              // §8.3 step C un-arm CAS
             if (prev2 == AwaiterState.Armed)
             {
-                _pipe.Diag?.Log("R.ArmUnArm", 0, 0, 0, 0);
                 // Un-armed successfully; return sync.
                 return TryRead(out var r)
                     ? ValueTask.FromResult(r)
                     : ValueTask.FromResult(new ReadResult(default, false, writerDone));
             }
-            _pipe.Diag?.Log("R.ArmUnArmFail", prev2, 0, 0, 0);
             // prev2 == Signaled: signaler already fired SetResult.  Fall
             // through to return the VT so the caller awaits GetResult.
         }
-
-        _pipe.Diag?.Log("R.ArmPark", 0, 0, 0, 0);
 
         // §8.3 step D: register cancellation and return the VT.
         _readCtr = ct.UnsafeRegister(static (s, _) =>
@@ -427,7 +409,6 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
 
     ReadResult IValueTaskSource<ReadResult>.GetResult(short token)
     {
-        _pipe.Diag?.Log("R.GetResultEntry", token, 0, 0, 0);
         var signal = _readAwaiter.GetResult(token);
 
         // §8.7 bridge: clear awaiter state for the next cycle.
@@ -437,38 +418,21 @@ internal sealed class SpscPipeReader : PipeReader, IValueTaskSource<ReadResult>
 
         if (signal.IsCanceled)
         {
-            _pipe.Diag?.Log("R.GetResultCanceled", 0, 0, 0, 0);
             return new ReadResult(default, isCanceled: true, isCompleted: false);
         }
 
         // Re-run sync path to produce the real ReadResult (§8.7 rationale).
+        // Guaranteed to return true under the §8.2.1 reader-caught-up skip:
+        // the writer never signals with IsCanceled=false unless there is
+        // new data past examined or the writer has completed.  If this
+        // branch ever fires, the §8.2 / §8.2.1 / §8.3 protocol has drifted
+        // from the spec and we surface it as an InvalidOperationException.
         if (TryRead(out var result))
         {
-            _pipe.Diag?.Log("R.GetResultOK",
-                (long)result.Buffer.Length,
-                result.IsCompleted ? 1 : 0,
-                0, 0);
             return result;
         }
-
-        _pipe.Diag?.Log("R.GetResultSpurious",
-            _diag_lastTryRead_examinedSeen,
-            _diag_lastTryRead_availableEndSeen,
-            _diag_lastTryRead_writerDoneSeen ? 1 : 0,
-            _diag_lastTryRead_tailSeen is null ? -1 : _diag_lastTryRead_tailSeen.RunningIndex);
-
-        var tryReadObs =
-            $"tryRead-observed: examined={_diag_lastTryRead_examinedSeen} availableEnd={_diag_lastTryRead_availableEndSeen} " +
-            $"tail={(_diag_lastTryRead_tailSeen is null ? "null" : $"seg@{_diag_lastTryRead_tailSeen.RunningIndex}+{_diag_lastTryRead_tailSeen.WrittenLength}")} writerDone={_diag_lastTryRead_writerDoneSeen}";
-        var snapshot =
-            $"now: examined={_examinedPosition} bytesRead={_bytesRead} " +
-            $"readerHead={(_head is null ? "null" : $"seg@{_head.RunningIndex}+{_head.WrittenLength}")} " +
-            $"memTail={(_pipe._state.Tail is null ? "null" : $"seg@{_pipe._state.Tail.RunningIndex}+{_pipe._state.Tail.WrittenLength}")} " +
-            $"memBWP={_pipe._state.BytesWrittenPublished} " +
-            $"memWriterCompletion={_pipe._state.WriterCompletionState} " +
-            $"memReaderAwaiterState={_pipe._state.ReaderAwaiterState} ";
         throw new InvalidOperationException(
-            $"SpscPipe: spurious wake (§8.3). {tryReadObs} | {snapshot}");
+            "SpscPipe: spurious wake (§8.3 / §8.7) — signaler fired but sync-path found no data, completion, or cancellation.");
     }
 
     ValueTaskSourceStatus IValueTaskSource<ReadResult>.GetStatus(short token)

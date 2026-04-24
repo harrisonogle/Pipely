@@ -168,19 +168,7 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
         Interlocked.MemoryBarrier();                                                 // §8.2 StoreLoad fence
 
         var awaiterState = Volatile.Read(ref _pipe._state.ReaderAwaiterState);       // §8.2 acquire
-        if (awaiterState == AwaiterState.Idle)
-        {
-            if (_pipe.Diag is not null)
-            {
-                var tail = _pipe._state.Tail;
-                _pipe.Diag.Log("W.SignalSkipIdle",
-                    tail is null ? -1 : tail.RunningIndex,
-                    tail is null ? 0 : tail.WrittenLength,
-                    _pipe._state.BytesWrittenPublished,
-                    _bytesWritten);
-            }
-            return;
-        }
+        if (awaiterState == AwaiterState.Idle) return;
 
         // §8.2.1 reader-caught-up skip.  If the reader has already examined
         // past everything we have published, the signal would be redundant
@@ -193,37 +181,14 @@ internal sealed class SpscPipeWriter : PipeWriter, IValueTaskSource<FlushResult>
         // ExaminedPublished release (same thread, program order).
         var examinedPublished =
             Volatile.Read(ref _pipe._state.ExaminedPublished);                       // §8.2.1 acquire
-        if (!isComplete && examinedPublished >= _bytesWritten)
-        {
-            _pipe.Diag?.Log("W.SignalSkipCaughtUp",
-                examinedPublished, _bytesWritten, 0, 0);
-            return;
-        }
+        if (!isComplete && examinedPublished >= _bytesWritten) return;
 
         var prev = Interlocked.CompareExchange(
             ref _pipe._state.ReaderAwaiterState,
             AwaiterState.Signaled, AwaiterState.Armed);                               // §8.2 signal CAS (full fence)
         if (prev == AwaiterState.Armed)
         {
-            if (_pipe.Diag is not null)
-            {
-                var tail = _pipe._state.Tail;
-                _pipe.Diag.Log("W.SignalFire",
-                    tail is null ? -1 : tail.RunningIndex,
-                    tail is null ? 0 : tail.WrittenLength,
-                    _pipe._state.BytesWrittenPublished,
-                    _bytesWritten);
-            }
             _pipe.ReaderInternal.SetSignal(new ReadSignal { IsCanceled = false });   // §8.2 SetResult via bridge
-        }
-        else if (_pipe.Diag is not null)
-        {
-            var tail = _pipe._state.Tail;
-            _pipe.Diag.Log("W.SignalRace",
-                tail is null ? -1 : tail.RunningIndex,
-                tail is null ? 0 : tail.WrittenLength,
-                _pipe._state.BytesWrittenPublished,
-                prev);
         }
     }
 
