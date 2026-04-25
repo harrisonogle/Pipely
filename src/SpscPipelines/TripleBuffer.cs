@@ -4,81 +4,70 @@ using System.Threading;
 
 namespace SpscPipelines;
 
-public struct Snapshot
+public sealed class TripleBuffer<T> where T : struct
 {
-    public double Bid;
-    public double Ask;
-    public long TimestampTicks;
-    public long Symbol;
-}
-
-public sealed class TripleBuffer
-{
-    [StructLayout(LayoutKind.Explicit, Size = 192)]
+    private const int CacheLineSize = 128;  // x86-64 / Graviton; use 128 if targeting Apple Silicon production
+    
+    [InlineArray(CacheLineSize)]
+    private struct CacheLinePad { private byte _b; }
+    
+    [StructLayout(LayoutKind.Sequential)]
     private struct PaddedSlot
     {
-        [FieldOffset(0)] public Snapshot Data;
+        public T Data;
+        private CacheLinePad _pad;
     }
-
+    
     private PaddedSlot _slot0;
     private PaddedSlot _slot1;
     private PaddedSlot _slot2;
-
-    // State word: bit 0 = dirty, bits 1-2 = published slot index.
-    [StructLayout(LayoutKind.Explicit, Size = 128)]
+    
+    [StructLayout(LayoutKind.Sequential)]
     private struct PaddedInt
     {
-        [FieldOffset(0)] public int Value;
+        public int Value;
+        private CacheLinePad _padAfter;
     }
+    
+    private CacheLinePad _padBeforeState;
     private PaddedInt _state;
-
-    [StructLayout(LayoutKind.Explicit, Size = 128)]
-    private struct ProducerState
-    {
-        [FieldOffset(0)] public int OwnedIndex;
-    }
-    private ProducerState _producer;
-
-    [StructLayout(LayoutKind.Explicit, Size = 128)]
-    private struct ConsumerState
-    {
-        [FieldOffset(0)] public int OwnedIndex;
-    }
-    private ConsumerState _consumer;
-
+    private PaddedInt _producer;     // OwnedIndex packed in Value
+    private PaddedInt _consumer;     // OwnedIndex packed in Value
+    
     public TripleBuffer()
     {
-        _producer.OwnedIndex = 0;
-        _consumer.OwnedIndex = 2;
-        _state.Value = 1 << 1;  // slot 1 published, dirty = 0
+        Debug.Assert(Unsafe.SizeOf<T>() > 0);
+        // Initial state: slot 1 published, dirty = 0
+        _state.Value = 1 << 1;
+        _producer.Value = 0;
+        _consumer.Value = 2;
     }
-
-    public ref Snapshot ProducerSlot() => ref GetSlot(_producer.OwnedIndex);
-
+    
+    public ref T ProducerSlot() => ref GetSlot(_producer.Value);
+    
     public void Publish()
     {
-        int newlyPublished = _producer.OwnedIndex;
-        int newState = (newlyPublished << 1) | 1;  // set dirty
+        int newlyPublished = _producer.Value;
+        int newState = (newlyPublished << 1) | 1;
         int oldState = Interlocked.Exchange(ref _state.Value, newState);
-        _producer.OwnedIndex = (oldState >> 1) & 0b11;
+        _producer.Value = (oldState >> 1) & 0b11;
     }
-
+    
     public bool TryAcquire()
     {
         int current = Volatile.Read(ref _state.Value);
-        if ((current & 1) == 0)
-            return false;  // not dirty
-
-        int ours = _consumer.OwnedIndex << 1;  // dirty = 0
+        if ((current & 1) == 0) return false;
+        
+        int ours = _consumer.Value << 1;
         int acquired = Interlocked.Exchange(ref _state.Value, ours);
-        _consumer.OwnedIndex = (acquired >> 1) & 0b11;
+        _consumer.Value = (acquired >> 1) & 0b11;
         return true;
     }
-
-    public ref Snapshot ConsumerSlot() => ref GetSlot(_consumer.OwnedIndex);
-
+    
+    public ref T ConsumerSlot() => ref GetSlot(_consumer.Value);
+    
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private ref Snapshot GetSlot(int index)
+    private ref T GetSlot(int index)
     {
         switch (index)
         {
