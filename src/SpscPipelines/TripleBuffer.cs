@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -29,7 +30,9 @@ public sealed class TripleBuffer<T> where T : struct
         private CacheLinePad _padAfter;
     }
     
+#pragma warning disable CS0169
     private CacheLinePad _padBeforeState;
+#pragma warning restore CS0169
     private PaddedInt _state;
     private PaddedInt _producer;     // OwnedIndex packed in Value
     private PaddedInt _consumer;     // OwnedIndex packed in Value
