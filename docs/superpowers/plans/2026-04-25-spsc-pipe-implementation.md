@@ -51,7 +51,7 @@ SpscPipe/                                          (existing root)
     │   └── BclParityTests.cs
     ├── SpscPipe.Stress/                           (NEW)
     │   ├── SpscPipe.Stress.csproj
-    │   ├── PrngWorkload.cs
+    │   ├── ByteSequence.cs
     │   ├── StressHarness.cs
     │   └── Program.cs
     └── SpscPipe.Benchmarks/                       (NEW)
@@ -1071,8 +1071,9 @@ private BufferSegment? PopFreelist(int minSize)
         return null;
     }
     _freelistHead = head.Next;
-    head.RecycleReset(0);   // RunningIndex re-set by caller
     _freelistCount--;
+    // Don't RecycleReset here — RentSegment does it with the correct runningIndex,
+    // which also clears the freelist-link Next set by PushFreelist.
     return head;
 }
 
@@ -1937,11 +1938,101 @@ internal void OnReadAwaiterTokenCancel()
 }
 ```
 
-- [ ] **Step 4: Mirror the above for the writer side**
+- [ ] **Step 4: Add `ParkFlushAwaiter` to `SpscPipe.Writer.cs`**
 
-Add `ParkFlushAwaiter` to `SpscPipe.Writer.cs` (symmetric structure; use `_pipe._flushAwaiter`, no stash, `_pipe._lastAcquiredReaderState` for throw checks, `unconsumed < ResumeWriterThreshold || IsCompleted` for wake condition). Add `OnFlushAwaiterTokenCancel` to `SpscPipe.cs`. Replace the `throw new NotImplementedException("Flush parking implemented in Task 8.")` in `FlushAsync` with `return ParkFlushAwaiter(ct);`.
+```csharp
+private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
+{
+    _pipe._flushAwaiter._ctr.Dispose();        // R5b cleanup
+    _pipe._flushAwaiter._core.Reset();
+    _pipe._flushAwaiter._token = ct;
 
-(Implementer: follow the pattern from `ParkReadAwaiter` exactly; the structure is symmetric. Reference Spec lines 800–890.)
+    while (true)
+    {
+        int oldV = _pipe._flushAwaiter._state;
+        Debug.Assert((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Inactive,
+                     "SPSC violation: concurrent FlushAsync");
+        int desired = (oldV & SpscAwaiter<FlushResult>.CancelFlag) | SpscAwaiter<FlushResult>.Pending;
+        if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV) break;
+    }
+
+    // Lost-wakeup re-check (throw-first).
+    if (_pipe._readerTb.TryAcquire())
+    {
+        _pipe._lastAcquiredReaderState = _pipe._readerTb.ConsumerSlot();
+
+        if (_pipe._lastAcquiredReaderState.IsCompleted && _pipe._lastAcquiredReaderState.CompletionException != null)
+        {
+            while (true)
+            {
+                int oldV = _pipe._flushAwaiter._state;
+                if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
+                int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
+                {
+                    _pipe._flushAwaiter._core.SetException(_pipe._lastAcquiredReaderState.CompletionException);
+                    return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
+                }
+            }
+        }
+
+        long unconsumed = _pipe._totalWritten - _pipe._lastAcquiredReaderState.TotalConsumed;
+        bool releasable = unconsumed < _pipe._options.ResumeWriterThreshold
+                          || _pipe._lastAcquiredReaderState.IsCompleted;
+
+        if (releasable)
+        {
+            while (true)
+            {
+                int oldV = _pipe._flushAwaiter._state;
+                if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
+                int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
+                    return new ValueTask<FlushResult>(_pipe.BuildFlushResult(isCanceled: false));
+            }
+        }
+    }
+
+    // Lost-cancel re-check.
+    int v = _pipe._flushAwaiter._state;
+    if ((v & SpscAwaiter<FlushResult>.CancelFlag) != 0
+        && Interlocked.CompareExchange(
+               ref _pipe._flushAwaiter._state,
+               SpscAwaiter<FlushResult>.Inactive,
+               SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
+           == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
+    {
+        _pipe._flushAwaiter._core.SetResult(_pipe.BuildFlushResult(isCanceled: true));
+        return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
+    }
+
+    _pipe._flushAwaiter._ctr = ct.UnsafeRegister(static p => ((SpscPipe)p!).OnFlushAwaiterTokenCancel(), _pipe);
+    if ((_pipe._flushAwaiter._state & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending)
+        _pipe._flushAwaiter._ctr.Dispose();
+    return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
+}
+```
+
+Replace the `throw new NotImplementedException("Flush parking implemented in Task 8.")` in `FlushAsync` (Task 5 final line) with `return ParkFlushAwaiter(ct);`.
+
+- [ ] **Step 4b: Add `OnFlushAwaiterTokenCancel` to `SpscPipe.cs`**
+
+```csharp
+internal void OnFlushAwaiterTokenCancel()
+{
+    while (true)
+    {
+        int oldV = _flushAwaiter._state;
+        if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
+        int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+        if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
+        {
+            _flushAwaiter._core.SetException(new OperationCanceledException(_flushAwaiter._token));
+            return;
+        }
+    }
+}
+```
 
 - [ ] **Step 5: Add park/wake tests**
 
@@ -2307,9 +2398,14 @@ public class SpscPipeCancellationTests
     {
         using var pipe = new SpscPipe();
         var readTask = pipe.Reader.ReadAsync().AsTask();
-        await Task.Delay(50);                   // give park time to settle
-        pipe.Reader.CancelPendingRead();
 
+        // No Task.Delay needed: ParkReadAwaiter CASes to Pending synchronously before returning,
+        // so by the time AsTask() returns the awaiter is parked. If readTask is already complete,
+        // ReadAsync took the sync path (un-parked via re-check), which would mean the test's
+        // precondition (no data, no completion) is violated.
+        Assert.False(readTask.IsCompleted);
+
+        pipe.Reader.CancelPendingRead();
         var result = await readTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.True(result.IsCanceled);
     }
@@ -2323,18 +2419,20 @@ public class SpscPipeCancellationTests
         pipe.Writer.Advance(3);
         await pipe.Writer.FlushAsync();
 
-        // Read once + AdvanceTo to set up stash for next read.
+        // Read once + AdvanceTo with examined=buffer.End so HasReadableProgress is false on next read.
+        // (If we used single-arg AdvanceTo, examined would stay at consumed=1, and the next ReadAsync
+        //  would return sync with the remaining 2 bytes — no park.)
         var r1 = await pipe.Reader.ReadAsync();
-        pipe.Reader.AdvanceTo(r1.Buffer.GetPosition(1));
+        pipe.Reader.AdvanceTo(r1.Buffer.GetPosition(1), r1.Buffer.End);
 
         // Park reader; cancel from a third thread.
         var readTask = pipe.Reader.ReadAsync().AsTask();
-        await Task.Delay(50);
+        Assert.False(readTask.IsCompleted);
         await Task.Run(() => pipe.Reader.CancelPendingRead());
 
         var result = await readTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.True(result.IsCanceled);
-        // Buffer should be the bytes after the AdvanceTo (at park time).
+        // Buffer should be the bytes after the AdvanceTo's consumed position (at park time).
         Assert.Equal(2, result.Buffer.Length);
         Assert.Equal(new byte[] { 2, 3 }, result.Buffer.ToArray());
     }
@@ -2354,8 +2452,8 @@ public class SpscPipeCancellationTests
         using var pipe = new SpscPipe();
         var cts = new CancellationTokenSource();
         var readTask = pipe.Reader.ReadAsync(cts.Token).AsTask();
+        Assert.False(readTask.IsCompleted);
 
-        await Task.Delay(50);
         cts.Cancel();
 
         await Assert.ThrowsAsync<OperationCanceledException>(async () => await readTask.WaitAsync(TimeSpan.FromSeconds(5)));
@@ -2367,8 +2465,8 @@ public class SpscPipeCancellationTests
         using var pipe = new SpscPipe(new SpscPipeOptions(pauseWriterThreshold: 50, resumeWriterThreshold: 25));
         pipe.Writer.GetMemory(100); pipe.Writer.Advance(100);
         var flushTask = pipe.Writer.FlushAsync().AsTask();
+        Assert.False(flushTask.IsCompleted);
 
-        await Task.Delay(50);
         await Task.Run(() => pipe.Writer.CancelPendingFlush());
 
         var result = await flushTask.WaitAsync(TimeSpan.FromSeconds(5));
@@ -2443,7 +2541,7 @@ git commit -m "SpscPipe: CancelPending* + Dispose with CTR cleanup"
 
 **Files:**
 - Create: `tests/SpscPipe.Stress/SpscPipe.Stress.csproj`
-- Create: `tests/SpscPipe.Stress/PrngWorkload.cs`
+- Create: `tests/SpscPipe.Stress/ByteSequence.cs`
 - Create: `tests/SpscPipe.Stress/StressHarness.cs`
 - Create: `tests/SpscPipe.Stress/Program.cs`
 
@@ -2456,42 +2554,31 @@ dotnet sln add tests/SpscPipe.Stress/SpscPipe.Stress.csproj
 dotnet add tests/SpscPipe.Stress/SpscPipe.Stress.csproj reference src/SpscPipelines/SpscPipelines.csproj
 ```
 
-- [ ] **Step 2: Write `PrngWorkload.cs`**
+- [ ] **Step 2: Write `ByteSequence.cs`**
 
 ```csharp
 namespace SpscPipe.Stress;
 
-internal sealed class PrngWorkload
+internal static class ByteSequence
 {
-    private readonly Random _producerRng;
-    private readonly Random _consumerRng;
-    private readonly int _totalBytes;
-
-    public PrngWorkload(int seed, int totalBytes)
+    // Deterministic, O(1)-per-byte, allocation-free. Producer and consumer compute the
+    // same expected byte from the absolute offset alone — no shared RNG state needed.
+    // Uses Knuth's multiplicative hash; quality is sufficient for byte-integrity checks.
+    public static byte ByteAt(long offset)
     {
-        _producerRng = new Random(seed);
-        _consumerRng = new Random(seed);
-        _totalBytes  = totalBytes;
+        ulong x = unchecked((ulong)offset);
+        x = unchecked(x * 2654435761UL);
+        x ^= x >> 16;
+        return (byte)x;
     }
-
-    public byte ExpectedByte(long absoluteOffset)
-    {
-        // Deterministic sequence; producer and consumer share the seed.
-        // Use a separate RNG so we don't have to track Position; compute on-demand via hash.
-        var rng = new Random(unchecked((int)(absoluteOffset ^ (absoluteOffset >> 32))));
-        return (byte)rng.Next(256);
-    }
-
-    public int TotalBytes => _totalBytes;
 }
 ```
 
-(Implementer: this is a starting point. A real implementation should use a faster sequence generator like xoshiro or a simple LFSR. The point is byte-sequence integrity verification.)
+(`new Random(seed)` per byte is far too slow for streaming MiB-scale workloads. This hash is one mul + one shift per byte and produces a deterministic-but-distinct-enough sequence for catching off-by-one or torn-write bugs.)
 
 - [ ] **Step 3: Write `StressHarness.cs`**
 
 ```csharp
-using System.Buffers;
 using SpscPipelines;
 
 namespace SpscPipe.Stress;
@@ -2507,12 +2594,12 @@ internal sealed class StressHarness
         _duration = duration;
     }
 
-    public async Task<StressResult> RunOnce(int seed, int totalBytes, CancellationToken ct)
+    public async Task<StressResult> RunOnce(int seed, long totalBytes, CancellationToken ct)
     {
         using var pipe = new SpscPipe(_options);
-        var workload = new PrngWorkload(seed, totalBytes);
-        var rng = new Random(seed);
-        var deadline = DateTimeOffset.UtcNow + _duration;
+        // Two independent RNGs for producer/consumer so timing/yielding decisions don't synchronize.
+        var producerRng = new Random(seed);
+        var consumerRng = new Random(seed ^ 0x5A5A_5A5A);
 
         long produced = 0;
         long consumed = 0;
@@ -2524,15 +2611,15 @@ internal sealed class StressHarness
             {
                 while (produced < totalBytes && !ct.IsCancellationRequested)
                 {
-                    int chunk = rng.Next(1, 4097);
+                    int chunk = producerRng.Next(1, 4097);
                     chunk = (int)Math.Min(chunk, totalBytes - produced);
                     var mem = pipe.Writer.GetMemory(chunk);
                     for (int i = 0; i < chunk; i++)
-                        mem.Span[i] = workload.ExpectedByte(produced + i);
+                        mem.Span[i] = ByteSequence.ByteAt(produced + i);
                     pipe.Writer.Advance(chunk);
                     produced += chunk;
 
-                    if (rng.Next(8) == 0) await Task.Yield();
+                    if (producerRng.Next(8) == 0) await Task.Yield();
                     var fr = await pipe.Writer.FlushAsync(ct);
                     if (fr.IsCompleted) break;
                 }
@@ -2548,19 +2635,34 @@ internal sealed class StressHarness
                 while (!ct.IsCancellationRequested)
                 {
                     var rr = await pipe.Reader.ReadAsync(ct);
+                    long bufferStart = consumed;
+                    long offset = bufferStart;
                     foreach (var memory in rr.Buffer)
                     {
                         for (int i = 0; i < memory.Length; i++)
                         {
-                            byte expected = workload.ExpectedByte(consumed + i);
+                            byte expected = ByteSequence.ByteAt(offset + i);
                             if (memory.Span[i] != expected)
                                 throw new InvalidOperationException(
-                                    $"Byte mismatch at offset {consumed + i}: expected {expected}, got {memory.Span[i]}");
+                                    $"Byte mismatch at offset {offset + i}: expected 0x{expected:X2}, got 0x{memory.Span[i]:X2}");
                         }
-                        consumed += memory.Length;
+                        offset += memory.Length;
                     }
-                    pipe.Reader.AdvanceTo(rr.Buffer.End);
-                    if (rr.IsCompleted) break;
+                    consumed = offset;
+
+                    // Sometimes only AdvanceTo a prefix to exercise the partial-consume path.
+                    if (consumerRng.Next(4) == 0 && rr.Buffer.Length > 1)
+                    {
+                        long takeBytes = consumerRng.Next(1, (int)Math.Min(rr.Buffer.Length, int.MaxValue));
+                        consumed = bufferStart + takeBytes;
+                        pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(takeBytes));
+                    }
+                    else
+                    {
+                        pipe.Reader.AdvanceTo(rr.Buffer.End);
+                    }
+
+                    if (rr.IsCompleted && consumed >= produced) break;
                 }
                 pipe.Reader.Complete();
             }
@@ -2576,14 +2678,19 @@ internal sealed class StressHarness
             return new StressResult(seed, produced, consumed, "timeout — possible deadlock", null, null);
         }
 
+        if (producerEx != null || consumerEx != null)
+            return new StressResult(seed, produced, consumed, "exception", producerEx, consumerEx);
+
         return new StressResult(seed, produced, consumed,
             consumed == produced ? "ok" : "byte-count mismatch",
-            producerEx, consumerEx);
+            null, null);
     }
 }
 
 internal record StressResult(int Seed, long Produced, long Consumed, string Status, Exception? ProducerEx, Exception? ConsumerEx);
 ```
+
+Note the partial-consume path: 25% of reads `AdvanceTo` a random prefix instead of `Buffer.End`, exercising the "examined > consumed" path that's easy to miss with always-drain stress patterns.
 
 - [ ] **Step 4: Write `Program.cs`**
 
@@ -2592,7 +2699,7 @@ using SpscPipelines;
 using SpscPipe.Stress;
 
 int seedCount = args.Length > 0 ? int.Parse(args[0]) : 10;
-int bytesPerSeed = args.Length > 1 ? int.Parse(args[1]) : 1 << 22;   // 4 MiB
+long bytesPerSeed = args.Length > 1 ? long.Parse(args[1]) : 1L << 22;   // 4 MiB
 
 var harness = new StressHarness(SpscPipeOptions.Default, TimeSpan.FromSeconds(30));
 int failures = 0;
@@ -2643,29 +2750,39 @@ using Xunit;
 
 namespace SpscPipe.Tests;
 
+public enum PipeKind { Bcl, Spsc }
+
 public class BclParityTests
 {
-    // Run each test against both a BCL Pipe and an SpscPipe; verify outcomes match.
+    // Each parametrized test runs against both BCL Pipe and SpscPipe; verify outcomes match.
 
-    public static IEnumerable<object[]> PipeFactories => new[]
+    private static (PipeReader Reader, PipeWriter Writer, IDisposable Disposer) CreatePipe(PipeKind kind, PipeOptions? bclOpts = null)
     {
-        new object[] { (Func<(PipeReader, PipeWriter, IDisposable)>)(() => {
-            var p = new Pipe();
-            return (p.Reader, p.Writer, (IDisposable)new DummyDisposable());
-        }) },
-        new object[] { (Func<(PipeReader, PipeWriter, IDisposable)>)(() => {
-            var p = new SpscPipe();
-            return (p.Reader, p.Writer, p);
-        }) },
-    };
+        switch (kind)
+        {
+            case PipeKind.Bcl:
+                var bcl = new Pipe(bclOpts ?? PipeOptions.Default);
+                return (bcl.Reader, bcl.Writer, NoOpDisposable.Instance);
+            case PipeKind.Spsc:
+                var spsc = new SpscPipe();    // defaults match BCL defaults
+                return (spsc.Reader, spsc.Writer, spsc);
+            default:
+                throw new ArgumentOutOfRangeException(nameof(kind));
+        }
+    }
 
-    private sealed class DummyDisposable : IDisposable { public void Dispose() { } }
+    private sealed class NoOpDisposable : IDisposable
+    {
+        public static readonly NoOpDisposable Instance = new();
+        public void Dispose() { }
+    }
 
     [Theory]
-    [MemberData(nameof(PipeFactories))]
-    public async Task WriterCompleteEx_NextReadAsyncThrows(Func<(PipeReader r, PipeWriter w, IDisposable d)> factory)
+    [InlineData(PipeKind.Bcl)]
+    [InlineData(PipeKind.Spsc)]
+    public async Task WriterCompleteEx_NextReadAsyncThrows(PipeKind kind)
     {
-        var (reader, writer, disp) = factory();
+        var (reader, writer, disp) = CreatePipe(kind);
         using (disp)
         {
             var ex = new InvalidOperationException("test");
@@ -2676,10 +2793,11 @@ public class BclParityTests
     }
 
     [Theory]
-    [MemberData(nameof(PipeFactories))]
-    public async Task ReaderCompleteEx_NextFlushAsyncThrows(Func<(PipeReader r, PipeWriter w, IDisposable d)> factory)
+    [InlineData(PipeKind.Bcl)]
+    [InlineData(PipeKind.Spsc)]
+    public async Task ReaderCompleteEx_NextFlushAsyncThrows(PipeKind kind)
     {
-        var (reader, writer, disp) = factory();
+        var (reader, writer, disp) = CreatePipe(kind);
         using (disp)
         {
             var ex = new InvalidOperationException("test");
@@ -2690,11 +2808,12 @@ public class BclParityTests
     }
 
     [Theory]
-    [MemberData(nameof(PipeFactories))]
-    public async Task BackpressureHysteresis_ParkAtPause_ResumeAtBelowResume(Func<(PipeReader r, PipeWriter w, IDisposable d)> factory)
+    [InlineData(PipeKind.Bcl)]
+    [InlineData(PipeKind.Spsc)]
+    public async Task BackpressureHysteresis_ParkAtPause_ResumeAtBelowResume(PipeKind kind)
     {
         // Both pipes use defaults (Pause=64K, Resume=32K).
-        var (reader, writer, disp) = factory();
+        var (reader, writer, disp) = CreatePipe(kind);
         using (disp)
         {
             // Fill above pause threshold.
@@ -2713,10 +2832,11 @@ public class BclParityTests
     }
 
     [Theory]
-    [MemberData(nameof(PipeFactories))]
-    public async Task EmptyPipe_TryReadReturnsFalse_ReadAsyncParks(Func<(PipeReader r, PipeWriter w, IDisposable d)> factory)
+    [InlineData(PipeKind.Bcl)]
+    [InlineData(PipeKind.Spsc)]
+    public async Task EmptyPipe_TryReadReturnsFalse_ReadAsyncParks(PipeKind kind)
     {
-        var (reader, writer, disp) = factory();
+        var (reader, writer, disp) = CreatePipe(kind);
         using (disp)
         {
             Assert.False(reader.TryRead(out _));
@@ -2729,10 +2849,11 @@ public class BclParityTests
     }
 
     [Theory]
-    [MemberData(nameof(PipeFactories))]
-    public async Task RoundTripBytes_PreservesContent(Func<(PipeReader r, PipeWriter w, IDisposable d)> factory)
+    [InlineData(PipeKind.Bcl)]
+    [InlineData(PipeKind.Spsc)]
+    public async Task RoundTripBytes_PreservesContent(PipeKind kind)
     {
-        var (reader, writer, disp) = factory();
+        var (reader, writer, disp) = CreatePipe(kind);
         using (disp)
         {
             var data = Enumerable.Range(0, 1000).Select(i => (byte)i).ToArray();
