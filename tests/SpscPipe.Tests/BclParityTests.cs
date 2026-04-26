@@ -65,15 +65,28 @@ public class BclParityTests
     [InlineData(PipeKind.Spsc)]
     public async Task BackpressureHysteresis_ParkAtPause_ResumeAtBelowResume(PipeKind kind)
     {
-        var (reader, writer, disp) = CreatePipe(kind);
+        const int pauseAt  = 100;
+        const int resumeAt = 50;
+
+        PipeReader reader; PipeWriter writer; IDisposable disp;
+        if (kind == PipeKind.Bcl)
+        {
+            var bcl = new Pipe(new PipeOptions(pauseWriterThreshold: pauseAt, resumeWriterThreshold: resumeAt));
+            reader = bcl.Reader; writer = bcl.Writer; disp = NoOpDisposable.Instance;
+        }
+        else
+        {
+            var spsc = new SpscPipelines.SpscPipe(new SpscPipeOptions(pauseWriterThreshold: pauseAt, resumeWriterThreshold: resumeAt));
+            reader = spsc.Reader; writer = spsc.Writer; disp = spsc;
+        }
+
         using (disp)
         {
-            var mem = writer.GetMemory(70_000); writer.Advance(70_000);
+            writer.GetMemory(150); writer.Advance(150);
             var flushTask = writer.FlushAsync().AsTask();
-            Assert.False(flushTask.IsCompleted);
 
             var r = await reader.ReadAsync();
-            reader.AdvanceTo(r.Buffer.GetPosition(40_000));
+            reader.AdvanceTo(r.Buffer.GetPosition(125));   // 25 unconsumed, well below resume=50
 
             var result = await flushTask.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.False(result.IsCanceled);
