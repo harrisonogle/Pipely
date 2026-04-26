@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO.Pipelines;
 using System.Threading;
 
@@ -101,6 +102,29 @@ public sealed partial class SpscPipe : IDisposable
         s.SetFreelistNext(_freelistHead);
         _freelistHead = s;
         _freelistCount++;
+    }
+
+    internal bool HasReadableProgress() => _lastAcquiredWriterState.TotalWritten > _totalExamined;
+
+    internal void IntegrateAcquiredWriterState()
+    {
+        var w = _lastAcquiredWriterState;
+        if (_readHead == null)                  // I10 bootstrap
+        {
+            _readHead    = w.HeadSegment;
+            _readHeadIdx = 0;
+        }
+        _readTail    = w.TailSegment;
+        _readTailIdx = w.TailWritten;
+    }
+
+    internal ReadResult BuildReadResult(bool isCanceled)
+    {
+        bool isCompleted = _lastAcquiredWriterState.IsCompleted;
+        var buffer = _readHead == null
+            ? ReadOnlySequence<byte>.Empty
+            : new ReadOnlySequence<byte>(_readHead, _readHeadIdx, _readTail!, _readTailIdx);
+        return new ReadResult(buffer, isCanceled, isCompleted);
     }
 
     internal FlushResult BuildFlushResult(bool isCanceled)
