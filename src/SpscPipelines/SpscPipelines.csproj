@@ -7,4 +7,11 @@
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
 
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SpscPipe.Tests" />
+    <InternalsVisibleTo Include="SpscPipe.Stress" />
+    <InternalsVisibleTo Include="SpscPipe.Benchmarks" />
+  </ItemGroup>
+
 </Project>

@@ -4,5 +4,6 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj" />
+    <Project Path="tests/SpscPipe.Tests/SpscPipe.Tests.csproj" />
   </Folder>
 </Solution>
