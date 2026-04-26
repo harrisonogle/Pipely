@@ -96,4 +96,30 @@ public class SpscPipeWriterTests
         var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await pipe.Writer.FlushAsync());
         Assert.Same(ex, thrown);
     }
+
+    [Fact]
+    public async Task FlushAsync_ParksOnBackpressure_ResumesOnAdvance()
+    {
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(
+            pauseWriterThreshold: 100,
+            resumeWriterThreshold: 50));
+
+        // Fill above pause threshold.
+        var mem = pipe.Writer.GetMemory(150);
+        pipe.Writer.Advance(150);
+
+        var flushTask = pipe.Writer.FlushAsync().AsTask();
+        Assert.False(flushTask.IsCompleted);
+
+        // Reader drains enough to drop below resume threshold.
+        await Task.Run(async () =>
+        {
+            var r = await pipe.Reader.ReadAsync();
+            // Consume 110 bytes (leaves 40 unconsumed; below resume threshold of 50).
+            pipe.Reader.AdvanceTo(r.Buffer.GetPosition(110));
+        });
+
+        var result = await flushTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.False(result.IsCanceled);
+    }
 }

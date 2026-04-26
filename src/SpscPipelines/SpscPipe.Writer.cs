@@ -114,10 +114,80 @@ public sealed partial class SpscPipe
             if (!needsPark)
                 return new ValueTask<FlushResult>(_pipe.BuildFlushResult(isCanceled: false));
 
-            // Parking implemented in Task 8 — for now, throw to make the unimplemented path explicit.
-            throw new NotImplementedException("Flush parking implemented in Task 8.");
+            return ParkFlushAwaiter(ct);
         }
         public override void Complete(Exception? ex = null) => throw new NotImplementedException();
         public override void CancelPendingFlush() => throw new NotImplementedException();
+
+        private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
+        {
+            _pipe._flushAwaiter._ctr.Dispose();        // R5b cleanup
+            _pipe._flushAwaiter._core.Reset();
+            _pipe._flushAwaiter._token = ct;
+
+            while (true)
+            {
+                int oldV = _pipe._flushAwaiter._state;
+                System.Diagnostics.Debug.Assert((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Inactive,
+                             "SPSC violation: concurrent FlushAsync");
+                int desired = (oldV & SpscAwaiter<FlushResult>.CancelFlag) | SpscAwaiter<FlushResult>.Pending;
+                if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV) break;
+            }
+
+            // Lost-wakeup re-check (throw-first).
+            if (_pipe._readerTb.TryAcquire())
+            {
+                _pipe._lastAcquiredReaderState = _pipe._readerTb.ConsumerSlot();
+
+                if (_pipe._lastAcquiredReaderState.IsCompleted && _pipe._lastAcquiredReaderState.CompletionException != null)
+                {
+                    while (true)
+                    {
+                        int oldV = _pipe._flushAwaiter._state;
+                        if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
+                        int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                        if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
+                        {
+                            _pipe._flushAwaiter._core.SetException(_pipe._lastAcquiredReaderState.CompletionException);
+                            return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
+                        }
+                    }
+                }
+
+                long unconsumed = _pipe._totalWritten - _pipe._lastAcquiredReaderState.TotalConsumed;
+                bool releasable = unconsumed < _pipe._options.ResumeWriterThreshold
+                                  || _pipe._lastAcquiredReaderState.IsCompleted;
+
+                if (releasable)
+                {
+                    while (true)
+                    {
+                        int oldV = _pipe._flushAwaiter._state;
+                        if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
+                        int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                        if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
+                            return new ValueTask<FlushResult>(_pipe.BuildFlushResult(isCanceled: false));
+                    }
+                }
+            }
+
+            // Lost-cancel re-check.
+            int v = _pipe._flushAwaiter._state;
+            if ((v & SpscAwaiter<FlushResult>.CancelFlag) != 0
+                && Interlocked.CompareExchange(
+                       ref _pipe._flushAwaiter._state,
+                       SpscAwaiter<FlushResult>.Inactive,
+                       SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
+                   == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
+            {
+                _pipe._flushAwaiter._core.SetResult(_pipe.BuildFlushResult(isCanceled: true));
+                return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
+            }
+
+            _pipe._flushAwaiter._ctr = ct.UnsafeRegister(static p => ((SpscPipe)p!).OnFlushAwaiterTokenCancel(), _pipe);
+            if ((_pipe._flushAwaiter._state & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending)
+                _pipe._flushAwaiter._ctr.Dispose();
+            return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
+        }
     }
 }

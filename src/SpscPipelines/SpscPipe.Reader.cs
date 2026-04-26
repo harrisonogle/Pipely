@@ -40,8 +40,7 @@ public sealed partial class SpscPipe
             if (_pipe.HasReadableProgress() || _pipe._lastAcquiredWriterState.IsCompleted)
                 return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: false));
 
-            // Parking implemented in Task 8.
-            throw new NotImplementedException("Read parking implemented in Task 8.");
+            return ParkReadAwaiter(ct);
         }
 
         public override bool TryRead(out ReadResult result)
@@ -132,5 +131,77 @@ public sealed partial class SpscPipe
         }
         public override void Complete(Exception? ex = null) => throw new NotImplementedException();
         public override void CancelPendingRead() => throw new NotImplementedException();
+
+        private ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
+        {
+            _pipe._readAwaiter._ctr.Dispose();        // R5b cleanup
+            _pipe._readAwaiter._core.Reset();
+            _pipe._readAwaiter._token = ct;
+
+            _pipe._readAwaiter._stashHead    = _pipe._readHead;
+            _pipe._readAwaiter._stashHeadIdx = _pipe._readHeadIdx;
+            _pipe._readAwaiter._stashTail    = _pipe._readTail;
+            _pipe._readAwaiter._stashTailIdx = _pipe._readTailIdx;
+
+            while (true)
+            {
+                int oldV = _pipe._readAwaiter._state;
+                System.Diagnostics.Debug.Assert((oldV & SpscAwaiter<ReadResult>.StateMask) == SpscAwaiter<ReadResult>.Inactive);
+                int desired = (oldV & SpscAwaiter<ReadResult>.CancelFlag) | SpscAwaiter<ReadResult>.Pending;
+                if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV) break;
+            }
+
+            // Lost-wakeup re-check (throw-first).
+            if (_pipe._writerTb.TryAcquire())
+            {
+                _pipe._lastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
+                _pipe.IntegrateAcquiredWriterState();
+
+                if (_pipe._lastAcquiredWriterState.IsCompleted && _pipe._lastAcquiredWriterState.CompletionException != null)
+                {
+                    while (true)
+                    {
+                        int oldV = _pipe._readAwaiter._state;
+                        if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) break;
+                        int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+                        if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
+                        {
+                            _pipe._readAwaiter._core.SetException(_pipe._lastAcquiredWriterState.CompletionException);
+                            return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
+                        }
+                    }
+                }
+
+                if (_pipe.HasReadableProgress() || _pipe._lastAcquiredWriterState.IsCompleted)
+                {
+                    while (true)
+                    {
+                        int oldV = _pipe._readAwaiter._state;
+                        if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) break;
+                        int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+                        if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
+                            return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: false));
+                    }
+                }
+            }
+
+            // Lost-cancel re-check.
+            int v = _pipe._readAwaiter._state;
+            if ((v & SpscAwaiter<ReadResult>.CancelFlag) != 0
+                && Interlocked.CompareExchange(
+                       ref _pipe._readAwaiter._state,
+                       SpscAwaiter<ReadResult>.Inactive,
+                       SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag)
+                   == (SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag))
+            {
+                _pipe._readAwaiter._core.SetResult(_pipe.BuildReadResult(isCanceled: true));
+                return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
+            }
+
+            _pipe._readAwaiter._ctr = ct.UnsafeRegister(static p => ((SpscPipe)p!).OnReadAwaiterTokenCancel(), _pipe);
+            if ((_pipe._readAwaiter._state & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending)
+                _pipe._readAwaiter._ctr.Dispose();
+            return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
+        }
     }
 }

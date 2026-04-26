@@ -54,4 +54,24 @@ public class SpscPipeReaderTests
         var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await pipe.Reader.ReadAsync());
         Assert.Same(ex, thrown);
     }
+
+    [Fact]
+    public async Task ReadAsync_ParksWhenNoData_ResumesOnFlush()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        var readTask = pipe.Reader.ReadAsync().AsTask();
+        Assert.False(readTask.IsCompleted);
+
+        // Writer side on a different thread.
+        await Task.Run(async () =>
+        {
+            var mem = pipe.Writer.GetMemory(3);
+            mem.Span[0] = 7; mem.Span[1] = 8; mem.Span[2] = 9;
+            pipe.Writer.Advance(3);
+            await pipe.Writer.FlushAsync();
+        });
+
+        var result = await readTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new byte[] { 7, 8, 9 }, result.Buffer.ToArray());
+    }
 }

@@ -140,10 +140,55 @@ public sealed partial class SpscPipe : IDisposable
             if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
             {
                 _readAwaiter._ctr.Dispose();
-                // Pattern 2 construction happens here in Task 8. For now, deliver default.
-                // This intermediate behavior won't be exposed to users until ReadAsync is wired (Task 6),
-                // and the parking path is wired (Task 8). The sync fast path doesn't reach here.
-                _readAwaiter._core.SetResult(default);
+
+                // Pattern 2: construct ReadResult from stash + just-published WriterState.
+                var w = _lastPublishedWriterState;
+
+                // Throw-first: writer-completed-with-ex delivered as exception.
+                if (w.IsCompleted && w.CompletionException != null)
+                {
+                    _readAwaiter._core.SetException(w.CompletionException);
+                    return;
+                }
+
+                var head    = _readAwaiter._stashHead ?? w.HeadSegment;     // bootstrap fallback
+                var headIdx = _readAwaiter._stashHead == null ? 0 : _readAwaiter._stashHeadIdx;
+
+                var buffer = head == null
+                    ? ReadOnlySequence<byte>.Empty
+                    : new ReadOnlySequence<byte>(head, headIdx, w.TailSegment!, w.TailWritten);
+
+                _readAwaiter._core.SetResult(new ReadResult(buffer, isCanceled: false, isCompleted: w.IsCompleted));
+                return;
+            }
+        }
+    }
+
+    internal void OnReadAwaiterTokenCancel()
+    {
+        while (true)
+        {
+            int oldV = _readAwaiter._state;
+            if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) return;
+            int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+            if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
+            {
+                _readAwaiter._core.SetException(new OperationCanceledException(_readAwaiter._token));
+                return;
+            }
+        }
+    }
+
+    internal void OnFlushAwaiterTokenCancel()
+    {
+        while (true)
+        {
+            int oldV = _flushAwaiter._state;
+            if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
+            int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+            if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
+            {
+                _flushAwaiter._core.SetException(new OperationCanceledException(_flushAwaiter._token));
                 return;
             }
         }
