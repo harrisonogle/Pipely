@@ -149,6 +149,86 @@ public sealed partial class SpscPipe : IDisposable
         }
     }
 
+    internal void PublishReaderState()
+    {
+        var snapshot = new ReaderState
+        {
+            HeadSegment         = _readHead,
+            TotalConsumed       = _totalConsumed,
+            TotalExamined       = _totalExamined,
+            IsCompleted         = false,
+            CompletionException = null,
+        };
+        _readerTb.ProducerSlot() = snapshot;
+        _readerTb.Publish();
+        _lastPublishedReaderState = snapshot;
+
+        SignalFlushIfBackpressureRelieved();
+    }
+
+    // R2-1: gated signaler — only wakes the parked writer when backpressure has relieved.
+    // Called from AdvanceTo. The writer cannot re-check the wake condition after _core.SetResult,
+    // so signal-side gating is required (not optional).
+    //
+    // Side effect: the inner TryAcquire mutates _readTail/_readTailIdx via IntegrateAcquiredWriterState.
+    // Benign — keeps reader's view of the writer's tail fresh as a no-op-or-better.
+    internal void SignalFlushIfBackpressureRelieved()
+    {
+        // Fast path: no parked writer.
+        if ((_flushAwaiter._state & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
+
+        // Refresh writer state to compute unconsumed accurately.
+        if (_writerTb.TryAcquire())
+        {
+            _lastAcquiredWriterState = _writerTb.ConsumerSlot();
+            IntegrateAcquiredWriterState();
+        }
+
+        long unconsumed = _lastAcquiredWriterState.TotalWritten - _totalConsumed;
+        // Note: no `|| _readerCompleted` clause — AdvanceTo's entry guard throws if _readerCompleted,
+        // so this code path never runs post-completion. Reader.Complete uses SignalFlushAwaiterIfPending (unconditional).
+        if (unconsumed >= _options.ResumeWriterThreshold) return;
+
+        while (true)
+        {
+            int oldV = _flushAwaiter._state;
+            if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
+            int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+            if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
+            {
+                _flushAwaiter._ctr.Dispose();
+                DeliverFlushResult();
+                return;
+            }
+        }
+    }
+
+    // Unconditional signaler — used by Reader.Complete only (completion is always a wake reason).
+    internal void SignalFlushAwaiterIfPending()
+    {
+        while (true)
+        {
+            int oldV = _flushAwaiter._state;
+            if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
+            int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+            if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
+            {
+                _flushAwaiter._ctr.Dispose();
+                DeliverFlushResult();
+                return;
+            }
+        }
+    }
+
+    private void DeliverFlushResult()
+    {
+        var r = _lastPublishedReaderState;
+        if (r.IsCompleted && r.CompletionException != null)
+            _flushAwaiter._core.SetException(r.CompletionException);
+        else
+            _flushAwaiter._core.SetResult(new FlushResult(isCanceled: false, isCompleted: r.IsCompleted));
+    }
+
     internal void RecycleDrainedSegments()
     {
         var r = _lastAcquiredReaderState;

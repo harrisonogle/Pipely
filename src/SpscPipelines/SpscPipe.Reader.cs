@@ -80,8 +80,56 @@ public sealed partial class SpscPipe
             return false;
         }
 
-        public override void AdvanceTo(SequencePosition consumed) => throw new NotImplementedException();
-        public override void AdvanceTo(SequencePosition consumed, SequencePosition examined) => throw new NotImplementedException();
+        public override void AdvanceTo(SequencePosition consumed) => AdvanceTo(consumed, consumed);
+
+        public override void AdvanceTo(SequencePosition consumed, SequencePosition examined)
+        {
+            if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+            if (_pipe._readerCompleted) throw new InvalidOperationException("Reading is completed.");
+
+            var consumedSeg = consumed.GetObject() as BufferSegment;
+            var examinedSeg = examined.GetObject() as BufferSegment;
+
+            if (consumedSeg == null && examinedSeg == null)
+            {
+                _pipe.PublishReaderState();
+                return;
+            }
+            if (consumedSeg == null || examinedSeg == null)
+                throw new InvalidOperationException("AdvanceTo: mixed null/non-null SequencePositions");
+
+            // R4-7: pipe-identity check.
+            if (!ReferenceEquals(consumedSeg.OwnerToken, _pipe) || !ReferenceEquals(examinedSeg.OwnerToken, _pipe))
+                throw new InvalidOperationException("AdvanceTo: SequencePosition is from a different pipe.");
+
+            int consumedIdx = consumed.GetInteger();
+            int examinedIdx = examined.GetInteger();
+
+            long consumedAbs = consumedSeg.RunningIndex + consumedIdx;
+            long examinedAbs = examinedSeg.RunningIndex + examinedIdx;
+
+            // Refresh writer state for upper-bound validation.
+            if (_pipe._writerTb.TryAcquire())
+            {
+                _pipe._lastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
+                _pipe.IntegrateAcquiredWriterState();
+            }
+
+            if (consumedAbs < _pipe._totalConsumed
+                || examinedAbs < _pipe._totalExamined
+                || consumedAbs > examinedAbs
+                || examinedAbs > _pipe._lastAcquiredWriterState.TotalWritten)
+            {
+                throw new InvalidOperationException("AdvanceTo position out of range");
+            }
+
+            _pipe._readHead      = consumedSeg;
+            _pipe._readHeadIdx   = consumedIdx;
+            _pipe._totalConsumed = consumedAbs;
+            _pipe._totalExamined = examinedAbs;
+
+            _pipe.PublishReaderState();
+        }
         public override void Complete(Exception? ex = null) => throw new NotImplementedException();
         public override void CancelPendingRead() => throw new NotImplementedException();
     }
