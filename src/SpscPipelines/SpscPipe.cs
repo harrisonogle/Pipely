@@ -53,9 +53,34 @@ public sealed partial class SpscPipe : IDisposable
 
     public void Dispose()
     {
-        // Full implementation in Task 10.
         if (_disposed) return;
         _disposed = true;
+
+        // R4-1: dispose leftover CTRs (idempotent on default).
+        _readAwaiter._ctr.Dispose();
+        _flushAwaiter._ctr.Dispose();
+
+        // Walk the chain.
+        var seg = _chainHead;
+        while (seg != null)
+        {
+            var next = seg.Next;
+            seg.DisposeOwned();
+            seg = next;
+        }
+        _chainHead = null;
+        _writingHead = null;
+
+        // Walk the freelist.
+        var fl = _freelistHead;
+        while (fl != null)
+        {
+            var next = fl.Next;
+            fl.DisposeOwned();
+            fl = next;
+        }
+        _freelistHead = null;
+        _freelistCount = 0;
     }
 
     internal BufferSegment RentSegment(int sizeHint, long runningIndex)

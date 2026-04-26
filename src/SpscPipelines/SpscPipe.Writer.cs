@@ -137,7 +137,20 @@ public sealed partial class SpscPipe
 
             _pipe.SignalReadAwaiterIfPending();
         }
-        public override void CancelPendingFlush() => throw new NotImplementedException();
+        public override void CancelPendingFlush()
+        {
+            int oldV = Interlocked.Or(ref _pipe._flushAwaiter._state, SpscAwaiter<FlushResult>.CancelFlag);
+            if ((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Pending
+                && Interlocked.CompareExchange(
+                       ref _pipe._flushAwaiter._state,
+                       SpscAwaiter<FlushResult>.Inactive,
+                       SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
+                   == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
+            {
+                _pipe._flushAwaiter._ctr.Dispose();
+                _pipe._flushAwaiter._core.SetResult(new FlushResult(isCanceled: true, isCompleted: false));
+            }
+        }
 
         private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
         {

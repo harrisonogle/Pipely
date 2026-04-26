@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO.Pipelines;
 using System.Runtime.ExceptionServices;
 using System.Threading;
@@ -149,7 +150,27 @@ public sealed partial class SpscPipe
 
             _pipe.SignalFlushAwaiterIfPending();
         }
-        public override void CancelPendingRead() => throw new NotImplementedException();
+        public override void CancelPendingRead()
+        {
+            int oldV = Interlocked.Or(ref _pipe._readAwaiter._state, SpscAwaiter<ReadResult>.CancelFlag);
+            if ((oldV & SpscAwaiter<ReadResult>.StateMask) == SpscAwaiter<ReadResult>.Pending
+                && Interlocked.CompareExchange(
+                       ref _pipe._readAwaiter._state,
+                       SpscAwaiter<ReadResult>.Inactive,
+                       SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag)
+                   == (SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag))
+            {
+                _pipe._readAwaiter._ctr.Dispose();
+
+                var head = _pipe._readAwaiter._stashHead;
+                var tail = _pipe._readAwaiter._stashTail;
+                var buffer = head == null
+                    ? ReadOnlySequence<byte>.Empty
+                    : new ReadOnlySequence<byte>(head, _pipe._readAwaiter._stashHeadIdx, tail!, _pipe._readAwaiter._stashTailIdx);
+
+                _pipe._readAwaiter._core.SetResult(new ReadResult(buffer, isCanceled: true, isCompleted: false));
+            }
+        }
 
         private ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
         {
