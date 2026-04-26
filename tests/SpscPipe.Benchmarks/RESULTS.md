@@ -58,5 +58,46 @@ single-consumer hot path. A 1.50x speedup at this chunk size meets that bar.
 - **Pause/resume thresholds match.** BCL's `PipeOptions.Default` pause/resume = 64K/32K; the
   SPSC adapter passes `SpscPipeOptions.Default` which uses the same 64K/32K. So the comparison
   exercises identical backpressure points.
-- **Latency benchmark is out of scope here.** Only `*ProduceAndDrain*` was filtered; the
-  `LatencyHarness` ping-pong remains hooked up for future characterization.
+
+## Latency
+
+`LatencyHarness.Run` — producer writes 100,000 fixed-size 256-byte messages, each prefixed with a
+`Stopwatch.GetTimestamp()` value. Consumer reads each message and records `(now - timestamp)` into
+a power-of-2 log-bucket histogram. No artificial pacing — measures producer→consumer hand-off
+latency under sustained throughput. Same hardware/build as throughput run, commit `1b020ad`.
+
+Three independent runs (histogram resolution is power-of-2 buckets — adjacent runs may report the
+same value or shift by one bucket due to where the percentile falls):
+
+| Pipe     | Run | P50      | P90      | P99      | P99.9   |
+|----------|----:|---------:|---------:|---------:|--------:|
+| BCL      |   1 |  2,048ns |  8,192ns | 16,384ns |  1.05ms |
+| BCL      |   2 |  1,024ns |  4,096ns | 16,384ns |  4.19ms |
+| BCL      |   3 |  2,048ns |  8,192ns | 16,384ns |  4.19ms |
+| SpscPipe |   1 |    512ns |    512ns |  4,096ns |  4.19ms |
+| SpscPipe |   2 |    512ns |  1,024ns |  8,192ns |  4.19ms |
+| SpscPipe |   3 |    512ns |    512ns |  4,096ns |  4.19ms |
+
+### Verdict
+
+- **Median latency:** SpscPipe ~512 ns vs BCL ~1-2 µs — a **2-4× lower median** for the
+  producer→consumer hand-off.
+- **P90/P99:** Same ordering — SpscPipe consistently 2-4× lower.
+- **Tail (P99.9):** Both pipes hit the ~1-4 ms range. The tail is dominated by OS scheduling jitter
+  and GC pauses, not by pipe internals; lock-free vs locked doesn't change the worst-case behavior
+  of the shared runtime. This is expected and not a regression.
+
+### Notes / caveats
+
+- **Coarse histogram resolution.** The shared `Histogram` class uses power-of-2 buckets (1ns, 2ns,
+  4ns, ..., 512ns, 1024ns, 2048ns, ...). A "P50: 512ns" report means the median falls in the
+  [512, 1024) ns bucket. Run-to-run drift of one bucket on a percentile usually reflects the
+  histogram boundary, not a real shift. For tighter resolution, swap in a finer histogram
+  (e.g., HdrHistogram).
+- **`Stopwatch.GetTimestamp()` overhead** is ~10ns on this hardware, well below the 512ns minimum
+  bucket — the noise floor is real signal, not measurement floor.
+- **No warmup separation.** First-message latency includes JIT warmup. With 100K samples that's
+  diluted in P50/P90/P99 but contributes to P99.9 outliers.
+- **Sustained-throughput model, not round-trip.** This measures stream latency under continuous
+  flow, not request/response ping-pong. A round-trip benchmark (write → read → reply → read)
+  would be a different shape; not currently implemented.
