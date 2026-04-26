@@ -42,9 +42,12 @@ internal sealed class StressHarness
                     var fr = await pipe.Writer.FlushAsync(ct);
                     if (fr.IsCompleted) break;
                 }
-                pipe.Writer.Complete();
             }
             catch (Exception e) { producerEx = e; }
+            finally
+            {
+                try { pipe.Writer.Complete(producerEx); } catch { }
+            }
         }, ct);
 
         var consumer = Task.Run(async () =>
@@ -82,9 +85,12 @@ internal sealed class StressHarness
 
                     if (rr.IsCompleted && consumed >= produced) break;
                 }
-                pipe.Reader.Complete();
             }
             catch (Exception e) { consumerEx = e; }
+            finally
+            {
+                try { pipe.Reader.Complete(consumerEx); } catch { }
+            }
         }, ct);
 
         try
@@ -93,7 +99,7 @@ internal sealed class StressHarness
         }
         catch (TimeoutException)
         {
-            return new StressResult(seed, produced, consumed, "timeout — possible deadlock", null, null);
+            return new StressResult(seed, produced, consumed, "timeout — possible deadlock", producerEx, consumerEx);
         }
 
         if (producerEx != null || consumerEx != null)
