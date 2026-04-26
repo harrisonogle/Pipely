@@ -139,6 +139,7 @@ public sealed partial class SpscPipe
         }
         public override void CancelPendingFlush()
         {
+            if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
             int oldV = Interlocked.Or(ref _pipe._flushAwaiter._state, SpscAwaiter<FlushResult>.CancelFlag);
             if ((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Pending
                 && Interlocked.CompareExchange(

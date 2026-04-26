@@ -36,4 +36,20 @@ public class SpscPipeDisposeTests
         Assert.Throws<ObjectDisposedException>(() => pipe.Writer.GetMemory(0));
         Assert.Throws<ObjectDisposedException>(() => pipe.Reader.TryRead(out _));
     }
+
+    [Fact]
+    public void CancelPendingRead_AfterDispose_Throws()
+    {
+        var pipe = new SpscPipelines.SpscPipe();
+        pipe.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => pipe.Reader.CancelPendingRead());
+    }
+
+    [Fact]
+    public void CancelPendingFlush_AfterDispose_Throws()
+    {
+        var pipe = new SpscPipelines.SpscPipe();
+        pipe.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => pipe.Writer.CancelPendingFlush());
+    }
 }

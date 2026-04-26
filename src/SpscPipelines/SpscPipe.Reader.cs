@@ -152,6 +152,7 @@ public sealed partial class SpscPipe
         }
         public override void CancelPendingRead()
         {
+            if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
             int oldV = Interlocked.Or(ref _pipe._readAwaiter._state, SpscAwaiter<ReadResult>.CancelFlag);
             if ((oldV & SpscAwaiter<ReadResult>.StateMask) == SpscAwaiter<ReadResult>.Pending
                 && Interlocked.CompareExchange(
