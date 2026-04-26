@@ -1,7 +1,7 @@
 # SPSC Pipe — Design (TripleBuffer-based)
 
 **Date:** 2026-04-25
-**Status:** Design (pre-implementation) — round-2 revision
+**Status:** Design (pre-implementation) — round-4 revision (gated for implementation plan)
 
 ## Top-level key takeaways
 
@@ -19,6 +19,8 @@
   - `AdvanceTo` argument validation rejects positions past the latest known `TotalWritten`, but does **not** verify positions came from the user's most-recent `ReadResult.Buffer` specifically (BCL does). Catches silent-hang failure mode but not stale-`SequencePosition`-from-recycled-segment corruption.
   - No `ReadAsync`-without-intervening-`AdvanceTo` guard. BCL throws `InvalidOperationException` if the user calls `ReadAsync` twice without `AdvanceTo`. SPSC contract considered sufficient; second call returns the same (or fresher) buffer.
   - `CancelPending*`-from-third-thread always returns `IsCompleted = false` even if the opposite side has just completed (one-call lag). The next non-cancel call surfaces the correct `IsCompleted` via `TryAcquire`. Only affects the parked-and-cancelled-from-third-thread path; sync-entry sticky-cancel consume sees fresh state via the throw-first `TryAcquire`.
+  - `CancelPendingRead` while the reader is parked returns the buffer **as-of park time** (constructed from the awaiter stash), not the current pipe state. BCL constructs from the current committed state. Difference is observable when the writer publishes between the reader's park and the cancel; the data is not lost — it surfaces on the next `ReadAsync`. The non-parked sync-entry sticky-cancel consume *is* BCL-accurate (uses freshly-acquired writer state).
+  - Strict SPSC threading contract: only one thread per side may call user-facing methods (`CancelPending*` excepted). BCL `Pipe` permits concurrent reader-side and writer-side ops under appropriate `PipeOptions`; SPSC explicitly does not.
 
 ## Section 1 — Architecture overview
 
@@ -41,10 +43,14 @@
 - `_writingHead : BufferSegment?` — current tail segment being filled.
 - `_writingHeadBytesBuffered : int` — bytes written into `_writingHead` (not yet necessarily published).
 - `_totalWritten : long` — monotonic byte counter.
+- `_freelistHead : BufferSegment?` — top of writer-private LIFO freelist (chained via `BufferSegment.Next`).
 - `_freelistCount : int` — current freelist size; bounded by `_options.MaxFreelistSegments`.
 - `_lastPublishedWriterState : WriterState` — read by the reader's signaler under Pattern 2 to construct the `ReadResult`.
 - `_lastAcquiredReaderState : ReaderState` — most recent acquire from `_readerTb`.
 - `_writerCompleted : bool` — sticky after `Complete`.
+
+**Pipe-level (single field; mutated by `Dispose` only):**
+- `_disposed : bool` — sticky after `Dispose`. Every public method's entry guard checks this first and throws `ObjectDisposedException` if set.
 
 **Reader-side (touched only by the reader thread):**
 - `_readHead : BufferSegment?`, `_readHeadIdx : int` — head of unconsumed data.
@@ -243,6 +249,8 @@ The freelist is a writer-private LIFO stack: head pointer in `_freelistHead : Bu
 
 **Note on `MemoryPool<byte>.Rent`.** `pool.Rent(sizeHint)` returns a buffer of length **at least** `sizeHint`, not exactly `sizeHint`. Tests, freelist size comparisons, and any code reasoning about rented capacity must use `>=`, never `==`.
 
+**Exception-safety on allocation failure.** `pool.Rent` may throw `OutOfMemoryException` (or `ArgumentOutOfRangeException` for size-capped pools). The `GetMemory` pseudocode in Section 4 calls `RentSegment` *before* mutating `_writingHead`/`_chainHead`, so an exception leaves writer-private state untouched and the call is safely retryable. Matches BCL `PipeWriter.GetMemory` behavior. An implementer who refactors the order risks leaving the chain in an inconsistent state — exception-safety is sequence-dependent.
+
 ### Recycling path (canonical version — see also §6 `Reader.Complete` interaction)
 
 Called at the end of `FlushAsync`, after the writer has refreshed `_lastAcquiredReaderState` via `_readerTb.TryAcquire()`:
@@ -317,19 +325,21 @@ Edge cases:
 
 ### Lifecycle: cleanup on Dispose
 
-`SpscPipe.Dispose()` walks the chain and the freelist, calling `BufferSegment.DisposeOwned()` on each to release `IMemoryOwner` rentals. Idempotent: a `_disposed` flag at the top of `Dispose` short-circuits subsequent calls.
+`SpscPipe.Dispose()` walks the chain and the freelist, calling `BufferSegment.DisposeOwned()` on each to release `IMemoryOwner` rentals. Idempotent: a `_disposed` flag at the top of `Dispose` short-circuits subsequent calls. Also disposes leftover awaiter `_ctr` registrations (R4-1: closes a CTR-rooting leak when a token-cancelled awaiter is never followed by another park to clean up — `SpscPipe` is otherwise rooted by the `CancellationTokenSource`'s callback list for the lifetime of the CTS).
 
 ```csharp
 public void Dispose()
 {
     if (_disposed) return;
     _disposed = true;
+    _readAwaiter._ctr.Dispose();        // R4-1: idempotent; safe on default value
+    _flushAwaiter._ctr.Dispose();
     DisposeChain(_chainHead);
     DisposeFreelist(_freelistHead);
 }
 ```
 
-**Precondition:** no operation is currently in flight on either side, **and no `ReadResult.Buffer` references are still held by the user**. The buffer references segments whose `IMemoryOwner` will be released; accessing them after `Dispose` is use-after-free. After `Dispose`, the pipe is unusable (further public method calls throw `ObjectDisposedException`).
+**Precondition:** no operation is currently in flight on either side, **and no `ReadResult.Buffer` references are still held by the user**. The buffer references segments whose `IMemoryOwner` will be released; accessing them after `Dispose` is use-after-free. After `Dispose`, the pipe is unusable: every public method's entry guard checks `_disposed` first (after the `_writerCompleted`/`_readerCompleted` check is the wrong order — `_disposed` should be first). Calls after `Dispose` throw `ObjectDisposedException`. Implementations should add this guard to every public method shown in Section 4 (omitted from the pseudocode samples for brevity, but load-bearing for the contract).
 
 `SpscPipe` implements `IDisposable`; `BCL.Pipe` does not. This is a documented divergence (justified because we don't expose `Reset` and segments need explicit memory release).
 
@@ -443,6 +453,10 @@ ValueTask<FlushResult> FlushAsync(CancellationToken ct)
     _writerTb.Publish();                              // R1; I9 release fence
     _lastPublishedWriterState = snapshot;
 
+    // Note: FlushAsync publishes and signals unconditionally even when no bytes have been written
+    // since the last flush (zero-byte flush). May cause a spurious reader wakeup; the reader handles
+    // it correctly (returns ReadResult with no new bytes; reader re-parks). Optional optimization:
+    // skip publish+signal when _writingHeadBytesBuffered is unchanged. BCL guards via _unflushedBytes > 0.
     SignalReadAwaiterIfPending();                     // R1
 
     // Re-acquire reader state for backpressure freshness (catches reader's response to our signal).
@@ -695,7 +709,9 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     public CancellationToken _token;            // cached for OCE construction; set at park, read by token callback
 
     // Stash for Pattern 2. Used by SpscAwaiter<ReadResult>; ignored by SpscAwaiter<FlushResult>
-    // (FlushResult has no buffer). Set by reader at park time, read by signaler/canceler after CASing out of Pending.
+    // (FlushResult has no buffer; ~24 bytes wasted per pipe — implementation may split the type
+    // into two non-generic awaiter classes if the savings matter).
+    // Set by reader at park time, read by signaler/canceler after CASing out of Pending.
     public BufferSegment? _stashHead;
     public int            _stashHeadIdx;
     public BufferSegment? _stashTail;       // R2-5: extended for cancel-while-parked buffer reconstruction
@@ -721,11 +737,15 @@ Two states (`Inactive` / `Pending`) suffice; "how was this completed" lives in `
 - `_ctr` is written by the owner *after* CAS Inactive→Pending. **Important: the CAS does NOT release-publish `_ctr`** — there is no synchronizes-with edge between the owner's `_ctr = …` write and a signaler/canceler that wins CAS Pending→Inactive between the owner's CAS and the owner's `_ctr` write. Safety rests on two distinct properties: (a) `CancellationTokenRegistration` is a small struct and `Dispose()` is **idempotent and tolerant of default/torn input** — disposing a default or partially-published value at worst no-ops; (b) the owner's R5 re-check (`if (_state != Pending) _ctr.Dispose()`) ensures the owner disposes the by-then-fully-written value if a signaler/canceler beat it to the CAS. This guarantees at-least-once Dispose. The R5b (start-of-next-park dispose) handles the orthogonal token-callback-wins case where the callback won the CAS but didn't dispose. Future maintainers must not "optimize away" the R5 re-check on the assumption that `_state` publishes `_ctr` — it doesn't.
 - Stash fields (`_stashHead`, `_stashHeadIdx`, `_stashTail`, `_stashTailIdx`) are written by the owner *before* CAS Inactive→Pending; read by the signaler or canceler after CAS Pending→Inactive succeeds. The CAS's release/acquire ordering does cover these. Stash fields are not cleared after read; they retain references to BufferSegments until the next park overwrites them (one-cycle pin, parallel to TripleBuffer slot retention; benign).
 
-**On Pattern 2 (stash-and-construct).** The signaler runs on the writer thread (for the read awaiter); constructing a `ReadResult` requires reader-private cursors per I3. To avoid Pattern 1's thread-affinity constraint, the reader stashes its full cursor (head + tail) at park time. The signaler combines the stash with `_lastPublishedWriterState` (writer-private, freshest just before signaling) to construct the `ReadResult` and pass it to `_core.SetResult`. The canceler-while-parked path uses the same stash to construct a buffer with the bytes that were available at park time (matching BCL's "give me what you have right now" cancel semantics).
+**On Pattern 2 (stash-and-construct).** The signaler runs on the writer thread (for the read awaiter); constructing a `ReadResult` requires reader-private cursors per I3. To avoid Pattern 1's thread-affinity constraint, the reader stashes its full cursor (head + tail) at park time. The signaler combines the stash with `_lastPublishedWriterState` (writer-private, freshest just before signaling) to construct the `ReadResult` and pass it to `_core.SetResult`. The canceler-while-parked path uses the same stash to construct a buffer reflecting **park-time** contents — bytes the writer publishes between the reader's park and the cancel-from-third-thread are *not* in the cancel result; they surface on the next `ReadAsync` (documented top-level divergence from BCL, which constructs from current committed state). The stash is also not refreshed by `ParkReadAwaiter`'s lost-wakeup integrate; refreshing it would introduce a torn-stash window for a concurrent canceler.
 
 **Implementation note on `RunContinuationsAsynchronously`.** Set `_core.RunContinuationsAsynchronously = true` **once at construction**, not per-`Reset` — `ManualResetValueTaskSourceCore<T>.Reset` does not reset this flag. Setting it `true` avoids inline continuation execution on the signaler thread (which can lead to unbounded stack depth and reentrancy hazards under bursty workloads). Pattern 2 makes this choice cleanly orthogonal to correctness.
 
-**Cross-thread visibility of `_lastPublishedWriterState` under Pattern 2.** The reader's signaler runs on the writer thread; it reads `_lastPublishedWriterState` (a writer-private field set on the writer thread, immediately before `SignalReadAwaiterIfPending` is called). Since both writes are on the writer thread, no cross-thread synchronization is needed for that read. The constructed `ReadResult` is then passed into `_core.SetResult`, which provides the release/acquire fence to the reader's continuation thread. Symmetric for `_lastPublishedReaderState` and the writer-side awaiter.
+**Cross-thread visibility of `_lastPublishedWriterState` under Pattern 2.** The reader's signaler runs on the writer thread; it reads `_lastPublishedWriterState` (a writer-private field set on the writer thread, immediately before `SignalReadAwaiterIfPending` is called). Since both writes are on the writer thread, no cross-thread synchronization is needed for that read. The constructed `ReadResult` is then passed into `_core.SetResult`, which provides the release/acquire fence to the reader's continuation thread.
+
+**Symmetric for `_lastPublishedReaderState`.** The writer's signaler (called from `AdvanceTo` via `SignalFlushIfBackpressureRelieved` and from `Reader.Complete` via `SignalFlushAwaiterIfPending`) runs on the **reader** thread; it reads `_lastPublishedReaderState`, which is reader-private and was set on the reader thread immediately before the signaler call. No cross-thread sync needed for that read. `_core.SetResult` then provides release/acquire to the writer's continuation. Future maintainers adding additional signaler call sites must place them on the reader thread to preserve this property.
+
+**Cancel-via-stash transitive-fence visibility.** The cross-thread `CancelPendingRead` path (canceler on a third thread) constructs an ROS from segments reachable through the stash. Visibility chain: writer's freeze writes → (writer's `Publish` release fence) → reader's `TryAcquire` acquire fence → reader's stash writes (same thread, sequenced) → reader's CAS Inactive→Pending release → canceler's CAS Pending→Inactive acquire → canceler's reads of stash + segment fields → canceler's `_core.SetResult` release → continuation's `GetResult` acquire. All segment fields the canceler reads (`RunningIndex`, `Memory`, etc.) were established by the writer's freeze before the writer published, and the chain transitively carries the writes to the canceler thread.
 
 **`Interlocked.Or` portability note.** `Interlocked.Or(ref int, int)` was added in .NET 7; this project targets net10.0, so it's available. If back-porting to older targets, fall back to a CAS loop.
 
@@ -862,7 +882,11 @@ void OnReadAwaiterTokenCancel()
 
 **Note on Pattern 2 cursor lag.** After a Pattern-2-delivered ReadResult, the reader's local `_readTail`/`_readTailIdx` may briefly lag the buffer the user just received — the buffer was constructed with the writer's just-published `TailSegment`/`TailWritten`, but reader's local fields aren't updated by the signaler. The signaler does **not** update `_readHead` either; that's the user's responsibility via `AdvanceTo`. AdvanceTo's top-of-method `TryAcquire` (R2-7) refreshes `_readTail`/`_readTailIdx` on the next reader call. Sticky-cancel sync return after a Pattern-2 delivery similarly refreshes via the entry-side `TryAcquire` (R2-3 throw-first ordering puts TryAcquire before sticky-cancel consumption).
 
-**Bootstrap-via-signaler delays full bootstrap until first `AdvanceTo`.** If the reader's first read hits the Pattern-2 signaler path (rather than the synchronous `TryAcquire`-and-integrate path), `_readHead` remains null until the user's `AdvanceTo` extracts the head segment from the delivered buffer's `consumed` position. During that window, the reader's published `_lastPublishedReaderState.HeadSegment` is also null — but `IsCompleted = false`, so the writer's recycle predicate's pre-bootstrap guard (`if (HeadSegment is null && !IsCompleted) return;`) holds, blocking recycling. Self-correcting: once the user calls `AdvanceTo`, `_readHead` is set from `consumed.GetObject()` and the next `PublishReaderState` carries a non-null `HeadSegment`. A future maintainer must not "fix" the recycle guard to allow null `HeadSegment` without `IsCompleted`, or this safety property breaks.
+**Bootstrap-via-signaler delays full bootstrap until first `AdvanceTo`.** If the reader's first read hits the Pattern-2 signaler path (rather than the synchronous `TryAcquire`-and-integrate path), `_readHead` remains null until the user's `AdvanceTo` extracts the head segment from the delivered buffer's `consumed` position. During that window, the reader's published `_lastPublishedReaderState.HeadSegment` is also null — but `IsCompleted = false`, so the writer's recycle predicate's pre-bootstrap guard (`if (HeadSegment is null && !IsCompleted) return;`) holds, blocking recycling. Self-correcting: once the user calls `AdvanceTo`, `_readHead` is set from `consumed.GetObject()` and the next `PublishReaderState` carries a non-null `HeadSegment`.
+
+**Lost-wakeup integrate variant of the same case.** `ParkReadAwaiter`'s lost-wakeup re-check (step 2) calls `IntegrateAcquiredWriterState`. If `_readHead` was null pre-park (first read) and the integrate sets `_readHead` from the just-acquired `WriterState.HeadSegment` but the un-park condition (`HasReadableProgress` / `IsCompleted` / writer-completion-exception) does not fire, `_readHead` becomes non-null while the reader stays parked. The reader's published `_lastPublishedReaderState.HeadSegment` is still null (no `PublishReaderState` happens during park), so the same pre-bootstrap recycle guard protects the segment.
+
+A future maintainer must not "fix" either recycle guard variant to allow null `HeadSegment` without `IsCompleted`, or both safety properties break.
 
 ### Writer's park / wake
 
@@ -1308,6 +1332,8 @@ If a sticky `CancelPending*` is consumed on a post-`Writer.Complete(null)` read,
 - **`Dispose` on a never-used pipe.** Safe; the chain and freelist are empty.
 - **`AdvanceTo` argument validation (R8).** Monotonicity + upper bound against `_lastAcquiredWriterState.TotalWritten`. No buffer-specific validation (documented BCL divergence; catches silent-hang failure mode).
 - **`AdvanceTo` on `default(SequencePosition)`.** Treated as a no-op (with publish), per N6 — handles the "AdvanceTo after empty `IsCompleted=true` ReadResult" case without NPE.
+- **`AdvanceTo` with a `SequencePosition` from a different `SpscPipe` instance.** The upper-bound check (`examined ≤ TotalWritten`) catches obvious cases but does not detect cross-pipe references in general. Implementation should consider adding a per-segment back-reference to the owning `SpscPipe` (or a pipe-identity tag) so `AdvanceTo` can throw `InvalidOperationException` rather than silently corrupting another pipe's state. Treated as a defense-in-depth opportunity for the implementation plan, not a spec-level requirement.
+- **`Reader.Complete` while a `ReadResult.Buffer` is outstanding.** The writer's next `FlushAsync` sweeps the entire chain (because `Reader.Complete` publishes `HeadSegment = null, IsCompleted = true`). Segments returned to the freelist may be re-rented and overwritten. Outstanding `ReadResult.Buffer` references must therefore not be accessed after `Reader.Complete` returns (parallel to the `Dispose` precondition). The implementation's public XML doc on `Reader.Complete` should state this explicitly.
 - **`CancelPendingRead` + token cancellation interaction.** If both fire concurrently, they race on the CAS out of `Pending`. The winner's path is delivered (canceled result vs. OCE throw). The loser's intent is preserved as the sticky cancel flag (if canceler lost) — surfaces on next call.
 - **`RunningIndex` overflow.** `RunningIndex` is `long`; overflow at ~9 EB. Out of scope.
 
@@ -1321,7 +1347,7 @@ If a sticky `CancelPending*` is consumed on a post-`Writer.Complete(null)` read,
 - Under Option A (BCL-strict), every call after `Complete(ex)` throws on the opposite side. No `_exceptionAlreadySurfaced` tracking needed.
 - `Reader.Complete` publishes `HeadSegment = null, IsCompleted = true` so the writer recycles the entire chain on its next `FlushAsync`.
 - `IsCanceled` and `IsCompleted` flags are independent in `ReadResult` for `Writer.Complete(null)` cases; for `Writer.Complete(ex)` the throw fires first and cancel is dropped.
-- Five documented divergences from BCL: no `Reset`; double-`Complete` coalesces; `IDisposable` added; faulted-completion no-drain; `AdvanceTo` no buffer-specific upper-bound check.
+- Nine documented divergences from BCL (see top-level takeaways): no `Reset`; double-`Complete` coalesces; `IDisposable` added; faulted-completion no-drain; `AdvanceTo` no buffer-specific upper-bound check; no `ReadAsync`-without-`AdvanceTo` guard; cancel-from-third-thread `IsCompleted=false` lag; cancel-while-parked stash-time buffer; strict SPSC threading contract.
 - `Dispose()` releases segment + freelist memory; precondition is no in-flight ops AND no outstanding buffer refs.
 
 ## Section 7 — Verifiability
