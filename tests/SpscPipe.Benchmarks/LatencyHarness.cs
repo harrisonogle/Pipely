@@ -20,21 +20,19 @@ internal sealed record LatencyStats(
 internal static class LatencyHarness
 {
     // Producer writes fixed-size messages with a Stopwatch timestamp in the first 8 bytes.
-    // Consumer reads each message and records (now - timestamp) into a flat sample array.
+    // Consumer reads each message and records (now - timestamp) into the caller-provided sample array.
     // No artificial pacing — measures producer→consumer hand-off latency under sustained throughput.
     // After both sides finish, samples are sorted and exact percentiles are computed by index.
-    public static async Task<LatencyStats> Run(IPipeAdapter adapter, int messages, int messageBytes)
+    //
+    // The sample buffer is caller-owned so it can be reused across trials without re-allocating
+    // (which would add GC pressure that confounds the very runtime-drift we may be measuring).
+    // Caller is responsible for pre-touching pages before the first call.
+    public static async Task<LatencyStats> Run(IPipeAdapter adapter, long[] samples, int messageBytes)
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (8-byte timestamp prefix)");
 
-        long[] samples = new long[messages];
+        int messages = samples.Length;
         long bytesTotal = (long)messages * messageBytes;
-
-        // Pre-touch every 4 KB page to commit physical memory before the timed run.
-        // .NET allocates large arrays from anonymous mmap pages with lazy commit; without this,
-        // the consumer faults on first write to each new page (~1-10 µs each, concentrated in
-        // the early portion of the run, which then cascades into queueing).
-        for (int i = 0; i < samples.Length; i += 512) samples[i] = 1;
 
         var producer = Task.Run(async () =>
         {
