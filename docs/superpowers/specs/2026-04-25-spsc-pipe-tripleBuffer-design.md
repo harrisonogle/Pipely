@@ -13,7 +13,6 @@
 - BCL surface compatibility: `ReadAsync` / `TryRead` / `FlushAsync` / `Advance` / `AdvanceTo` / `Complete` / `CancelPending*`. Read/flush precedence is **throw-first** (matches BCL `IsCompletedOrThrow`): `Complete(ex)` throws on every subsequent call, taking precedence over both sticky cancel and cancellation-token surfacing.
 - **Documented divergences from BCL `Pipe`:**
   - No `Reset` (single-use lifecycle; pipe is created → used → both sides `Complete` → `Dispose`).
-  - Double-`Complete` on a side coalesces (BCL throws).
   - `IDisposable` added (BCL `Pipe` doesn't implement it; required because there's no `Reset`).
   - `Writer.Complete(exception)` makes any buffered-but-unconsumed data **unreachable** to the reader (BCL-strict per `IsCompletedOrThrow`). Drain semantics apply only to `Writer.Complete(null)`. Symmetric for `Reader.Complete(exception)` and the writer side.
   - `AdvanceTo` argument validation rejects positions past the latest known `TotalWritten`, but does **not** verify positions came from the user's most-recent `ReadResult.Buffer` specifically (BCL does). Catches silent-hang failure mode but not stale-`SequencePosition`-from-recycled-segment corruption.
@@ -1254,7 +1253,7 @@ public sealed class SpscPipe : IDisposable
 ```csharp
 void Complete(Exception? exception = null)
 {
-    if (_writerCompleted) return;            // double-Complete coalesces (BCL throws; documented divergence)
+    if (_writerCompleted) return;            // double-Complete coalesces (BCL net10.0 also coalesces — parity)
     _writerCompleted = true;
 
     var snapshot = new WriterState
@@ -1324,7 +1323,7 @@ If a sticky `CancelPending*` is consumed on a post-`Writer.Complete(null)` read,
 
 ### Edge cases
 
-- **Double `Complete`.** Coalesces (no-op on second call). BCL throws on second; we relax for SPSC simplicity. **Documented divergence.**
+- **Double `Complete`.** Coalesces (no-op on second call). BCL net10.0 also coalesces — parity, not a divergence.
 - **`CancelPending*` after `Complete`.** Safe (cross-thread by contract). Sets the flag; the next op's entry guard either short-circuits to throw (after `Writer.Complete(ex)` / `Reader.Complete(ex)`) or returns sticky-canceled then completion. After `*Complete(ex)`, throw-first means cancel never observable.
 - **`Complete` while opposite side parked.** R1 (publish before signal) covers it.
 - **`Complete` while a `CancelPending*` race is in flight.** Standard awaiter race; either signaler or canceler wins the CAS. Both orderings reach a consistent terminal state.
@@ -1347,7 +1346,7 @@ If a sticky `CancelPending*` is consumed on a post-`Writer.Complete(null)` read,
 - Under Option A (BCL-strict), every call after `Complete(ex)` throws on the opposite side. No `_exceptionAlreadySurfaced` tracking needed.
 - `Reader.Complete` publishes `HeadSegment = null, IsCompleted = true` so the writer recycles the entire chain on its next `FlushAsync`.
 - `IsCanceled` and `IsCompleted` flags are independent in `ReadResult` for `Writer.Complete(null)` cases; for `Writer.Complete(ex)` the throw fires first and cancel is dropped.
-- Nine documented divergences from BCL (see top-level takeaways): no `Reset`; double-`Complete` coalesces; `IDisposable` added; faulted-completion no-drain; `AdvanceTo` no buffer-specific upper-bound check; no `ReadAsync`-without-`AdvanceTo` guard; cancel-from-third-thread `IsCompleted=false` lag; cancel-while-parked stash-time buffer; strict SPSC threading contract.
+- Eight documented divergences from BCL (see top-level takeaways): no `Reset`; `IDisposable` added; faulted-completion no-drain; `AdvanceTo` no buffer-specific upper-bound check; no `ReadAsync`-without-`AdvanceTo` guard; cancel-from-third-thread `IsCompleted=false` lag; cancel-while-parked stash-time buffer; strict SPSC threading contract.
 - `Dispose()` releases segment + freelist memory; precondition is no in-flight ops AND no outstanding buffer refs.
 
 ## Section 7 — Verifiability
