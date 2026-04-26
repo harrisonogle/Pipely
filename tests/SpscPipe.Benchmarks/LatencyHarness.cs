@@ -4,18 +4,37 @@ using System.Runtime.InteropServices;
 
 namespace SpscPipe.Benchmarks;
 
+internal sealed record LatencyStats(
+    long MinTicks,
+    long P50Ticks,
+    long P90Ticks,
+    long P99Ticks,
+    long P999Ticks,
+    long MaxTicks,
+    double MeanTicks,
+    long Frequency,
+    int Messages,
+    int MessageBytes
+);
+
 internal static class LatencyHarness
 {
     // Producer writes fixed-size messages with a Stopwatch timestamp in the first 8 bytes.
     // Consumer reads each message and records (now - timestamp) into a flat sample array.
     // No artificial pacing — measures producer→consumer hand-off latency under sustained throughput.
     // After both sides finish, samples are sorted and exact percentiles are computed by index.
-    public static async Task Run(IPipeAdapter adapter, int messages, int messageBytes)
+    public static async Task<LatencyStats> Run(IPipeAdapter adapter, int messages, int messageBytes)
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (8-byte timestamp prefix)");
 
         long[] samples = new long[messages];
         long bytesTotal = (long)messages * messageBytes;
+
+        // Pre-touch every 4 KB page to commit physical memory before the timed run.
+        // .NET allocates large arrays from anonymous mmap pages with lazy commit; without this,
+        // the consumer faults on first write to each new page (~1-10 µs each, concentrated in
+        // the early portion of the run, which then cascades into queueing).
+        for (int i = 0; i < samples.Length; i += 512) samples[i] = 1;
 
         var producer = Task.Run(async () =>
         {
@@ -64,14 +83,41 @@ internal static class LatencyHarness
         for (int i = 0; i < samples.Length; i++) meanTicks += samples[i];
         meanTicks /= samples.Length;
 
-        Console.WriteLine($"  Messages:    {messages:N0} × {messageBytes} B");
-        Console.WriteLine($"  Min:         {TicksToNs(samples[0], freq):N0} ns");
-        Console.WriteLine($"  P50:         {TicksToNs(Percentile(samples, 0.50), freq):N0} ns");
-        Console.WriteLine($"  P90:         {TicksToNs(Percentile(samples, 0.90), freq):N0} ns");
-        Console.WriteLine($"  P99:         {TicksToNs(Percentile(samples, 0.99), freq):N0} ns");
-        Console.WriteLine($"  P99.9:       {TicksToNs(Percentile(samples, 0.999), freq):N0} ns");
-        Console.WriteLine($"  Max:         {TicksToNs(samples[^1], freq):N0} ns");
-        Console.WriteLine($"  Mean:        {meanTicks * 1_000_000_000 / freq:N0} ns");
+        return new LatencyStats(
+            MinTicks:     samples[0],
+            P50Ticks:     Percentile(samples, 0.50),
+            P90Ticks:     Percentile(samples, 0.90),
+            P99Ticks:     Percentile(samples, 0.99),
+            P999Ticks:    Percentile(samples, 0.999),
+            MaxTicks:     samples[^1],
+            MeanTicks:    meanTicks,
+            Frequency:    freq,
+            Messages:     messages,
+            MessageBytes: messageBytes);
+    }
+
+    // Side-by-side comparison table. "Ratio" column matches BDN convention:
+    // ratio = comparison_mean / baseline_mean, formatted as decimal (e.g., 0.67 = SpscPipe 33% faster).
+    // Baseline (BCL) is implicit at 1.00 by virtue of being the denominator.
+    public static void PrintComparison(string baselineLabel, LatencyStats baseline, string compareLabel, LatencyStats compare)
+    {
+        Console.WriteLine($"| Stat   | {baselineLabel,14} | {compareLabel,14} | Ratio |");
+        Console.WriteLine($"|:-------|---------------:|---------------:|------:|");
+        PrintRow("Min",   baseline.MinTicks,   compare.MinTicks,   baseline.Frequency, compare.Frequency);
+        PrintRow("P50",   baseline.P50Ticks,   compare.P50Ticks,   baseline.Frequency, compare.Frequency);
+        PrintRow("P90",   baseline.P90Ticks,   compare.P90Ticks,   baseline.Frequency, compare.Frequency);
+        PrintRow("P99",   baseline.P99Ticks,   compare.P99Ticks,   baseline.Frequency, compare.Frequency);
+        PrintRow("P99.9", baseline.P999Ticks,  compare.P999Ticks,  baseline.Frequency, compare.Frequency);
+        PrintRow("Max",   baseline.MaxTicks,   compare.MaxTicks,   baseline.Frequency, compare.Frequency);
+        PrintRow("Mean",  baseline.MeanTicks,  compare.MeanTicks,  baseline.Frequency, compare.Frequency);
+    }
+
+    private static void PrintRow(string label, double baselineTicks, double compareTicks, long baselineFreq, long compareFreq)
+    {
+        double baselineNs = TicksToNs(baselineTicks, baselineFreq);
+        double compareNs = TicksToNs(compareTicks, compareFreq);
+        double ratio = compareNs / baselineNs;
+        Console.WriteLine($"| {label,-6} | {baselineNs,11:N0} ns | {compareNs,11:N0} ns | {ratio,5:F2} |");
     }
 
     // Nearest-rank percentile: index = ceil(p * n) - 1, clamped to [0, n-1].
@@ -82,5 +128,5 @@ internal static class LatencyHarness
         return sortedSamples[idx];
     }
 
-    private static double TicksToNs(long ticks, long freq) => (double)ticks * 1_000_000_000 / freq;
+    private static double TicksToNs(double ticks, long freq) => ticks * 1_000_000_000 / freq;
 }

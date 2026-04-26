@@ -22,14 +22,18 @@ if (args.Length > 0 && args[0] == "latency")
         }
     }
 
-    Console.WriteLine("=== BCL Pipe ===");
+    Console.WriteLine($"Running BCL Pipe ({messages:N0} × {messageBytes} B)...");
+    LatencyStats bclStats;
     using (var bcl = new BclPipeAdapter())
-        await LatencyHarness.Run(bcl, messages, messageBytes);
+        bclStats = await LatencyHarness.Run(bcl, messages, messageBytes);
+
+    Console.WriteLine($"Running SpscPipe ({messages:N0} × {messageBytes} B)...");
+    LatencyStats spscStats;
+    using (var spsc = new SpscPipeAdapter())
+        spscStats = await LatencyHarness.Run(spsc, messages, messageBytes);
 
     Console.WriteLine();
-    Console.WriteLine("=== SpscPipe ===");
-    using (var spsc = new SpscPipeAdapter())
-        await LatencyHarness.Run(spsc, messages, messageBytes);
+    LatencyHarness.PrintComparison("BCL Pipe", bclStats, "SpscPipe", spscStats);
 
     return 0;
 }
