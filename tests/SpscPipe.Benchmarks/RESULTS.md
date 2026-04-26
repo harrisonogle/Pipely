@@ -31,7 +31,7 @@ tightly clustered, StdDev = 0.22 us = 0.30% of mean.)
 
 ## Verdict
 
-- **BCL throughput:** 1 MiB / 110.34 us ≈ **9.50 GB/s** (1 KB = 1024 B; 1 GB = 1024^3 B).
+- **BCL throughput:** 1 MiB / 110.34 us ≈ **9.50 GB/s** (1 GB = 10^9 B).
 - **SPSC throughput:** 1 MiB / 73.69 us ≈ **14.23 GB/s**.
 - **Speedup (BCL mean / SPSC mean):** ~1.50x — i.e. SPSC takes 67% of the time BCL does for the
   same single-producer / single-consumer 1 MiB transfer. Both runs are extremely stable
@@ -55,7 +55,7 @@ single-consumer hot path. A 1.50x speedup at this chunk size meets that bar.
   64 KiB} to characterize the curve.
 - **`ServerGarbageCollection` is on** (csproj). Workstation GC may give different absolute numbers
   but should not flip the ranking.
-- **Pause/resume thresholds differ.** BCL's `PipeOptions.Default` pause/resume = 64K/32K; the
+- **Pause/resume thresholds match.** BCL's `PipeOptions.Default` pause/resume = 64K/32K; the
   SPSC adapter passes `SpscPipeOptions.Default` which uses the same 64K/32K. So the comparison
   exercises identical backpressure points.
 - **Latency benchmark is out of scope here.** Only `*ProduceAndDrain*` was filtered; the
