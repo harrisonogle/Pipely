@@ -33,6 +33,10 @@ public sealed partial class SpscPipe : IDisposable
     internal ReaderState _lastPublishedReaderState;
     internal WriterState _lastAcquiredWriterState;
     internal bool _readerCompleted;
+    // True when a ReadResult has been delivered to the user but not yet AdvanceTo'd.
+    // Set on every ReadResult-delivery site (sync return + park SetResult); cleared in AdvanceTo.
+    // Cross-thread sets (signaler, canceler) ride on _core's SetResult/await synchronization edge.
+    internal bool _readPending;
 
     // Pipe-level (mutated by Dispose only).
     internal bool _disposed;
@@ -183,6 +187,7 @@ public sealed partial class SpscPipe : IDisposable
                     ? ReadOnlySequence<byte>.Empty
                     : new ReadOnlySequence<byte>(head, headIdx, w.TailSegment!, w.TailWritten);
 
+                _readPending = true;
                 _readAwaiter._core.SetResult(new ReadResult(buffer, isCanceled: false, isCompleted: w.IsCompleted));
                 return;
             }

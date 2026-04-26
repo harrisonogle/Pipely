@@ -129,6 +129,22 @@ public class BclParityTests
         }
     }
 
+    [Theory]
+    [InlineData(PipeKind.Bcl)]
+    [InlineData(PipeKind.Spsc)]
+    public async Task ReadAsync_TwiceWithoutAdvanceTo_BothThrow(PipeKind kind)
+    {
+        var (reader, writer, disp) = CreatePipe(kind);
+        using (disp)
+        {
+            writer.GetMemory(5); writer.Advance(5);
+            await writer.FlushAsync();
+
+            await reader.ReadAsync();
+            Assert.Throws<InvalidOperationException>(() => reader.ReadAsync());
+        }
+    }
+
     // NOTE: Originally documented as "SpscCoalesces_BclThrows" — BCL Pipe historically threw
     // InvalidOperationException on a second Writer.Complete. As of .NET 10, BCL also coalesces
     // (verified empirically: a second Writer.Complete on a completed BCL Pipe is a no-op). This

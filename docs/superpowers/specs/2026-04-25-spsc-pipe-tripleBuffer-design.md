@@ -15,7 +15,6 @@
   - No `Reset` (single-use lifecycle; pipe is created → used → both sides `Complete` → `Dispose`).
   - `IDisposable` added (BCL `Pipe` doesn't implement it; required because there's no `Reset`).
   - `AdvanceTo` argument validation rejects positions past the latest known `TotalWritten`, but does **not** verify positions came from the user's most-recent `ReadResult.Buffer` specifically (BCL does). Catches silent-hang failure mode but not stale-`SequencePosition`-from-recycled-segment corruption.
-  - No `ReadAsync`-without-intervening-`AdvanceTo` guard. BCL throws `InvalidOperationException` if the user calls `ReadAsync` twice without `AdvanceTo`. SPSC contract considered sufficient; second call returns the same (or fresher) buffer.
   - `CancelPending*`-from-third-thread always returns `IsCompleted = false` even if the opposite side has just completed (one-call lag). The next non-cancel call surfaces the correct `IsCompleted` via `TryAcquire`. Only affects the parked-and-cancelled-from-third-thread path; sync-entry sticky-cancel consume sees fresh state via the throw-first `TryAcquire`.
   - `CancelPendingRead` while the reader is parked returns the buffer **as-of park time** (constructed from the awaiter stash), not the current pipe state. BCL constructs from the current committed state. Difference is observable when the writer publishes between the reader's park and the cancel; the data is not lost — it surfaces on the next `ReadAsync`. The non-parked sync-entry sticky-cancel consume *is* BCL-accurate (uses freshly-acquired writer state).
 
@@ -1344,7 +1343,7 @@ If a sticky `CancelPending*` is consumed on a post-`Writer.Complete(null)` read,
 - Under Option A (BCL-strict), every call after `Complete(ex)` throws on the opposite side. No `_exceptionAlreadySurfaced` tracking needed.
 - `Reader.Complete` publishes `HeadSegment = null, IsCompleted = true` so the writer recycles the entire chain on its next `FlushAsync`.
 - `IsCanceled` and `IsCompleted` flags are independent in `ReadResult` for `Writer.Complete(null)` cases; for `Writer.Complete(ex)` the throw fires first and cancel is dropped.
-- Six documented divergences from BCL (see top-level takeaways): no `Reset`; `IDisposable` added; `AdvanceTo` no buffer-specific upper-bound check; no `ReadAsync`-without-`AdvanceTo` guard; cancel-from-third-thread `IsCompleted=false` lag; cancel-while-parked stash-time buffer.
+- Five documented divergences from BCL (see top-level takeaways): no `Reset`; `IDisposable` added; `AdvanceTo` no buffer-specific upper-bound check; cancel-from-third-thread `IsCompleted=false` lag; cancel-while-parked stash-time buffer.
 - `Dispose()` releases segment + freelist memory; precondition is no in-flight ops AND no outstanding buffer refs.
 
 ## Section 7 — Verifiability
