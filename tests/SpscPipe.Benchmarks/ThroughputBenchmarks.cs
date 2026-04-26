@@ -1,5 +1,4 @@
 using BenchmarkDotNet.Attributes;
-using System.IO.Pipelines;
 
 namespace SpscPipe.Benchmarks;
 
@@ -12,31 +11,43 @@ public class ThroughputBenchmarks
     [Benchmark(Baseline = true)]
     public async Task BclPipe_ProduceAndDrain()
     {
-        var pipe = new Pipe();
+        using var adapter = new BclPipeAdapter();
+        await ProduceAndDrain(adapter);
+    }
+
+    [Benchmark]
+    public async Task SpscPipe_ProduceAndDrain()
+    {
+        using var adapter = new SpscPipeAdapter();
+        await ProduceAndDrain(adapter);
+    }
+
+    private static async Task ProduceAndDrain(IPipeAdapter adapter)
+    {
         var producer = Task.Run(async () =>
         {
             int written = 0;
             var chunk = new byte[ChunkSize];
             while (written < TotalBytes)
             {
-                var memory = pipe.Writer.GetMemory(chunk.Length);
+                var memory = adapter.Writer.GetMemory(chunk.Length);
                 chunk.CopyTo(memory);
-                pipe.Writer.Advance(chunk.Length);
-                await pipe.Writer.FlushAsync();
+                adapter.Writer.Advance(chunk.Length);
+                await adapter.Writer.FlushAsync();
                 written += chunk.Length;
             }
-            await pipe.Writer.CompleteAsync();
+            adapter.Writer.Complete();
         });
 
         var consumer = Task.Run(async () =>
         {
             while (true)
             {
-                var result = await pipe.Reader.ReadAsync();
-                pipe.Reader.AdvanceTo(result.Buffer.End);
+                var result = await adapter.Reader.ReadAsync();
+                adapter.Reader.AdvanceTo(result.Buffer.End);
                 if (result.IsCompleted) break;
             }
-            await pipe.Reader.CompleteAsync();
+            adapter.Reader.Complete();
         });
 
         await Task.WhenAll(producer, consumer);
