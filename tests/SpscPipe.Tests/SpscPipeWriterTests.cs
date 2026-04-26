@@ -56,4 +56,44 @@ public class SpscPipeWriterTests
         pipe.Dispose();
         Assert.Throws<ObjectDisposedException>(() => pipe.Writer.GetMemory(0));
     }
+
+    [Fact]
+    public async Task FlushAsync_NoBackpressure_ReturnsImmediatelyNotCompleted()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        pipe.Writer.GetMemory(10);
+        pipe.Writer.Advance(10);
+
+        var result = await pipe.Writer.FlushAsync();
+        Assert.False(result.IsCanceled);
+        Assert.False(result.IsCompleted);
+    }
+
+    [Fact]
+    public async Task FlushAsync_AfterReaderCompletedNull_ReturnsIsCompletedTrue()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        // Manually publish a reader-completed state via the readerTb (proxy for Reader.Complete which is Task 9).
+        pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
+        var readerSnap = new ReaderState { IsCompleted = true, CompletionException = null };
+        pipe._readerTb.ProducerSlot() = readerSnap;
+        pipe._readerTb.Publish();
+
+        var result = await pipe.Writer.FlushAsync();
+        Assert.True(result.IsCompleted);
+        Assert.False(result.IsCanceled);
+    }
+
+    [Fact]
+    public async Task FlushAsync_AfterReaderCompletedException_Throws()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
+        var ex = new InvalidOperationException("from reader");
+        pipe._readerTb.ProducerSlot() = new ReaderState { IsCompleted = true, CompletionException = ex };
+        pipe._readerTb.Publish();
+
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await pipe.Writer.FlushAsync());
+        Assert.Same(ex, thrown);
+    }
 }

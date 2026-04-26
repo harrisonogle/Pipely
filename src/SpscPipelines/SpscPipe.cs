@@ -1,4 +1,5 @@
 using System.IO.Pipelines;
+using System.Threading;
 
 namespace SpscPipelines;
 
@@ -100,5 +101,42 @@ public sealed partial class SpscPipe : IDisposable
         s.SetFreelistNext(_freelistHead);
         _freelistHead = s;
         _freelistCount++;
+    }
+
+    internal FlushResult BuildFlushResult(bool isCanceled)
+        => new(isCanceled, isCompleted: _lastAcquiredReaderState.IsCompleted);
+
+    internal void SignalReadAwaiterIfPending()
+    {
+        while (true)
+        {
+            int oldV = _readAwaiter._state;
+            if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) return;
+            int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+            if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
+            {
+                _readAwaiter._ctr.Dispose();
+                // Pattern 2 construction happens here in Task 8. For now, deliver default.
+                // This intermediate behavior won't be exposed to users until ReadAsync is wired (Task 6),
+                // and the parking path is wired (Task 8). The sync fast path doesn't reach here.
+                _readAwaiter._core.SetResult(default);
+                return;
+            }
+        }
+    }
+
+    internal void RecycleDrainedSegments()
+    {
+        var r = _lastAcquiredReaderState;
+        if (r.HeadSegment is null && !r.IsCompleted) return;       // pre-bootstrap
+
+        var readerHead = r.HeadSegment;
+
+        while (_chainHead != _writingHead && _chainHead != readerHead)
+        {
+            var recycled = _chainHead!;
+            _chainHead   = recycled.Next!;
+            PushFreelist(recycled);
+        }
     }
 }
