@@ -129,7 +129,26 @@ public sealed partial class SpscPipe
 
             _pipe.PublishReaderState();
         }
-        public override void Complete(Exception? ex = null) => throw new NotImplementedException();
+        public override void Complete(Exception? exception = null)
+        {
+            if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+            if (_pipe._readerCompleted) return;
+            _pipe._readerCompleted = true;
+
+            var snapshot = new ReaderState
+            {
+                HeadSegment         = null,           // S4: terminal publish
+                TotalConsumed       = _pipe._totalConsumed,
+                TotalExamined       = _pipe._totalExamined,
+                IsCompleted         = true,
+                CompletionException = exception,
+            };
+            _pipe._readerTb.ProducerSlot() = snapshot;
+            _pipe._readerTb.Publish();
+            _pipe._lastPublishedReaderState = snapshot;
+
+            _pipe.SignalFlushAwaiterIfPending();
+        }
         public override void CancelPendingRead() => throw new NotImplementedException();
 
         private ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)

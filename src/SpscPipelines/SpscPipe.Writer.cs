@@ -116,7 +116,27 @@ public sealed partial class SpscPipe
 
             return ParkFlushAwaiter(ct);
         }
-        public override void Complete(Exception? ex = null) => throw new NotImplementedException();
+        public override void Complete(Exception? exception = null)
+        {
+            if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+            if (_pipe._writerCompleted) return;     // double-Complete coalesces
+            _pipe._writerCompleted = true;
+
+            var snapshot = new WriterState
+            {
+                HeadSegment         = _pipe._chainHead,
+                TailSegment         = _pipe._writingHead,
+                TailWritten         = _pipe._writingHeadBytesBuffered,
+                TotalWritten        = _pipe._totalWritten,
+                IsCompleted         = true,
+                CompletionException = exception,
+            };
+            _pipe._writerTb.ProducerSlot() = snapshot;
+            _pipe._writerTb.Publish();
+            _pipe._lastPublishedWriterState = snapshot;
+
+            _pipe.SignalReadAwaiterIfPending();
+        }
         public override void CancelPendingFlush() => throw new NotImplementedException();
 
         private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
