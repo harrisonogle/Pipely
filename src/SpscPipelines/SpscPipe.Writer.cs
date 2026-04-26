@@ -55,7 +55,6 @@ public sealed partial class SpscPipe
             _pipe._totalWritten += bytes;
         }
 
-        // FlushAsync, Complete, CancelPendingFlush — implemented in later tasks.
         public override ValueTask<FlushResult> FlushAsync(CancellationToken ct = default)
         {
             if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
