@@ -90,8 +90,9 @@ public class HotHandoffContinuationDispatcherTests
         using var dispatcher = new HotHandoffContinuationDispatcher();
         const int totalDispatches = 5_000;
         int dispatchExceptions = 0;
-        var allDispatched = new CountdownEvent(totalDispatches);
 
+        // Parallel.For is synchronous — when it returns, every iteration body has
+        // completed. No CountdownEvent / Wait needed; the signal is implicit.
         Parallel.For(0, totalDispatches, _ =>
         {
             try
@@ -102,13 +103,8 @@ public class HotHandoffContinuationDispatcherTests
             {
                 Interlocked.Increment(ref dispatchExceptions);
             }
-            finally
-            {
-                allDispatched.Signal();
-            }
         });
 
-        Assert.True(allDispatched.Wait(TimeSpan.FromSeconds(30)));
         Assert.Equal(0, Volatile.Read(ref dispatchExceptions));
     }
 
@@ -150,7 +146,7 @@ public class HotHandoffContinuationDispatcherTests
     public async Task Dispatch_RacingDispose_InvokesCallbackExactlyOnce()
     {
         // Repeat to flush out the race: the Dispatcher CAS and Dispose's Or both
-        // target _state; the spec's Race 1 / Race 4 cases must close every interleaving.
+        // target _state; the spec's Race 1 / Race 2 / Race 4 cases must close every interleaving.
         const int trials = 200;
 
         for (int trial = 0; trial < trials; trial++)
@@ -232,7 +228,8 @@ public class HotHandoffContinuationDispatcherTests
             }, null);
         }
 
-        Assert.True(allDone.Wait(TimeSpan.FromSeconds(10)));
+        Assert.True(allDone.Wait(TimeSpan.FromSeconds(10)),
+            $"Not all post-Dispose callbacks ran within 10s. onTP={Volatile.Read(ref onTpThread)}, notTP={Volatile.Read(ref notOnTpThread)}");
         Assert.Equal(total, Volatile.Read(ref onTpThread));
         Assert.Equal(0,     Volatile.Read(ref notOnTpThread));
     }
