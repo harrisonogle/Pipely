@@ -26,11 +26,25 @@ var trialsOption = new Option<int>("--trials")
     DefaultValueFactory = _ => 1,
 };
 
+var warmupOption = new Option<int>("--warmup")
+{
+    Description = "Number of warmup trials run before recording (not included in stats)",
+    DefaultValueFactory = _ => 0,
+};
+
+var continuousOption = new Option<bool>("--continuous")
+{
+    Description = "Continuous-streaming mode: skip Writer.Complete() / Reader.Complete() so the consumer's final ReadAsync isn't waiting on an end-of-stream signal. Isolates steady-state tail behavior from end-of-stream artifacts.",
+    DefaultValueFactory = _ => false,
+};
+
 var latencyCommand = new Command("latency", "Run the latency benchmark")
 {
     countOption,
     sizeOption,
     trialsOption,
+    warmupOption,
+    continuousOption,
 };
 
 latencyCommand.SetAction(async parseResult =>
@@ -38,8 +52,10 @@ latencyCommand.SetAction(async parseResult =>
     int count = parseResult.GetValue(countOption);
     int size = parseResult.GetValue(sizeOption);
     int trials = parseResult.GetValue(trialsOption);
+    int warmup = parseResult.GetValue(warmupOption);
+    bool continuous = parseResult.GetValue(continuousOption);
 
-    await RunLatencyBenchmarks(count, size, trials);
+    await RunLatencyBenchmarks(count, size, trials, warmup, continuous);
 
     return 0;
 });
@@ -51,49 +67,85 @@ var rootCommand = new RootCommand("Benchmark harness")
 
 return await rootCommand.Parse(args).InvokeAsync();
 
-static async Task RunLatencyBenchmarks(int count, int size, int trials)
+static async Task RunLatencyBenchmarks(int count, int size, int trials, int warmup, bool continuous)
 {
     var samples = new LatencySamples(count);
+    string modeSuffix = continuous ? ", continuous" : "";
+
+    if (warmup > 0)
+    {
+        Console.WriteLine($"Running {warmup} warmup trial(s) of {count:N0} × {size} B{modeSuffix} (not recorded)...");
+        for (int w = 1; w <= warmup; w++)
+        {
+            using (var bcl = new BclPipeAdapter())
+                _ = await LatencyHarness.Run(bcl, samples, size, continuous);
+            using (var spsc = new SpscPipeAdapter())
+                _ = await LatencyHarness.Run(spsc, samples, size, continuous);
+        }
+        Console.WriteLine("Warmup complete.");
+    }
 
     if (trials == 1)
     {
-        Console.WriteLine($"Running BCL Pipe ({count:N0} × {size} B).");
+        Console.WriteLine($"Running BCL Pipe ({count:N0} × {size} B{modeSuffix}).");
         LatencyStats bclStats;
         using (var bcl = new BclPipeAdapter())
-            bclStats = await LatencyHarness.Run(bcl, samples, size);
+            bclStats = await LatencyHarness.Run(bcl, samples, size, continuous);
 
-        Console.WriteLine($"Running SpscPipe ({count:N0} × {size} B).");
+        Console.WriteLine($"Running SpscPipe ({count:N0} × {size} B{modeSuffix}).");
         LatencyStats spscStats;
+        AwaiterCounters spscReadCounters, spscFlushCounters;
         using (var spsc = new SpscPipeAdapter())
-            spscStats = await LatencyHarness.Run(spsc, samples, size);
+        {
+            spscStats = await LatencyHarness.Run(spsc, samples, size, continuous);
+            spscReadCounters = spsc.GetReadAwaiterCounters();
+            spscFlushCounters = spsc.GetFlushAwaiterCounters();
+        }
 
-        LatencyHarness.PrintComparison("Transfer", "BCL Pipe", bclStats.Message, "SpscPipe", spscStats.Message);
-        LatencyHarness.PrintComparison("FlushAsync", "BCL Pipe", bclStats.Flush, "SpscPipe", spscStats.Flush);
-        LatencyHarness.PrintComparison("ReadAsync", "BCL Pipe", bclStats.Read, "SpscPipe", spscStats.Read);
+        PrintTrialComparisons(bclStats, spscStats, spscReadCounters, spscFlushCounters);
     }
     else
     {
-        Console.WriteLine($"Running {trials} trials of {count:N0} × {size} B per trial (BCL then SpscPipe each trial).");
+        Console.WriteLine($"Running {trials} trials of {count:N0} × {size} B per trial{modeSuffix} (BCL then SpscPipe each trial).");
 
         for (int t = 1; t <= trials; t++)
         {
             LatencyStats bclStats;
             using (var bcl = new BclPipeAdapter())
-                bclStats = await LatencyHarness.Run(bcl, samples, size);
+                bclStats = await LatencyHarness.Run(bcl, samples, size, continuous);
 
             LatencyStats spscStats;
+            AwaiterCounters spscReadCounters, spscFlushCounters;
             using (var spsc = new SpscPipeAdapter())
-                spscStats = await LatencyHarness.Run(spsc, samples, size);
+            {
+                spscStats = await LatencyHarness.Run(spsc, samples, size, continuous);
+                spscReadCounters = spsc.GetReadAwaiterCounters();
+                spscFlushCounters = spsc.GetFlushAwaiterCounters();
+            }
 
             Console.WriteLine();
             Console.WriteLine($"=== Trial {t}/{trials} ===");
-            LatencyHarness.PrintComparison(nameof(bclStats.Message), "BCL Pipe", bclStats.Message, "SpscPipe", spscStats.Message);
-            LatencyHarness.PrintComparison(nameof(bclStats.Flush), "BCL Pipe", bclStats.Flush, "SpscPipe", spscStats.Flush);
-            LatencyHarness.PrintComparison(nameof(bclStats.SyncFlush), "BCL Pipe", bclStats.SyncFlush, "SpscPipe", spscStats.SyncFlush);
-            LatencyHarness.PrintComparison(nameof(bclStats.AsyncFlush), "BCL Pipe", bclStats.AsyncFlush, "SpscPipe", spscStats.AsyncFlush);
-            LatencyHarness.PrintComparison(nameof(bclStats.Read), "BCL Pipe", bclStats.Read, "SpscPipe", spscStats.Read);
-            LatencyHarness.PrintComparison(nameof(bclStats.SyncRead), "BCL Pipe", bclStats.SyncRead, "SpscPipe", spscStats.SyncRead);
-            LatencyHarness.PrintComparison(nameof(bclStats.AsyncRead), "BCL Pipe", bclStats.AsyncRead, "SpscPipe", spscStats.AsyncRead);
+            PrintTrialComparisons(bclStats, spscStats, spscReadCounters, spscFlushCounters);
         }
     }
+}
+
+static void PrintTrialComparisons(LatencyStats bclStats, LatencyStats spscStats, AwaiterCounters spscRead, AwaiterCounters spscFlush)
+{
+    LatencyHarness.PrintComparison(nameof(bclStats.Message), "BCL Pipe", bclStats.Message, "SpscPipe", spscStats.Message);
+    LatencyHarness.PrintComparison(nameof(bclStats.Flush), "BCL Pipe", bclStats.Flush, "SpscPipe", spscStats.Flush);
+    LatencyHarness.PrintComparison(nameof(bclStats.SyncFlush), "BCL Pipe", bclStats.SyncFlush, "SpscPipe", spscStats.SyncFlush);
+    LatencyHarness.PrintComparison(nameof(bclStats.AsyncFlush), "BCL Pipe", bclStats.AsyncFlush, "SpscPipe", spscStats.AsyncFlush);
+    LatencyHarness.PrintComparison(nameof(bclStats.Read), "BCL Pipe", bclStats.Read, "SpscPipe", spscStats.Read);
+    LatencyHarness.PrintComparison(nameof(bclStats.SyncRead), "BCL Pipe", bclStats.SyncRead, "SpscPipe", spscStats.SyncRead);
+    LatencyHarness.PrintComparison(nameof(bclStats.AsyncRead), "BCL Pipe", bclStats.AsyncRead, "SpscPipe", spscStats.AsyncRead);
+    LatencyHarness.PrintComparisonValue(nameof(bclStats.MsgsPerRead), "BCL Pipe", bclStats.MsgsPerRead, "SpscPipe", spscStats.MsgsPerRead);
+
+    // TP work-item correlation (works for both pipes; ground-truth-via-counter for "did this call queue TP work?").
+    LatencyHarness.PrintTpCorrelation("FlushTp",   "BCL Pipe", bclStats.FlushTp, "SpscPipe", spscStats.FlushTp);
+    LatencyHarness.PrintTpCorrelation("ReadTp",    "BCL Pipe", bclStats.ReadTp,  "SpscPipe", spscStats.ReadTp);
+
+    // SPSC-only awaiter diagnostics (precise park/signal/cancel counts from instrumented Interlocked counters).
+    LatencyHarness.PrintAwaiterCounters("SpscPipe._readAwaiter",  spscRead);
+    LatencyHarness.PrintAwaiterCounters("SpscPipe._flushAwaiter", spscFlush);
 }

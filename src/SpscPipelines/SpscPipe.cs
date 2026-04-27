@@ -168,6 +168,7 @@ public sealed partial class SpscPipe : IDisposable
             int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
             if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
             {
+                Interlocked.Increment(ref _readAwaiter._signalWonCount);
                 _readAwaiter._ctr.Dispose();
 
                 // Pattern 2: construct ReadResult from stash + just-published WriterState.
@@ -203,6 +204,7 @@ public sealed partial class SpscPipe : IDisposable
             int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
             if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
             {
+                Interlocked.Increment(ref _readAwaiter._tokenCancelWonCount);
                 _readAwaiter._core.SetException(new OperationCanceledException(_readAwaiter._token));
                 return;
             }
@@ -218,6 +220,7 @@ public sealed partial class SpscPipe : IDisposable
             int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
             if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
             {
+                Interlocked.Increment(ref _flushAwaiter._tokenCancelWonCount);
                 _flushAwaiter._core.SetException(new OperationCanceledException(_flushAwaiter._token));
                 return;
             }
@@ -271,6 +274,7 @@ public sealed partial class SpscPipe : IDisposable
             int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
             if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
             {
+                Interlocked.Increment(ref _flushAwaiter._signalWonCount);
                 _flushAwaiter._ctr.Dispose();
                 DeliverFlushResult();
                 return;
@@ -288,6 +292,7 @@ public sealed partial class SpscPipe : IDisposable
             int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
             if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
             {
+                Interlocked.Increment(ref _flushAwaiter._signalWonCount);
                 _flushAwaiter._ctr.Dispose();
                 DeliverFlushResult();
                 return;

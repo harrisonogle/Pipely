@@ -180,6 +180,7 @@ public sealed partial class SpscPipe
                     ? ReadOnlySequence<byte>.Empty
                     : new ReadOnlySequence<byte>(head, _pipe._readAwaiter._stashHeadIdx, tail!, _pipe._readAwaiter._stashTailIdx);
 
+                Interlocked.Increment(ref _pipe._readAwaiter._cancelPendingWonCount);
                 _pipe._readPending = true;
                 _pipe._readAwaiter._core.SetResult(new ReadResult(buffer, isCanceled: true, isCompleted: false));
             }
@@ -201,7 +202,11 @@ public sealed partial class SpscPipe
                 int oldV = _pipe._readAwaiter._state;
                 System.Diagnostics.Debug.Assert((oldV & SpscAwaiter<ReadResult>.StateMask) == SpscAwaiter<ReadResult>.Inactive);
                 int desired = (oldV & SpscAwaiter<ReadResult>.CancelFlag) | SpscAwaiter<ReadResult>.Pending;
-                if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV) break;
+                if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
+                {
+                    Interlocked.Increment(ref _pipe._readAwaiter._parkCount);
+                    break;
+                }
             }
 
             // Lost-wakeup re-check (throw-first).
@@ -219,6 +224,7 @@ public sealed partial class SpscPipe
                         int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
                         if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
                         {
+                            Interlocked.Increment(ref _pipe._readAwaiter._lostWakeupResolvedCount);
                             _pipe._readAwaiter._core.SetException(_pipe._lastAcquiredWriterState.CompletionException);
                             return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
                         }
@@ -234,6 +240,7 @@ public sealed partial class SpscPipe
                         int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
                         if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
                         {
+                            Interlocked.Increment(ref _pipe._readAwaiter._lostWakeupResolvedCount);
                             _pipe._readPending = true;
                             return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: false));
                         }
@@ -250,6 +257,7 @@ public sealed partial class SpscPipe
                        SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag)
                    == (SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag))
             {
+                Interlocked.Increment(ref _pipe._readAwaiter._lostCancelResolvedCount);
                 _pipe._readPending = true;
                 _pipe._readAwaiter._core.SetResult(_pipe.BuildReadResult(isCanceled: true));
                 return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);

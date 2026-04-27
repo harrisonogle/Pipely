@@ -147,6 +147,7 @@ public sealed partial class SpscPipe
                        SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
                    == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
             {
+                Interlocked.Increment(ref _pipe._flushAwaiter._cancelPendingWonCount);
                 _pipe._flushAwaiter._ctr.Dispose();
                 _pipe._flushAwaiter._core.SetResult(new FlushResult(isCanceled: true, isCompleted: false));
             }
@@ -164,7 +165,11 @@ public sealed partial class SpscPipe
                 System.Diagnostics.Debug.Assert((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Inactive,
                              "SPSC violation: concurrent FlushAsync");
                 int desired = (oldV & SpscAwaiter<FlushResult>.CancelFlag) | SpscAwaiter<FlushResult>.Pending;
-                if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV) break;
+                if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
+                {
+                    Interlocked.Increment(ref _pipe._flushAwaiter._parkCount);
+                    break;
+                }
             }
 
             // Lost-wakeup re-check (throw-first).
@@ -181,6 +186,7 @@ public sealed partial class SpscPipe
                         int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
                         if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                         {
+                            Interlocked.Increment(ref _pipe._flushAwaiter._lostWakeupResolvedCount);
                             _pipe._flushAwaiter._core.SetException(_pipe._lastAcquiredReaderState.CompletionException);
                             return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
                         }
@@ -199,7 +205,10 @@ public sealed partial class SpscPipe
                         if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
                         int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
                         if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
+                        {
+                            Interlocked.Increment(ref _pipe._flushAwaiter._lostWakeupResolvedCount);
                             return new ValueTask<FlushResult>(_pipe.BuildFlushResult(isCanceled: false));
+                        }
                     }
                 }
             }
@@ -213,6 +222,7 @@ public sealed partial class SpscPipe
                        SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
                    == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
             {
+                Interlocked.Increment(ref _pipe._flushAwaiter._lostCancelResolvedCount);
                 _pipe._flushAwaiter._core.SetResult(_pipe.BuildFlushResult(isCanceled: true));
                 return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
             }
