@@ -352,4 +352,42 @@ public class HotHandoffContinuationDispatcherTests
         Assert.Equal(42, consumerLocal.Value);
         Assert.Equal(0,  dispatcherLocal.Value);
     }
+
+    [Fact]
+    public async Task SpscPipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch()
+    {
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        const int totalCycles  = 1000;
+        const int messageBytes = 8;
+
+        var producer = Task.Run(async () =>
+        {
+            for (int i = 0; i < totalCycles; i++)
+            {
+                var mem = pipe.Writer.GetMemory(messageBytes);
+                mem.Span.Clear();
+                pipe.Writer.Advance(messageBytes);
+                await pipe.Writer.FlushAsync();
+            }
+            pipe.Writer.Complete();
+        });
+
+        var consumer = Task.Run(async () =>
+        {
+            long bytesRead = 0;
+            long target    = (long)totalCycles * messageBytes;
+            while (bytesRead < target)
+            {
+                var rr = await pipe.Reader.ReadAsync();
+                bytesRead += rr.Buffer.Length;
+                pipe.Reader.AdvanceTo(rr.Buffer.End);
+                if (rr.IsCompleted) break;
+            }
+            pipe.Reader.Complete();
+        });
+
+        await Task.WhenAll(producer, consumer).WaitAsync(TimeSpan.FromSeconds(30));
+    }
 }
