@@ -282,4 +282,33 @@ public class HotHandoffContinuationDispatcherTests
         Assert.Equal(5, rr.Buffer.Length);
         pipe.Reader.AdvanceTo(rr.Buffer.End);
     }
+
+    [Fact]
+    public async Task SpscPipe_WithHotHandoff_AsyncLocalFlowsToContinuation()
+    {
+        var asyncLocal = new AsyncLocal<int>();
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        asyncLocal.Value = 42;
+
+        // Producer fires after a short delay so the consumer parks first.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            var mem = pipe.Writer.GetMemory(5);
+            mem.Span.Clear();
+            pipe.Writer.Advance(5);
+            await pipe.Writer.FlushAsync();
+        });
+
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+        // Continuation runs on the dispatcher's worker thread; the captured EC
+        // (consumer's, with asyncLocal.Value = 42) is restored by MRVTSC's
+        // RunInternal regardless of dispatcher choice.
+        Assert.Equal(5, rr.Buffer.Length);
+        Assert.Equal(42, asyncLocal.Value);
+    }
 }
