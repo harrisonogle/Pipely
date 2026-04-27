@@ -177,4 +177,36 @@ public class HotHandoffContinuationDispatcherTests
             Assert.Equal(1, Volatile.Read(ref invocationCount));
         }
     }
+
+    [Fact]
+    public void Dispose_BlocksUntilInFlightCallbackCompletes()
+    {
+        var dispatcher = new HotHandoffContinuationDispatcher();
+        using var callbackStarted = new ManualResetEventSlim(false);
+        using var callbackRelease = new ManualResetEventSlim(false);
+        int callbackCompleted = 0;
+
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            callbackStarted.Set();
+            callbackRelease.Wait(TimeSpan.FromSeconds(5));
+            Interlocked.Increment(ref callbackCompleted);
+        }, null);
+
+        Assert.True(callbackStarted.Wait(TimeSpan.FromSeconds(5)),
+            "Callback never started.");
+
+        var disposeTask = Task.Run(() => dispatcher.Dispose());
+
+        // Briefly verify Dispose has not yet returned — the callback is still gated.
+        Assert.False(disposeTask.Wait(TimeSpan.FromMilliseconds(200)),
+            "Dispose returned before the in-flight callback finished.");
+        Assert.Equal(0, Volatile.Read(ref callbackCompleted));
+
+        callbackRelease.Set();
+
+        Assert.True(disposeTask.Wait(TimeSpan.FromSeconds(5)),
+            "Dispose did not return after callback was released.");
+        Assert.Equal(1, Volatile.Read(ref callbackCompleted));
+    }
 }
