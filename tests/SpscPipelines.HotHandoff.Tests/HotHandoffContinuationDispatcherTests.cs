@@ -26,4 +26,38 @@ public class HotHandoffContinuationDispatcherTests
         Assert.NotEqual(Environment.CurrentManagedThreadId, observedThreadId);
         Assert.Equal("SpscPipe HotHandoff", observedThreadName);
     }
+
+    [Fact]
+    public void Dispatch_OverflowFallsBackToThreadPool()
+    {
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var firstStarted = new ManualResetEventSlim(false);
+        using var firstRelease = new ManualResetEventSlim(false);
+        using var secondDone   = new ManualResetEventSlim(false);
+        bool secondOnTpThread = false;
+
+        // First dispatch: claim the slot and hold it until released.
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            firstStarted.Set();
+            firstRelease.Wait(TimeSpan.FromSeconds(5));
+        }, null);
+
+        Assert.True(firstStarted.Wait(TimeSpan.FromSeconds(5)),
+            "First callback never started — slot was never claimed.");
+
+        // Second dispatch: slot is occupied; should overflow to TP.
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            secondOnTpThread = Thread.CurrentThread.IsThreadPoolThread;
+            secondDone.Set();
+        }, null);
+
+        Assert.True(secondDone.Wait(TimeSpan.FromSeconds(5)),
+            "Second (overflow) callback was not invoked.");
+        Assert.True(secondOnTpThread,
+            "Overflow callback should have run on a ThreadPool thread.");
+
+        firstRelease.Set();
+    }
 }
