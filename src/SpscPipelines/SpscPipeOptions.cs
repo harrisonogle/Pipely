@@ -10,6 +10,15 @@ public sealed class SpscPipeOptions
     public long ResumeWriterThreshold { get; }
     public int  MaxFreelistSegments   { get; }
 
+    /// <summary>
+    /// Routes parked-awaiter continuations to a thread of the dispatcher's choosing.
+    /// When null (the default), <see cref="ThreadPoolContinuationDispatcher.Instance"/> is used,
+    /// which forwards to <see cref="System.Threading.ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/>
+    /// — observably identical to the prior <c>RunContinuationsAsynchronously = true</c> behavior.
+    /// Init-only: chosen once at pipe construction. See <see cref="IContinuationDispatcher"/> for the contract.
+    /// </summary>
+    public IContinuationDispatcher? ContinuationDispatcher { get; init; }
+
     public SpscPipeOptions(
         MemoryPool<byte>? pool = null,
         int  minimumSegmentSize    = 4096,

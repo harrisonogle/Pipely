@@ -149,7 +149,8 @@ public sealed partial class SpscPipe
             {
                 Interlocked.Increment(ref _pipe._flushAwaiter._cancelPendingWonCount);
                 _pipe._flushAwaiter._ctr.Dispose();
-                _pipe._flushAwaiter._core.SetResult(new FlushResult(isCanceled: true, isCompleted: false));
+                _pipe._flushAwaiter._dispatchResult = new FlushResult(isCanceled: true, isCompleted: false);
+                _pipe.DispatchVia(s_dispatchFlushSetResult, _pipe._flushAwaiter);
             }
         }
 
@@ -187,7 +188,8 @@ public sealed partial class SpscPipe
                         if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                         {
                             Interlocked.Increment(ref _pipe._flushAwaiter._lostWakeupResolvedCount);
-                            _pipe._flushAwaiter._core.SetException(_pipe._lastAcquiredReaderState.CompletionException);
+                            _pipe._flushAwaiter._dispatchException = _pipe._lastAcquiredReaderState.CompletionException;
+                            _pipe.DispatchVia(s_dispatchFlushSetException, _pipe._flushAwaiter);
                             return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
                         }
                     }
@@ -223,7 +225,8 @@ public sealed partial class SpscPipe
                    == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
             {
                 Interlocked.Increment(ref _pipe._flushAwaiter._lostCancelResolvedCount);
-                _pipe._flushAwaiter._core.SetResult(_pipe.BuildFlushResult(isCanceled: true));
+                _pipe._flushAwaiter._dispatchResult = _pipe.BuildFlushResult(isCanceled: true);
+                _pipe.DispatchVia(s_dispatchFlushSetResult, _pipe._flushAwaiter);
                 return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
             }
 
