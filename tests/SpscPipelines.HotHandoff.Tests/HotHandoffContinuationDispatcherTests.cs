@@ -147,7 +147,7 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
-    public void Dispatch_RacingDispose_InvokesCallbackExactlyOnce()
+    public async Task Dispatch_RacingDispose_InvokesCallbackExactlyOnce()
     {
         // Repeat to flush out the race: the Dispatcher CAS and Dispose's Or both
         // target _state; the spec's Race 1 / Race 4 cases must close every interleaving.
@@ -170,7 +170,7 @@ public class HotHandoffContinuationDispatcherTests
             });
             var disposeTask = Task.Run(() => dispatcher.Dispose());
 
-            Task.WaitAll(new[] { dispatchTask, disposeTask }, TimeSpan.FromSeconds(5));
+            await Task.WhenAll(dispatchTask, disposeTask).WaitAsync(TimeSpan.FromSeconds(5));
 
             Assert.True(done.Wait(TimeSpan.FromSeconds(5)),
                 $"Trial {trial}: callback never ran.");
@@ -179,7 +179,7 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
-    public void Dispose_BlocksUntilInFlightCallbackCompletes()
+    public async Task Dispose_BlocksUntilInFlightCallbackCompletes()
     {
         var dispatcher = new HotHandoffContinuationDispatcher();
         using var callbackStarted = new ManualResetEventSlim(false);
@@ -199,14 +199,13 @@ public class HotHandoffContinuationDispatcherTests
         var disposeTask = Task.Run(() => dispatcher.Dispose());
 
         // Briefly verify Dispose has not yet returned — the callback is still gated.
-        Assert.False(disposeTask.Wait(TimeSpan.FromMilliseconds(200)),
-            "Dispose returned before the in-flight callback finished.");
+        var winner = await Task.WhenAny(disposeTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
+        Assert.NotSame(disposeTask, winner);
         Assert.Equal(0, Volatile.Read(ref callbackCompleted));
 
         callbackRelease.Set();
 
-        Assert.True(disposeTask.Wait(TimeSpan.FromSeconds(5)),
-            "Dispose did not return after callback was released.");
+        await disposeTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(1, Volatile.Read(ref callbackCompleted));
     }
 
