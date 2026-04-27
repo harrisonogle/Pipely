@@ -83,4 +83,32 @@ public class HotHandoffContinuationDispatcherTests
             $"Not all callbacks ran. Got {invocationCount} of {totalDispatches}.");
         Assert.Equal(totalDispatches, Volatile.Read(ref invocationCount));
     }
+
+    [Fact]
+    public void Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem()
+    {
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+        const int totalDispatches = 5_000;
+        int dispatchExceptions = 0;
+        var allDispatched = new CountdownEvent(totalDispatches);
+
+        Parallel.For(0, totalDispatches, _ =>
+        {
+            try
+            {
+                dispatcher.UnsafeQueueUserWorkItem(static _ => { }, null);
+            }
+            catch
+            {
+                Interlocked.Increment(ref dispatchExceptions);
+            }
+            finally
+            {
+                allDispatched.Signal();
+            }
+        });
+
+        Assert.True(allDispatched.Wait(TimeSpan.FromSeconds(30)));
+        Assert.Equal(0, Volatile.Read(ref dispatchExceptions));
+    }
 }
