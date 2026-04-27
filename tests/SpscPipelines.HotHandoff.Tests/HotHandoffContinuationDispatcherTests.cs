@@ -4,7 +4,7 @@ namespace SpscPipelines.HotHandoff.Tests;
 
 public class HotHandoffContinuationDispatcherTests
 {
-    // Tests added in subsequent tasks.
+    // ---------- Layer A: dispatcher in isolation (no SpscPipe) ----------
 
     [Fact]
     public void Dispatch_InvokesCallbackOnDedicatedThread()
@@ -260,6 +260,8 @@ public class HotHandoffContinuationDispatcherTests
         // (one dispatcher, multiple producer threads).
         await Task.WhenAll(Roundtrip(pipeA, 7), Roundtrip(pipeB, 11));
     }
+
+    // ---------- Layer B: dispatcher integrated with SpscPipe ----------
 
     [Fact]
     public async Task SpscPipe_WithHotHandoff_BasicReadFlush_RoundTrip()
