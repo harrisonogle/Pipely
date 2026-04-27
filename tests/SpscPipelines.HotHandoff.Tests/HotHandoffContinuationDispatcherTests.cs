@@ -111,4 +111,38 @@ public class HotHandoffContinuationDispatcherTests
         Assert.True(allDispatched.Wait(TimeSpan.FromSeconds(30)));
         Assert.Equal(0, Volatile.Read(ref dispatchExceptions));
     }
+
+    [Fact]
+    public void ThrowingCallback_DoesNotKillDispatcherThread()
+    {
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var firstDone  = new ManualResetEventSlim(false);
+        using var secondDone = new ManualResetEventSlim(false);
+        string? secondThreadName = null;
+
+        // First slot-path dispatch throws.
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            firstDone.Set();
+            throw new InvalidOperationException("intentional");
+        }, null);
+
+        Assert.True(firstDone.Wait(TimeSpan.FromSeconds(5)),
+            "First (throwing) callback never ran.");
+
+        // Give the dispatcher thread a moment to finish processing the throw + re-loop.
+        Thread.Sleep(50);
+
+        // Second slot-path dispatch must run on the same dedicated thread —
+        // the worker survived the throw.
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            secondThreadName = Thread.CurrentThread.Name;
+            secondDone.Set();
+        }, null);
+
+        Assert.True(secondDone.Wait(TimeSpan.FromSeconds(5)),
+            "Second callback after throwing first never ran — dispatcher thread may have died.");
+        Assert.Equal("SpscPipe HotHandoff", secondThreadName);
+    }
 }
