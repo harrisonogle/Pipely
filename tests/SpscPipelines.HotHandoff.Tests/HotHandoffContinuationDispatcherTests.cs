@@ -237,4 +237,31 @@ public class HotHandoffContinuationDispatcherTests
         Assert.Equal(total, Volatile.Read(ref onTpThread));
         Assert.Equal(0,     Volatile.Read(ref notOnTpThread));
     }
+
+    [Fact]
+    public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
+    {
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var pipeA = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipeB = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        static async Task Roundtrip(SpscPipelines.SpscPipe pipe, int payloadBytes)
+        {
+            var readTask = pipe.Reader.ReadAsync().AsTask();
+            await Task.Run(async () =>
+            {
+                var mem = pipe.Writer.GetMemory(payloadBytes);
+                mem.Span.Clear();
+                pipe.Writer.Advance(payloadBytes);
+                await pipe.Writer.FlushAsync();
+            });
+            var rr = await readTask.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(payloadBytes, rr.Buffer.Length);
+            pipe.Reader.AdvanceTo(rr.Buffer.End);
+        }
+
+        // Run both round-trips concurrently — exercises contract item #3
+        // (one dispatcher, multiple producer threads).
+        await Task.WhenAll(Roundtrip(pipeA, 7), Roundtrip(pipeB, 11));
+    }
 }
