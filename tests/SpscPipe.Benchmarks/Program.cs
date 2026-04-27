@@ -38,6 +38,12 @@ var continuousOption = new Option<bool>("--continuous")
     DefaultValueFactory = _ => false,
 };
 
+var waitForAttachOption = new Option<bool>("--wait-for-attach")
+{
+    Description = "Print PID then wait for Enter before running. Use to attach dotnet-trace before the benchmark starts (so the trace captures the actual run, not just the warmup/setup).",
+    DefaultValueFactory = _ => false,
+};
+
 var latencyCommand = new Command("latency", "Run the latency benchmark")
 {
     countOption,
@@ -45,6 +51,7 @@ var latencyCommand = new Command("latency", "Run the latency benchmark")
     trialsOption,
     warmupOption,
     continuousOption,
+    waitForAttachOption,
 };
 
 latencyCommand.SetAction(async parseResult =>
@@ -54,6 +61,14 @@ latencyCommand.SetAction(async parseResult =>
     int trials = parseResult.GetValue(trialsOption);
     int warmup = parseResult.GetValue(warmupOption);
     bool continuous = parseResult.GetValue(continuousOption);
+    bool waitForAttach = parseResult.GetValue(waitForAttachOption);
+
+    if (waitForAttach)
+    {
+        Console.WriteLine($"PID: {Environment.ProcessId}");
+        Console.WriteLine("Attach dotnet-trace now, then press Enter to begin benchmark...");
+        Console.ReadLine();
+    }
 
     await RunLatencyBenchmarks(count, size, trials, warmup, continuous);
 
@@ -140,6 +155,11 @@ static void PrintTrialComparisons(LatencyStats bclStats, LatencyStats spscStats,
     LatencyHarness.PrintComparison(nameof(bclStats.SyncRead), "BCL Pipe", bclStats.SyncRead, "SpscPipe", spscStats.SyncRead);
     LatencyHarness.PrintComparison(nameof(bclStats.AsyncRead), "BCL Pipe", bclStats.AsyncRead, "SpscPipe", spscStats.AsyncRead);
     LatencyHarness.PrintComparisonValue(nameof(bclStats.MsgsPerRead), "BCL Pipe", bclStats.MsgsPerRead, "SpscPipe", spscStats.MsgsPerRead);
+
+    // Wake-gap: time from continuation registered (OnCompleted) to continuation actually
+    // running. The runtime's TP scheduling cost in isolation, per-await.
+    LatencyHarness.PrintComparison(nameof(bclStats.WakeGapFlush), "BCL Pipe", bclStats.WakeGapFlush, "SpscPipe", spscStats.WakeGapFlush);
+    LatencyHarness.PrintComparison(nameof(bclStats.WakeGapRead),  "BCL Pipe", bclStats.WakeGapRead,  "SpscPipe", spscStats.WakeGapRead);
 
     // TP work-item correlation (works for both pipes; ground-truth-via-counter for "did this call queue TP work?").
     LatencyHarness.PrintTpCorrelation("FlushTp",   "BCL Pipe", bclStats.FlushTp, "SpscPipe", spscStats.FlushTp);

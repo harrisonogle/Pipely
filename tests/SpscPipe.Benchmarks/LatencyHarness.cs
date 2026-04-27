@@ -30,6 +30,8 @@ internal sealed record LatencyStats(
     SampleStats SyncRead,
     SampleStats AsyncRead,
     SampleStats MsgsPerRead,
+    SampleStats WakeGapFlush,
+    SampleStats WakeGapRead,
     TpCorrelation FlushTp,
     TpCorrelation ReadTp
 );
@@ -60,6 +62,8 @@ internal sealed class LatencySamples
         SyncRead = Initialize(count);
         AsyncRead = Initialize(count);
         MsgsPerRead = Initialize(count);
+        WakeGapFlush = Initialize(count);
+        WakeGapRead = Initialize(count);
     }
 
     public readonly int Count;
@@ -71,6 +75,8 @@ internal sealed class LatencySamples
     public readonly long[] SyncRead;
     public readonly long[] AsyncRead;
     public readonly long[] MsgsPerRead;
+    public readonly long[] WakeGapFlush;
+    public readonly long[] WakeGapRead;
 
     private static long[] Initialize(int count)
     {
@@ -124,6 +130,11 @@ internal static class LatencyHarness
         long syncReadWithTp = 0, syncReadWithoutTp = 0;
         long asyncReadWithTp = 0, asyncReadWithoutTp = 0;
 
+        int wakeGapFlushIdx = 0;
+        int wakeGapReadIdx = 0;
+        Action<long> recordFlushWakeGap = gap => samples.WakeGapFlush[wakeGapFlushIdx++] = gap;
+        Action<long> recordReadWakeGap  = gap => samples.WakeGapRead[wakeGapReadIdx++]   = gap;
+
         var producer = Task.Run(async () =>
         {
             for (int i = 0; i < messages; i++)
@@ -147,7 +158,7 @@ internal static class LatencyHarness
                 }
                 else
                 {
-                    fr = await flushTask;
+                    fr = await new TracedValueTaskAwaitable<FlushResult>(flushTask, recordFlushWakeGap);
                     flushTicks = Stopwatch.GetTimestamp();
                     long afterWi = ThreadPool.CompletedWorkItemCount;
                     samples.AsyncFlush[asyncFlushIdx++] = flushTicks - tFlushStart;
@@ -180,7 +191,7 @@ internal static class LatencyHarness
                 }
                 else
                 {
-                    rr = await readTask;
+                    rr = await new TracedValueTaskAwaitable<ReadResult>(readTask, recordReadWakeGap);
                     readTicks = Stopwatch.GetTimestamp();
                     long afterWi = ThreadPool.CompletedWorkItemCount;
                     samples.AsyncRead[asyncReadIdx++] = readTicks - t0;
@@ -218,6 +229,8 @@ internal static class LatencyHarness
         var syncReadSamples = samples.SyncRead.AsSpan(0, syncReadIdx);
         var asyncReadSamples = samples.AsyncRead.AsSpan(0, asyncReadIdx);
         var msgsPerReadSamples = samples.MsgsPerRead.AsSpan(0, readIdx);
+        var wakeGapFlushSamples = samples.WakeGapFlush.AsSpan(0, wakeGapFlushIdx);
+        var wakeGapReadSamples  = samples.WakeGapRead.AsSpan(0, wakeGapReadIdx);
 
         var result = new LatencyStats(
             Messages: messages,
@@ -230,6 +243,8 @@ internal static class LatencyHarness
             SyncRead: ComputeStatistics(syncReadSamples),
             AsyncRead: ComputeStatistics(asyncReadSamples),
             MsgsPerRead: ComputeStatistics(msgsPerReadSamples),
+            WakeGapFlush: ComputeStatistics(wakeGapFlushSamples),
+            WakeGapRead: ComputeStatistics(wakeGapReadSamples),
             FlushTp: new TpCorrelation(syncFlushWithTp, syncFlushWithoutTp, asyncFlushWithTp, asyncFlushWithoutTp),
             ReadTp: new TpCorrelation(syncReadWithTp, syncReadWithoutTp, asyncReadWithTp, asyncReadWithoutTp)
         );
@@ -242,6 +257,8 @@ internal static class LatencyHarness
         syncReadSamples.Clear();
         asyncReadSamples.Clear();
         msgsPerReadSamples.Clear();
+        wakeGapFlushSamples.Clear();
+        wakeGapReadSamples.Clear();
 
         return result;
 
