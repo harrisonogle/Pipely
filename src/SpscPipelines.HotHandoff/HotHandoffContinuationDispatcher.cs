@@ -26,6 +26,7 @@ namespace SpscPipelines.HotHandoff;
 /// </summary>
 public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, IDisposable
 {
+    private const int Vacant            = 0;
     private const int Busy              = 1;
     private const int ShutdownRequested = 2;
 
@@ -49,8 +50,8 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
 
     public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
     {
-        // Conditional claim: succeeds only when state == 0 (Vacant, no shutdown).
-        if (Interlocked.CompareExchange(ref _state, Busy, 0) == 0)
+        // Conditional claim: succeeds only when state == Vacant (no Busy, no ShutdownRequested).
+        if (Interlocked.CompareExchange(ref _state, Busy, Vacant) == Vacant)
         {
             _pendingState = state;                            // plain
             Interlocked.Exchange(ref _pending, callback);     // full fence: publishes both fields
@@ -80,8 +81,11 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
             }
             else
             {
-                // Fenced read of state. State 2 (Vacant + ShutdownRequested) is terminal.
-                var s = Interlocked.CompareExchange(ref _state, 0, 0);
+                // Fenced read of state via CAS-with-self: comparand == new-value, so the
+                // write is a no-op when state == Vacant and never executes otherwise; the
+                // return value is the read with full memory ordering. State == ShutdownRequested
+                // (== 2: Vacant + ShutdownRequested bit) is terminal.
+                var s = Interlocked.CompareExchange(ref _state, Vacant, Vacant);
                 if (s == ShutdownRequested) return;
                 Thread.SpinWait(SpinIterations);
             }
