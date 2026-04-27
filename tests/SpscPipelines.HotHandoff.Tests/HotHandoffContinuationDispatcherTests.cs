@@ -145,4 +145,36 @@ public class HotHandoffContinuationDispatcherTests
             "Second callback after throwing first never ran — dispatcher thread may have died.");
         Assert.Equal("SpscPipe HotHandoff", secondThreadName);
     }
+
+    [Fact]
+    public void Dispatch_RacingDispose_InvokesCallbackExactlyOnce()
+    {
+        // Repeat to flush out the race: the Dispatcher CAS and Dispose's Or both
+        // target _state; the spec's Race 1 / Race 4 cases must close every interleaving.
+        const int trials = 200;
+
+        for (int trial = 0; trial < trials; trial++)
+        {
+            var dispatcher = new HotHandoffContinuationDispatcher();
+            int invocationCount = 0;
+            using var done = new ManualResetEventSlim(false);
+
+            // Two threads racing: one Dispatches, the other Disposes.
+            var dispatchTask = Task.Run(() =>
+            {
+                dispatcher.UnsafeQueueUserWorkItem(_ =>
+                {
+                    Interlocked.Increment(ref invocationCount);
+                    done.Set();
+                }, null);
+            });
+            var disposeTask = Task.Run(() => dispatcher.Dispose());
+
+            Task.WaitAll(new[] { dispatchTask, disposeTask }, TimeSpan.FromSeconds(5));
+
+            Assert.True(done.Wait(TimeSpan.FromSeconds(5)),
+                $"Trial {trial}: callback never ran.");
+            Assert.Equal(1, Volatile.Read(ref invocationCount));
+        }
+    }
 }
