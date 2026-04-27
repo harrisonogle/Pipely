@@ -82,9 +82,9 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
             else
             {
                 // Fenced read of state via CAS-with-self: comparand == new-value, so the
-                // write is a no-op when state == Vacant and never executes otherwise; the
-                // return value is the read with full memory ordering. State == ShutdownRequested
-                // (== 2: Vacant + ShutdownRequested bit) is terminal.
+                // store is a no-op (writes the same value when state == Vacant; doesn't write
+                // otherwise). The return value is the read with full memory ordering.
+                // State == ShutdownRequested (== 2: Vacant + ShutdownRequested bit) is terminal.
                 var s = Interlocked.CompareExchange(ref _state, Vacant, Vacant);
                 if (s == ShutdownRequested) return;
                 Thread.SpinWait(SpinIterations);
