@@ -60,4 +60,27 @@ public class HotHandoffContinuationDispatcherTests
 
         firstRelease.Set();
     }
+
+    [Fact]
+    public void Dispatch_InvokesEachCallbackExactlyOnce()
+    {
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+        const int totalDispatches = 10_000;
+        int invocationCount = 0;
+        var allDone = new CountdownEvent(totalDispatches);
+
+        Action<object?> cb = _ =>
+        {
+            Interlocked.Increment(ref invocationCount);
+            allDone.Signal();
+        };
+
+        // Submit from multiple producer threads to exercise concurrent CAS losers
+        // (which fall through to TP).
+        Parallel.For(0, totalDispatches, _ => dispatcher.UnsafeQueueUserWorkItem(cb, null));
+
+        Assert.True(allDone.Wait(TimeSpan.FromSeconds(30)),
+            $"Not all callbacks ran. Got {invocationCount} of {totalDispatches}.");
+        Assert.Equal(totalDispatches, Volatile.Read(ref invocationCount));
+    }
 }
