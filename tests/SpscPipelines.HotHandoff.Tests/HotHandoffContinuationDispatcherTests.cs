@@ -209,4 +209,32 @@ public class HotHandoffContinuationDispatcherTests
             "Dispose did not return after callback was released.");
         Assert.Equal(1, Volatile.Read(ref callbackCompleted));
     }
+
+    [Fact]
+    public void Dispatch_AfterDispose_AlwaysRunsOnThreadPool()
+    {
+        var dispatcher = new HotHandoffContinuationDispatcher();
+        dispatcher.Dispose();
+
+        const int total = 100;
+        int onTpThread = 0;
+        int notOnTpThread = 0;
+        var allDone = new CountdownEvent(total);
+
+        for (int i = 0; i < total; i++)
+        {
+            dispatcher.UnsafeQueueUserWorkItem(_ =>
+            {
+                if (Thread.CurrentThread.IsThreadPoolThread)
+                    Interlocked.Increment(ref onTpThread);
+                else
+                    Interlocked.Increment(ref notOnTpThread);
+                allDone.Signal();
+            }, null);
+        }
+
+        Assert.True(allDone.Wait(TimeSpan.FromSeconds(10)));
+        Assert.Equal(total, Volatile.Read(ref onTpThread));
+        Assert.Equal(0,     Volatile.Read(ref notOnTpThread));
+    }
 }
