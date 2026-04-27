@@ -8,5 +8,6 @@
     <Project Path="tests/SpscPipe.Stress/SpscPipe.Stress.csproj" />
     <Project Path="tests/SpscPipe.Tests/SpscPipe.Tests.csproj" />
     <Project Path="tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.csproj" />
+    <Project Path="tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj" />
   </Folder>
 </Solution>
