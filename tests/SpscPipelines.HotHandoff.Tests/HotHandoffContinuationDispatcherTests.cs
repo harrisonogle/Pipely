@@ -260,4 +260,26 @@ public class HotHandoffContinuationDispatcherTests
         // (one dispatcher, multiple producer threads).
         await Task.WhenAll(Roundtrip(pipeA, 7), Roundtrip(pipeB, 11));
     }
+
+    [Fact]
+    public async Task SpscPipe_WithHotHandoff_BasicReadFlush_RoundTrip()
+    {
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        var readTask = pipe.Reader.ReadAsync().AsTask();
+        Assert.False(readTask.IsCompleted, "Reader should park on the empty pipe.");
+
+        await Task.Run(async () =>
+        {
+            var mem = pipe.Writer.GetMemory(5);
+            mem.Span.Clear();
+            pipe.Writer.Advance(5);
+            await pipe.Writer.FlushAsync();
+        });
+
+        var rr = await readTask.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(5, rr.Buffer.Length);
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+    }
 }
