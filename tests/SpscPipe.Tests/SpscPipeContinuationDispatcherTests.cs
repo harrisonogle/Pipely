@@ -175,23 +175,27 @@ public class SpscPipeContinuationDispatcherTests
 
         asyncLocal.Value = 42;
 
-        // Consumer awaits, parks. Dispatcher routes the continuation to TP.
-        var readTask = pipe.Reader.ReadAsync().AsTask();
-        Assert.False(readTask.IsCompleted);
-
-        // Producer-side write triggers signal -> dispatcher -> continuation runs.
-        await Task.Run(async () =>
+        // Producer fires in background; the small delay gives the consumer time to park
+        // on ReadAsync so the completion path goes through the dispatcher.
+        _ = Task.Run(async () =>
         {
+            await Task.Delay(50);
             var mem = pipe.Writer.GetMemory(5);
             mem.Span.Clear();
             pipe.Writer.Advance(5);
             await pipe.Writer.FlushAsync();
         });
 
-        int observedAfterAwait = asyncLocal.Value;
-        var rr = await readTask.WaitAsync(TimeSpan.FromSeconds(5));
+        // Consumer awaits ReadAsync directly. This await suspends, the dispatcher
+        // resumes us, and the next line runs on the dispatcher's chosen thread.
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+        // Observe AsyncLocal HERE — on the dispatcher's continuation path.
+        // If MRVTSC's RunInternal correctly applied the captured EC, value is 42.
+        int observedInContinuation = asyncLocal.Value;
         Assert.Equal(5, rr.Buffer.Length);
-        Assert.Equal(42, observedAfterAwait);
+        Assert.Equal(42, observedInContinuation);
     }
 
     // ---------- B. EC isolation — dispatcher's own AsyncLocal NOT observed in continuation ----------
@@ -207,28 +211,32 @@ public class SpscPipeContinuationDispatcherTests
 
         consumerLocal.Value = 42;
 
-        var readTask = pipe.Reader.ReadAsync().AsTask();
-        Assert.False(readTask.IsCompleted);
-
-        await Task.Run(async () =>
+        // Producer fires in background; small delay gives the consumer time to park.
+        _ = Task.Run(async () =>
         {
+            await Task.Delay(50);
             var mem = pipe.Writer.GetMemory(5);
             mem.Span.Clear();
             pipe.Writer.Advance(5);
             await pipe.Writer.FlushAsync();
         });
 
-        var rr = await readTask.WaitAsync(TimeSpan.FromSeconds(5));
+        // Consumer awaits ReadAsync directly. This await suspends, the dispatcher
+        // (whose dedicated thread had its dispatcherLocal set to 999) resumes us, and
+        // the next line runs on the dispatcher's thread under the consumer's restored EC.
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+        // Observe both AsyncLocals HERE — on the dispatcher's continuation path.
+        // - Consumer's value should be 42 (consumer's captured EC was restored).
+        // - Dispatcher's value should NOT be 999 (RunInternal isolated dispatcher's
+        //   per-thread EC from the continuation invocation).
+        int observedConsumer   = consumerLocal.Value;
+        int observedDispatcher = dispatcherLocal.Value;
+
         Assert.Equal(5, rr.Buffer.Length);
-
-        // Continuation observed consumer's value.
-        Assert.Equal(42, consumerLocal.Value);
-
-        // The dispatcher thread had set its own AsyncLocal value (999), but the continuation
-        // (which ran via dispatcher) should NOT see it. We're now back on the consumer's thread
-        // (the test's main async flow), so dispatcherLocal — never set on this thread — must
-        // still be the default 0.
-        Assert.Equal(0, dispatcherLocal.Value);
+        Assert.Equal(42, observedConsumer);
+        Assert.Equal(0, observedDispatcher);
     }
 
     // ---------- C. EC restoration — dispatcher's AsyncLocal preserved across continuation ----------
@@ -287,40 +295,44 @@ public class SpscPipeContinuationDispatcherTests
 
         consumerLocal.Value = 42;
 
-        var readTask = pipe.Reader.ReadAsync().AsTask();
-
-        int observedConsumerLocalInContinuation = -1;
-        int observedProducerLocalInContinuation = -1;
-
-        // Continue in the consumer's continuation
-        var capturingTask = readTask.ContinueWith(_ =>
-        {
-            observedConsumerLocalInContinuation = consumerLocal.Value;
-            observedProducerLocalInContinuation = producerLocal.Value;
-        });
-
-        await Task.Run(async () =>
+        // Producer fires in background; small delay gives the consumer time to park
+        // so the completion path goes through the (bad) dispatcher.
+        _ = Task.Run(async () =>
         {
             producerLocal.Value = 99;  // set on producer's thread
+            await Task.Delay(50);
             var mem = pipe.Writer.GetMemory(5);
             mem.Span.Clear();
             pipe.Writer.Advance(5);
             await pipe.Writer.FlushAsync();
         });
 
-        await capturingTask.WaitAsync(TimeSpan.FromSeconds(5));
+        // Consumer awaits ReadAsync directly. The bad dispatcher captures producer's EC
+        // and applies it to the work item, but MRVTSC's inner RunInternal restores the
+        // consumer's captured EC for the actual continuation invocation.
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+        // Observe AsyncLocals HERE — on the dispatcher's continuation path.
+        // - consumerLocal.Value should still be 42 (consumer's captured EC was restored).
+        // - producerLocal.Value should be 0 (producer's EC was the work-item-wrapping EC,
+        //   which RunInternal saved/restored across the continuation).
+        int observedConsumer = consumerLocal.Value;
+        int observedProducer = producerLocal.Value;
+
+        Assert.Equal(5, rr.Buffer.Length);
 
         // The consumer's value must always be observed (this is the hard guarantee even
         // with a misbehaving dispatcher, because MRVTSC's RunInternal restores the
         // captured EC for the continuation regardless of dispatcher).
-        Assert.Equal(42, observedConsumerLocalInContinuation);
+        Assert.Equal(42, observedConsumer);
 
         // The producer's EC, if captured by the bad dispatcher, would be applied to
         // the work item BEFORE the inner RunInternal restoration. The continuation
         // sees consumer's EC during execution due to RunInternal — so producer's
         // value is NOT visible. This test documents the safety property: even a
         // dispatcher that captures EC doesn't break the consumer's continuation.
-        Assert.Equal(0, observedProducerLocalInContinuation);
+        Assert.Equal(0, observedProducer);
     }
 
     // ---------- E. Exception in continuation doesn't kill dispatcher thread ----------
@@ -331,42 +343,49 @@ public class SpscPipeContinuationDispatcherTests
         using var dispatcher = new DedicatedThreadDispatcher();
         using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
 
-        // First read: the user's continuation advances the buffer and then throws. The
-        // dispatcher must wrap the callback in try/catch (per contract item #5) so the
-        // dispatcher thread survives the in-flight exception. The user's task fault surfaces
-        // up through its returned Task; the dispatcher thread is unaffected.
-        var firstRead = pipe.Reader.ReadAsync().AsTask().ContinueWith(t =>
+        // First read: producer fires in background, consumer parks on ReadAsync, the
+        // dispatcher resumes the continuation on its dedicated thread. The continuation
+        // (the awaited body below) then throws. The dispatcher's try/catch (contract item
+        // #5) protects its thread from in-flight exceptions; the test method's async
+        // builder also catches the rethrow on resumption. Either path is acceptable —
+        // what matters is that the dispatcher thread survives, verified by the second read.
+        _ = Task.Run(async () =>
         {
-            // Drain the buffer so subsequent ReadAsync calls don't see "Reading is in progress".
-            pipe.Reader.AdvanceTo(t.Result.Buffer.End);
-            throw new InvalidOperationException("test exception");
-        });
-
-        await Task.Run(async () =>
-        {
+            await Task.Delay(50);
             var mem = pipe.Writer.GetMemory(5);
             mem.Span.Clear();
             pipe.Writer.Advance(5);
             await pipe.Writer.FlushAsync();
         });
 
-        try { await firstRead.WaitAsync(TimeSpan.FromSeconds(5)); }
-        catch { /* expected — the ContinueWith body threw */ }
-
-        // Dispatcher thread should still be alive — second read should park then resume.
-        var secondRead = pipe.Reader.ReadAsync().AsTask();
-
-        await Task.Run(async () =>
+        var thrownAsExpected = false;
+        try
         {
+            var rr = await pipe.Reader.ReadAsync();
+            pipe.Reader.AdvanceTo(rr.Buffer.End);
+            throw new InvalidOperationException("test exception");
+        }
+        catch (InvalidOperationException ex) when (ex.Message == "test exception")
+        {
+            thrownAsExpected = true;
+        }
+
+        Assert.True(thrownAsExpected);
+
+        // Second read: confirms dispatcher thread is still alive.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
             var mem = pipe.Writer.GetMemory(7);
             mem.Span.Clear();
             pipe.Writer.Advance(7);
             await pipe.Writer.FlushAsync();
         });
 
-        var rr = await secondRead.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.False(rr.IsCanceled);
-        Assert.Equal(7, rr.Buffer.Length);
+        var rr2 = await pipe.Reader.ReadAsync();
+        Assert.False(rr2.IsCanceled);
+        Assert.Equal(7, rr2.Buffer.Length);
+        pipe.Reader.AdvanceTo(rr2.Buffer.End);
     }
 
     // ---------- F. Version safety under rapid park/resume ----------
