@@ -311,4 +311,45 @@ public class HotHandoffContinuationDispatcherTests
         Assert.Equal(5, rr.Buffer.Length);
         Assert.Equal(42, asyncLocal.Value);
     }
+
+    [Fact]
+    public async Task SpscPipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation()
+    {
+        var consumerLocal   = new AsyncLocal<int>();
+        var dispatcherLocal = new AsyncLocal<int>();
+
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+
+        // Set dispatcherLocal on the worker thread by dispatching a one-shot through the slot.
+        using var setupDone = new ManualResetEventSlim(false);
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            dispatcherLocal.Value = 999;
+            setupDone.Set();
+        }, null);
+        Assert.True(setupDone.Wait(TimeSpan.FromSeconds(5)));
+
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        consumerLocal.Value = 42;
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            var mem = pipe.Writer.GetMemory(5);
+            mem.Span.Clear();
+            pipe.Writer.Advance(5);
+            await pipe.Writer.FlushAsync();
+        });
+
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+        // Continuation runs on the dispatcher's worker thread under the consumer's
+        // captured EC. consumerLocal.Value (42) is observed; dispatcherLocal.Value
+        // (999, set on the worker thread above) is NOT observed.
+        Assert.Equal(5, rr.Buffer.Length);
+        Assert.Equal(42, consumerLocal.Value);
+        Assert.Equal(0,  dispatcherLocal.Value);
+    }
 }
