@@ -53,12 +53,7 @@ return await rootCommand.Parse(args).InvokeAsync();
 
 static async Task RunLatencyBenchmarks(int count, int size, int trials)
 {
-    // Allocate sample buffer once and reuse across all trials and both pipes.
-    // Per-trial allocation would add ~80 MB / trial of GC pressure that could confound the very
-    // runtime-drift we're trying to detect across trials.
-    long[] samples = new long[count];
-    // Pre-touch every 4 KB page to commit physical memory before the timed runs.
-    for (int i = 0; i < samples.Length; i += 512) samples[i] = 1;
+    var samples = new LatencySamples(count);
 
     if (trials == 1)
     {
@@ -72,8 +67,9 @@ static async Task RunLatencyBenchmarks(int count, int size, int trials)
         using (var spsc = new SpscPipeAdapter())
             spscStats = await LatencyHarness.Run(spsc, samples, size);
 
-        Console.WriteLine();
-        LatencyHarness.PrintComparison("BCL Pipe", bclStats, "SpscPipe", spscStats);
+        LatencyHarness.PrintComparison("Transfer", "BCL Pipe", bclStats.Transfer, "SpscPipe", spscStats.Transfer);
+        LatencyHarness.PrintComparison("FlushAsync", "BCL Pipe", bclStats.FlushAsync, "SpscPipe", spscStats.FlushAsync);
+        LatencyHarness.PrintComparison("ReadAsync", "BCL Pipe", bclStats.ReadAsync, "SpscPipe", spscStats.ReadAsync);
     }
     else
     {
@@ -91,7 +87,9 @@ static async Task RunLatencyBenchmarks(int count, int size, int trials)
 
             Console.WriteLine();
             Console.WriteLine($"=== Trial {t}/{trials} ===");
-            LatencyHarness.PrintComparison("BCL Pipe", bclStats, "SpscPipe", spscStats);
+            LatencyHarness.PrintComparison("Transfer", "BCL Pipe", bclStats.Transfer, "SpscPipe", spscStats.Transfer);
+            LatencyHarness.PrintComparison("FlushAsync", "BCL Pipe", bclStats.FlushAsync, "SpscPipe", spscStats.FlushAsync);
+            LatencyHarness.PrintComparison("ReadAsync", "BCL Pipe", bclStats.ReadAsync, "SpscPipe", spscStats.ReadAsync);
         }
     }
 }
