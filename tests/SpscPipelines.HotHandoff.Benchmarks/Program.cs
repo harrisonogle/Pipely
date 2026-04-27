@@ -4,10 +4,13 @@ using SpscPipelines.HotHandoff.Benchmarks;
 using System.CommandLine;
 
 // Anything that isn't the latency sub-command (including no args, or BDN args
-// like --filter / --job) is forwarded to BenchmarkSwitcher.
+// like --filter / --job) is forwarded to BenchmarkSwitcher. FromAssembly
+// auto-discovers every public [Benchmark] class in the project, so adding a
+// second BDN class later requires no Program.cs edit (matches the pattern in
+// tests/SpscPipe.Benchmarks/Program.cs).
 if (args.Length == 0 || args[0] != "latency")
 {
-    BenchmarkSwitcher.FromTypes(new[] { typeof(DispatcherThroughputBench) }).Run(args);
+    BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
     return 0;
 }
 

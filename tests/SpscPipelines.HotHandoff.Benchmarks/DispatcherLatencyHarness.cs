@@ -7,13 +7,13 @@ using SpscPipelines;
 namespace SpscPipelines.HotHandoff.Benchmarks;
 
 internal sealed record LatencyStats(
-    long Count,
-    long MinNs,
-    long P50Ns,
-    long P90Ns,
-    long P99Ns,
-    long P999Ns,
-    long MaxNs,
+    long   Count,
+    double MinNs,
+    double P50Ns,
+    double P90Ns,
+    double P99Ns,
+    double P999Ns,
+    double MaxNs,
     double MeanNs);
 
 internal static class DispatcherLatencyHarness
@@ -89,13 +89,13 @@ internal static class DispatcherLatencyHarness
 
         return new LatencyStats(
             Count:  span.Length,
-            MinNs:  TicksToNs(span[0],                   freq),
-            P50Ns:  TicksToNs(Percentile(span, 0.50),    freq),
-            P90Ns:  TicksToNs(Percentile(span, 0.90),    freq),
-            P99Ns:  TicksToNs(Percentile(span, 0.99),    freq),
-            P999Ns: TicksToNs(Percentile(span, 0.999),   freq),
-            MaxNs:  TicksToNs(span[^1],                  freq),
-            MeanNs: TicksToNs((long)meanTicks,           freq));
+            MinNs:  TicksToNs(span[0],                 freq),
+            P50Ns:  TicksToNs(Percentile(span, 0.50),  freq),
+            P90Ns:  TicksToNs(Percentile(span, 0.90),  freq),
+            P99Ns:  TicksToNs(Percentile(span, 0.99),  freq),
+            P999Ns: TicksToNs(Percentile(span, 0.999), freq),
+            MaxNs:  TicksToNs(span[^1],                freq),
+            MeanNs: TicksToNs(meanTicks,               freq));
     }
 
     public static void PrintComparison(string label, LatencyStats baseline, LatencyStats compare)
@@ -128,5 +128,5 @@ internal static class DispatcherLatencyHarness
         return sorted[idx];
     }
 
-    private static long TicksToNs(long ticks, long freq) => (long)(ticks * 1_000_000_000.0 / freq);
+    private static double TicksToNs(double ticks, long freq) => ticks * 1_000_000_000.0 / freq;
 }
