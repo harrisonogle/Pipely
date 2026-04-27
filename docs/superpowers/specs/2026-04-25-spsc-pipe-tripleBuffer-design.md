@@ -8,7 +8,7 @@
 - A lock-free, single-producer single-consumer (SPSC) implementation of `System.IO.Pipelines.PipeReader` / `PipeWriter`, sharing all cross-thread state through two `TripleBuffer<T>` instances rather than a shared mutable linked list.
 - Each side publishes a self-consistent monotonic snapshot of its own state (counters + segment cursor + completion); each side reads the other's latest snapshot opportunistically. Snapshot loss is safe because everything is monotonic.
 - The writer is the sole mutator of segments and the chain. Reader holds references but never mutates. Recycling is gated on the reader's published `HeadSegment`, not byte counters, eliminating a class of "still-referenced" bugs.
-- The awaiter is a single packed `int` per direction. Every state transition is `Interlocked.CompareExchange` or `Interlocked.Or`. Result construction is **stash-and-construct**: the reader stashes its head + tail cursor at park time; the signaler combines the stash with the writer's just-published state to construct the `ReadResult` and pass it to `_core.SetResult`. No thread-affinity constraint on continuations.
+- The awaiter is a single packed `int` per direction. Every state transition is `Interlocked.CompareExchange` or `Interlocked.Or`. Result construction is **stash-and-construct**: the reader stashes its head + tail cursor at park time; the signaler combines the stash with the writer's just-published state to construct the `ReadResult`, then dispatches the continuation via `IContinuationDispatcher` (default = ThreadPool, customizable per-pipe). No thread-affinity constraint on continuations; continuation-thread choice is pluggable.
 - Cancel-from-any-thread (`CancelPending*`) is a sticky bit on the awaiter, naturally coalescing per BCL semantics. The cancel-while-parked path constructs the `ReadResult.Buffer` from the stash so the reader observes the same data BCL would have given them.
 - BCL surface compatibility: `ReadAsync` / `TryRead` / `FlushAsync` / `Advance` / `AdvanceTo` / `Complete` / `CancelPending*`. Read/flush precedence is **throw-first** (matches BCL `IsCompletedOrThrow`): `Complete(ex)` throws on every subsequent call, taking precedence over both sticky cancel and cancellation-token surfacing.
 - **Documented divergences from BCL `Pipe`:**
@@ -30,7 +30,8 @@
   - `_options : SpscPipeOptions` — see Section 6.
 - **`SpscPipe.Writer : PipeWriter`** — single producer thread. Owns the segment chain (`_chainHead` → `_writingHead`), a private `BufferSegment` freelist, the `MemoryPool<byte>` reference, and writer-local cursors.
 - **`SpscPipe.Reader : PipeReader`** — single consumer thread. Owns reader-local cursors and the most recently acquired `WriterState`.
-- **`SpscAwaiter<T>`** — wraps `ManualResetValueTaskSourceCore<T>` with a single packed `int` state field plus a `ParkStash`. Detail in Section 5.
+- **`SpscAwaiter<T>`** — wraps `ManualResetValueTaskSourceCore<T>` (configured with `RunContinuationsAsynchronously = false`) with a single packed `int` state field plus a `ParkStash` and a dispatch-stash (`_dispatchResult` / `_dispatchException`). Detail in Section 5.
+- **`IContinuationDispatcher`** (public interface, §6) — pluggable thread-routing primitive for awaiter continuations. Default = `ThreadPoolContinuationDispatcher` (forwards to `ThreadPool.UnsafeQueueUserWorkItem`). User-supplied implementations let callers escape TP wake-gap latency for high-frequency workloads.
 
 ### Local cursors (private to each side)
 
@@ -713,6 +714,13 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     public BufferSegment? _stashTail;       // R2-5: extended for cancel-while-parked buffer reconstruction
     public int            _stashTailIdx;
 
+    // Stash for the dispatcher hop. Set by the actor that wins CAS Pending→Inactive (signaler /
+    // canceler / token-callback) before invoking the dispatcher; read by the dispatched callback,
+    // which clears the field and then calls _core.SetResult / _core.SetException. See "Continuation
+    // dispatch" below.
+    public T?         _dispatchResult;
+    public Exception? _dispatchException;
+
     public const int Inactive   = 0b00;
     public const int Pending    = 0b01;
     public const int StateMask  = 0b01;
@@ -732,16 +740,52 @@ Two states (`Inactive` / `Pending`) suffice; "how was this completed" lives in `
 - `_token` is written by the owner before CAS Inactive→Pending; read by the token callback after CAS Pending→Inactive succeeds. Synchronization rides on `_state`'s CAS. Field reuse across cycles is safe because `CancellationTokenRegistration.Dispose()` blocks on in-flight callbacks, so the prior cycle's callback completes before the next cycle's `_token = ct` write.
 - `_ctr` is written by the owner *after* CAS Inactive→Pending. **Important: the CAS does NOT release-publish `_ctr`** — there is no synchronizes-with edge between the owner's `_ctr = …` write and a signaler/canceler that wins CAS Pending→Inactive between the owner's CAS and the owner's `_ctr` write. Safety rests on two distinct properties: (a) `CancellationTokenRegistration` is a small struct and `Dispose()` is **idempotent and tolerant of default/torn input** — disposing a default or partially-published value at worst no-ops; (b) the owner's R5 re-check (`if (_state != Pending) _ctr.Dispose()`) ensures the owner disposes the by-then-fully-written value if a signaler/canceler beat it to the CAS. This guarantees at-least-once Dispose. The R5b (start-of-next-park dispose) handles the orthogonal token-callback-wins case where the callback won the CAS but didn't dispose. Future maintainers must not "optimize away" the R5 re-check on the assumption that `_state` publishes `_ctr` — it doesn't.
 - Stash fields (`_stashHead`, `_stashHeadIdx`, `_stashTail`, `_stashTailIdx`) are written by the owner *before* CAS Inactive→Pending; read by the signaler or canceler after CAS Pending→Inactive succeeds. The CAS's release/acquire ordering does cover these. Stash fields are not cleared after read; they retain references to BufferSegments until the next park overwrites them (one-cycle pin, parallel to TripleBuffer slot retention; benign).
+- Dispatch-stash fields (`_dispatchResult`, `_dispatchException`) are written by whichever actor wins CAS Pending→Inactive (signaler / canceler / token callback / lost-wakeup re-check), *after* the CAS but *before* the call to `IContinuationDispatcher.UnsafeQueueUserWorkItem`. Read inside the dispatched callback, which clears the field (sets it back to `default` / `null`) and then invokes `_core.SetResult` / `_core.SetException`. Because exactly one actor wins the CAS per park cycle (I11), there is no concurrent writer; the read inside the callback synchronizes with that single writer through the dispatcher's own ordering guarantees (any sound implementation of `UnsafeQueueUserWorkItem` provides a happens-before edge from the queue-call to the dequeued callback). Clearing on read is hygiene: it releases the awaiter's reference to the just-delivered `ReadResult` (and its `ROS<byte>` of segments) and to any stashed exception, so the awaiter does not retain those references between park cycles.
 
-**On Pattern 2 (stash-and-construct).** The signaler runs on the writer thread (for the read awaiter); constructing a `ReadResult` requires reader-private cursors per I3. To avoid Pattern 1's thread-affinity constraint, the reader stashes its full cursor (head + tail) at park time. The signaler combines the stash with `_lastPublishedWriterState` (writer-private, freshest just before signaling) to construct the `ReadResult` and pass it to `_core.SetResult`. The canceler-while-parked path uses the same stash to construct a buffer reflecting **park-time** contents — bytes the writer publishes between the reader's park and the cancel-from-third-thread are *not* in the cancel result; they surface on the next `ReadAsync` (documented top-level divergence from BCL, which constructs from current committed state). The stash is also not refreshed by `ParkReadAwaiter`'s lost-wakeup integrate; refreshing it would introduce a torn-stash window for a concurrent canceler.
+**On Pattern 2 (stash-and-construct).** The signaler runs on the writer thread (for the read awaiter); constructing a `ReadResult` requires reader-private cursors per I3. To avoid Pattern 1's thread-affinity constraint, the reader stashes its full cursor (head + tail) at park time. The signaler combines the stash with `_lastPublishedWriterState` (writer-private, freshest just before signaling) to construct the `ReadResult`, stash it on the awaiter, and hand off to `IContinuationDispatcher.UnsafeQueueUserWorkItem` (per R10); the dispatched callback then calls `_core.SetResult`. The canceler-while-parked path uses the same stash to construct a buffer reflecting **park-time** contents — bytes the writer publishes between the reader's park and the cancel-from-third-thread are *not* in the cancel result; they surface on the next `ReadAsync` (documented top-level divergence from BCL, which constructs from current committed state). The stash is also not refreshed by `ParkReadAwaiter`'s lost-wakeup integrate; refreshing it would introduce a torn-stash window for a concurrent canceler.
 
-**Implementation note on `RunContinuationsAsynchronously`.** Set `_core.RunContinuationsAsynchronously = true` **once at construction**, not per-`Reset` — `ManualResetValueTaskSourceCore<T>.Reset` does not reset this flag. Setting it `true` avoids inline continuation execution on the signaler thread (which can lead to unbounded stack depth and reentrancy hazards under bursty workloads). Pattern 2 makes this choice cleanly orthogonal to correctness.
+**Implementation note on `RunContinuationsAsynchronously`.** Set `_core.RunContinuationsAsynchronously = false` **once at construction**, not per-`Reset` — `ManualResetValueTaskSourceCore<T>.Reset` does not reset this flag. With RCA = false, `_core.SetResult` / `_core.SetException` invokes the registered continuation **inline on whatever thread calls it**. SpscPipe never calls `_core.SetResult` / `_core.SetException` from the signaler thread directly; instead, every signal site stashes the result on the awaiter, hops through `IContinuationDispatcher.UnsafeQueueUserWorkItem`, and the dispatched callback calls `_core.SetResult` / `_core.SetException` from the dispatcher's chosen thread. This dispatcher hop replaces MRVTSC's internal TP queueing (which RCA = true would otherwise perform). The default dispatcher forwards to `ThreadPool.UnsafeQueueUserWorkItem`, so the observable behavior matches the prior RCA = true setup: no inline execution on the signaler thread, no unbounded stack depth, no reentrancy hazard under bursty workloads. A custom dispatcher can route the callback to a user-controlled thread (see §6 `ContinuationDispatcher`).
 
-**Cross-thread visibility of `_lastPublishedWriterState` under Pattern 2.** The reader's signaler runs on the writer thread; it reads `_lastPublishedWriterState` (a writer-private field set on the writer thread, immediately before `SignalReadAwaiterIfPending` is called). Since both writes are on the writer thread, no cross-thread synchronization is needed for that read. The constructed `ReadResult` is then passed into `_core.SetResult`, which provides the release/acquire fence to the reader's continuation thread.
+### Continuation dispatch
 
-**Symmetric for `_lastPublishedReaderState`.** The writer's signaler (called from `AdvanceTo` via `SignalFlushIfBackpressureRelieved` and from `Reader.Complete` via `SignalFlushAwaiterIfPending`) runs on the **reader** thread; it reads `_lastPublishedReaderState`, which is reader-private and was set on the reader thread immediately before the signaler call. No cross-thread sync needed for that read. `_core.SetResult` then provides release/acquire to the writer's continuation. Future maintainers adding additional signaler call sites must place them on the reader thread to preserve this property.
+Every signal-path site that decides "the parked awaiter is being released" must invoke its continuation through the configured `IContinuationDispatcher` rather than calling `_core.SetResult` / `_core.SetException` inline on the signaling thread. The pattern is:
 
-**Cancel-via-stash transitive-fence visibility.** The cross-thread `CancelPendingRead` path (canceler on a third thread) constructs an ROS from segments reachable through the stash. Visibility chain: writer's freeze writes → (writer's `Publish` release fence) → reader's `TryAcquire` acquire fence → reader's stash writes (same thread, sequenced) → reader's CAS Inactive→Pending release → canceler's CAS Pending→Inactive acquire → canceler's reads of stash + segment fields → canceler's `_core.SetResult` release → continuation's `GetResult` acquire. All segment fields the canceler reads (`RunningIndex`, `Memory`, etc.) were established by the writer's freeze before the writer published, and the chain transitively carries the writes to the canceler thread.
+1. CAS Pending → Inactive succeeds (the actor has won the right to deliver the result).
+2. Stash the result or exception on the awaiter (`_dispatchResult` or `_dispatchException`).
+3. Call `dispatcher.UnsafeQueueUserWorkItem(s_dispatchCallback, awaiter)`, where `dispatcher` is `_options.ContinuationDispatcher ?? ThreadPoolContinuationDispatcher.Instance` and `s_dispatchCallback` is a static delegate (allocated once at type-init) that:
+   - Reads the stashed value back off the awaiter,
+   - Clears the stash field,
+   - Calls `awaiter._core.SetResult(value)` (or `awaiter._core.SetException(exception)`) on the dispatcher's chosen thread.
+4. With `_core.RunContinuationsAsynchronously = false`, that `_core.SetResult` / `_core.SetException` runs the registered continuation inline under the consumer-captured ExecutionContext (see EC invariant below).
+
+There are four families of static dispatch callbacks: `(SetResult|SetException) × (ReadAwaiter|FlushAwaiter)`. To keep the pseudocode in the signal paths below readable, treat each call to `_core.SetResult(value)` / `_core.SetException(ex)` shown there as shorthand for the stash-and-dispatch sequence:
+
+```csharp
+// _readAwaiter._core.SetResult(value)  (shorthand for) ↓
+_readAwaiter._dispatchResult = value;
+(_options.ContinuationDispatcher ?? ThreadPoolContinuationDispatcher.Instance)
+    .UnsafeQueueUserWorkItem(s_dispatchReadSetResult, _readAwaiter);
+// where:
+private static readonly Action<object?> s_dispatchReadSetResult = static state => {
+    var a = (SpscAwaiter<ReadResult>)state!;
+    var v = a._dispatchResult; a._dispatchResult = default;
+    a._core.SetResult(v);
+};
+```
+
+with parallel forms for `SetException` and for the flush awaiter. Lost-wakeup re-check paths inside `ParkReadAwaiter` / `ParkFlushAwaiter` that **don't** go through `_core.Set*` (the data-return paths that build a `ValueTask<T>` directly via `BuildReadResult` / `BuildFlushResult`) are *not* dispatched — there is no continuation, the result is returned synchronously to the caller's await machinery.
+
+**Allocation cost.** Zero allocations per dispatch: the static delegates are allocated once at type-init; the result/exception is stashed on the existing awaiter object (no per-dispatch tuple/closure); the dispatcher itself receives `(Action<object?>, object?)` matching `ThreadPool.UnsafeQueueUserWorkItem`'s shape. Per-dispatch overhead vs. RCA = true: one extra virtual call into the dispatcher (~1-2 ns); should be invisible in throughput benchmarks.
+
+**EC capture / restoration discipline (invariant).** ExecutionContext capture for await continuations occurs on the **consumer's** thread at `IValueTaskSource.OnCompleted` time, when the await machinery registers the continuation. The captured EC is stored in `_core._executionContext` and applied via `ExecutionContext.RunInternal` inside `_core.SetResult` / `_core.SetException`, regardless of which thread invokes those methods. Implementations of `IContinuationDispatcher` MUST NOT capture or apply an ExecutionContext themselves; the dispatcher's role is purely to route the callback to a thread, not to manipulate context. Dispatcher implementations using `ThreadPool.UnsafeQueueUserWorkItem` (the BCL primitive that bypasses EC capture) satisfy this invariant trivially; implementations using `ThreadPool.QueueUserWorkItem` or `Task.Run` would violate it — they would capture the **producer's** EC and apply it around the dispatched callback, which (in the rare case where the consumer's await suppressed `FlowExecutionContext`) would leak the producer's AsyncLocal values into the continuation. Treat this as a hard contract on dispatcher implementations, called out in the interface XML doc and in option-validation prose. The contract is convention rather than statically enforced; tests should include an EC-leak guard against a "buggy" dispatcher that captures EC.
+
+**SynchronizationContext / TaskScheduler interaction.** If the consumer's await captured a non-null `SynchronizationContext` or a non-default `TaskScheduler`, MRVTSC's internal continuation dispatch posts to those (via the standard `ValueTaskSourceOnCompletedFlags` plumbing), overriding the dispatcher's thread choice — the dispatched callback will call `_core.SetResult` on the dispatcher's thread, but `_core.SetResult` will then re-dispatch the continuation onto the captured SC / TaskScheduler before running it. For the primary use case (ASP.NET Core / Kestrel transports), `SynchronizationContext.Current` is null by convention and `ConfigureAwait(false)` is used pervasively, so this case is rare in practice. Document as a known constraint of the pluggable-dispatcher feature, not a bug: a custom hot-handoff dispatcher cannot bypass an SC/TaskScheduler the consumer's `await` chose to capture.
+
+**Cross-thread visibility of `_lastPublishedWriterState` under Pattern 2.** The reader's signaler runs on the writer thread; it reads `_lastPublishedWriterState` (a writer-private field set on the writer thread, immediately before `SignalReadAwaiterIfPending` is called). Since both writes are on the writer thread, no cross-thread synchronization is needed for that read. The constructed `ReadResult` is then stashed on the awaiter and dispatched; the dispatched callback's `_core.SetResult` provides the release/acquire fence to the reader's continuation thread (regardless of which thread the dispatcher routes the callback to).
+
+**Symmetric for `_lastPublishedReaderState`.** The writer's signaler (called from `AdvanceTo` via `SignalFlushIfBackpressureRelieved` and from `Reader.Complete` via `SignalFlushAwaiterIfPending`) runs on the **reader** thread; it reads `_lastPublishedReaderState`, which is reader-private and was set on the reader thread immediately before the signaler call. No cross-thread sync needed for that read. The constructed `FlushResult` is then stashed on the awaiter and dispatched; the dispatched callback's `_core.SetResult` provides release/acquire to the writer's continuation. Future maintainers adding additional signaler call sites must place them on the reader thread to preserve this property.
+
+**Cancel-via-stash transitive-fence visibility.** The cross-thread `CancelPendingRead` path (canceler on a third thread) constructs an ROS from segments reachable through the stash. Visibility chain: writer's freeze writes → (writer's `Publish` release fence) → reader's `TryAcquire` acquire fence → reader's stash writes (same thread, sequenced) → reader's CAS Inactive→Pending release → canceler's CAS Pending→Inactive acquire → canceler's reads of stash + segment fields → canceler's `_dispatchResult` write → canceler's call to `dispatcher.UnsafeQueueUserWorkItem` (which provides a happens-before edge into the dispatched callback) → dispatched callback's `_core.SetResult` release → continuation's `GetResult` acquire. All segment fields the canceler reads (`RunningIndex`, `Memory`, etc.) were established by the writer's freeze before the writer published, and the chain transitively carries the writes through the canceler thread, the dispatcher's hand-off, and into the continuation.
 
 **`Interlocked.Or` portability note.** `Interlocked.Or(ref int, int)` was added in .NET 7; this project targets net10.0, so it's available. If back-porting to older targets, fall back to a CAS loop.
 
@@ -789,6 +833,7 @@ ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
                 int desired = oldV & ~StateMask;
                 if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
                 {
+                    // Shorthand: stash exception + dispatch via IContinuationDispatcher (see "Continuation dispatch" above).
                     _readAwaiter._core.SetException(_lastAcquiredWriterState.CompletionException);
                     return new ValueTask<ReadResult>(_readAwaiter, _readAwaiter.Version);
                 }
@@ -803,6 +848,7 @@ ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
                 if ((oldV & StateMask) != Pending) break;
                 int desired = oldV & ~StateMask;
                 if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
+                    // Sync data return — no continuation, no dispatcher hop.
                     return new ValueTask<ReadResult>(BuildReadResult(isCanceled: false));
             }
         }
@@ -813,6 +859,7 @@ ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
     if ((v & CancelFlag) != 0
         && Interlocked.CompareExchange(ref _readAwaiter._state, Inactive, Pending | CancelFlag) == (Pending | CancelFlag))
     {
+        // Shorthand: stash canceled ReadResult + dispatch via IContinuationDispatcher.
         _readAwaiter._core.SetResult(BuildReadResult(isCanceled: true));
         return new ValueTask<ReadResult>(_readAwaiter, _readAwaiter.Version);
     }
@@ -841,6 +888,7 @@ void SignalReadAwaiterIfPending()
             // Throw-first: writer-completed-with-ex delivered as exception.
             if (w.IsCompleted && w.CompletionException != null)
             {
+                // Shorthand: stash exception + dispatch via IContinuationDispatcher.
                 _readAwaiter._core.SetException(w.CompletionException);
                 return;
             }
@@ -853,6 +901,7 @@ void SignalReadAwaiterIfPending()
                 : new ReadOnlySequence<byte>(head, headIdx, w.TailSegment!, w.TailWritten);
 
             var result = new ReadResult(buffer, isCanceled: false, isCompleted: w.IsCompleted);
+            // Shorthand: stash result + dispatch via IContinuationDispatcher.
             _readAwaiter._core.SetResult(result);
             return;
         }
@@ -869,6 +918,7 @@ void OnReadAwaiterTokenCancel()
         if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
         {
             // Don't dispose _ctr here (running inside it); next ParkReadAwaiter cleans up.
+            // Shorthand: stash OCE + dispatch via IContinuationDispatcher.
             _readAwaiter._core.SetException(new OperationCanceledException(_readAwaiter._token));
             return;
         }
@@ -919,6 +969,7 @@ ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
                 int desired = oldV & ~StateMask;
                 if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
                 {
+                    // Shorthand: stash exception + dispatch via IContinuationDispatcher.
                     _flushAwaiter._core.SetException(_lastAcquiredReaderState.CompletionException);
                     return new ValueTask<FlushResult>(_flushAwaiter, _flushAwaiter.Version);
                 }
@@ -937,6 +988,7 @@ ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
                 if ((oldV & StateMask) != Pending) break;
                 int desired = oldV & ~StateMask;
                 if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
+                    // Sync data return — no continuation, no dispatcher hop.
                     return new ValueTask<FlushResult>(BuildFlushResult(isCanceled: false));
             }
         }
@@ -947,6 +999,7 @@ ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
     if ((v & CancelFlag) != 0
         && Interlocked.CompareExchange(ref _flushAwaiter._state, Inactive, Pending | CancelFlag) == (Pending | CancelFlag))
     {
+        // Shorthand: stash canceled FlushResult + dispatch via IContinuationDispatcher.
         _flushAwaiter._core.SetResult(BuildFlushResult(isCanceled: true));
         return new ValueTask<FlushResult>(_flushAwaiter, _flushAwaiter.Version);
     }
@@ -1012,7 +1065,8 @@ void SignalFlushAwaiterIfPending()
     }
 }
 
-// Helper called after a successful CAS in either signaler.
+// Helper called after a successful CAS in either signaler. Both arms are shorthand:
+// stash result/exception + dispatch via IContinuationDispatcher.
 void DeliverFlushResult()
 {
     var r = _lastPublishedReaderState;
@@ -1035,6 +1089,7 @@ void OnFlushAwaiterTokenCancel()
         int desired = oldV & ~SpscAwaiter.StateMask;
         if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
         {
+            // Shorthand: stash OCE + dispatch via IContinuationDispatcher.
             _flushAwaiter._core.SetException(new OperationCanceledException(_flushAwaiter._token));
             return;
         }
@@ -1068,6 +1123,9 @@ public void CancelPendingRead()
 
         // isCompleted: false is conservative — canceler doesn't have access to writer state.
         // The next non-cancel call surfaces correct IsCompleted via TryAcquire.
+        // Shorthand: stash canceled ReadResult + dispatch via IContinuationDispatcher.
+        // The dispatch hop is critical here: the canceler runs on a third thread, and inline
+        // continuation execution would otherwise run user code on the canceler's thread.
         _readAwaiter._core.SetResult(new ReadResult(buffer, isCanceled: true, isCompleted: false));
     }
     // CAS-fail (raced with signaler/token): flag remains set; consumed by next ReadAsync.
@@ -1084,6 +1142,7 @@ public void CancelPendingFlush()
     {
         _flushAwaiter._ctr.Dispose();
         // FlushResult has no buffer; minimal construction.
+        // Shorthand: stash canceled FlushResult + dispatch via IContinuationDispatcher.
         _flushAwaiter._core.SetResult(new FlushResult(isCanceled: true, isCompleted: false));
     }
 }
@@ -1182,6 +1241,7 @@ Without step 5's re-check, the reader would be parked indefinitely.
 - `SignalFlushIfBackpressureRelieved` (gated) and `SignalFlushAwaiterIfPending` (unconditional) are split: AdvanceTo uses gated (R2-1), Reader.Complete uses unconditional.
 - `CancelPendingRead` constructs `ReadResult` from stash; `CancelPendingFlush` constructs minimal `FlushResult` (no buffer).
 - 11 internal paths to 4 user-observable outcomes (data return / canceled return / OCE throw / completion-exception throw, with `IsCompleted` orthogonal on data and canceled returns); race winners deterministic per CAS.
+- `_core.RunContinuationsAsynchronously = false`. Every `_core.Set*` call is shorthand for "stash result/exception on the awaiter, then dispatch via `IContinuationDispatcher.UnsafeQueueUserWorkItem`"; the dispatched callback calls `_core.Set*` on the dispatcher's chosen thread. Default dispatcher = `ThreadPool.UnsafeQueueUserWorkItem`, preserving the prior RCA = true behavior. Custom dispatchers must not capture/apply ExecutionContext (EC capture happens on the consumer's thread at `OnCompleted` time and is applied by `_core.Set*`).
 
 ## Section 6 — Lifecycle and edge cases
 
@@ -1197,6 +1257,8 @@ public sealed class SpscPipeOptions
     public long PauseWriterThreshold { get; }                   // default: 65536 (64 KB)
     public long ResumeWriterThreshold { get; }                  // default: 32768 (32 KB)
     public int MaxFreelistSegments { get; }                     // default: 256
+    public IContinuationDispatcher? ContinuationDispatcher { get; init; }
+        // default: null → uses ThreadPoolContinuationDispatcher.Instance (TP, identical to BCL behavior)
 
     public SpscPipeOptions(
         MemoryPool<byte>? pool = null,
@@ -1234,7 +1296,58 @@ public sealed class SpscPipe : IDisposable
 }
 ```
 
-`PauseWriterThreshold = 0` means unbounded (writer never parks). Validation matches BCL's `PipeOptions` shape; defaults match BCL's defaults. `MaxFreelistSegments` is our addition (N4).
+`PauseWriterThreshold = 0` means unbounded (writer never parks). Validation matches BCL's `PipeOptions` shape; defaults match BCL's defaults. `MaxFreelistSegments` is our addition (N4). `ContinuationDispatcher` is `init`-only (per-pipe, immutable after construction); leaving it null preserves today's observable behavior — every awaited continuation runs on a ThreadPool worker, identical to setting `_core.RunContinuationsAsynchronously = true`.
+
+### `IContinuationDispatcher`
+
+`SpscPipe` parks awaiters when the wake condition is unmet (no published data for `ReadAsync`, backpressure unrelieved for `FlushAsync`). When a producer subsequently signals the parked side, the *continuation* registered on that awaiter must run somewhere. By default that "somewhere" is the .NET ThreadPool, via `ThreadPool.UnsafeQueueUserWorkItem`. The pluggable `IContinuationDispatcher` interface lets a user supply a different routing — most commonly, a hot-handoff to a dedicated busy-spinning thread on a pinned core, escaping the TP wake-gap latency (~390-500 ns at P50, multi-µs at P99) for high-frequency single-stream workloads.
+
+```csharp
+namespace SpscPipelines;
+
+public interface IContinuationDispatcher
+{
+    /// <summary>
+    /// Queue the callback for invocation on a thread of the implementation's choosing.
+    /// Mirrors the contract of System.Threading.ThreadPool.UnsafeQueueUserWorkItem:
+    ///
+    /// 1. The callback MUST be invoked exactly once.
+    /// 2. The implementation MUST NOT capture or apply an ExecutionContext.
+    ///    SpscPipe relies on MRVTSC's internal EC restoration (via the consumer-captured
+    ///    EC from OnCompleted) to scope the continuation correctly. Adding EC manipulation
+    ///    in the dispatcher will either leak the producer's EC into the continuation
+    ///    (when FlowExecutionContext is absent on the original await) or introduce
+    ///    wasteful capture/apply overhead.
+    /// 3. The implementation MUST be thread-safe; concurrent calls from multiple
+    ///    producer threads are permitted (one dispatcher may serve multiple pipes).
+    /// 4. The implementation MUST NOT throw from UnsafeQueueUserWorkItem itself.
+    ///    Failure to invoke the callback hangs the consumer's await indefinitely;
+    ///    a dispatcher in a failed state should still attempt to invoke the callback
+    ///    (e.g., fall back to TP) rather than throw.
+    /// 5. Implementations SHOULD wrap the callback invocation in try/catch so a
+    ///    throwing continuation doesn't kill the dispatcher's worker thread(s).
+    /// </summary>
+    void UnsafeQueueUserWorkItem(Action<object?> callback, object? state);
+}
+```
+
+**Default implementation (internal).** A stateless singleton forwarder:
+
+```csharp
+internal sealed class ThreadPoolContinuationDispatcher : IContinuationDispatcher
+{
+    public static readonly ThreadPoolContinuationDispatcher Instance = new();
+
+    public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
+        => ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
+}
+```
+
+When `SpscPipeOptions.ContinuationDispatcher` is `null`, the pipe uses `ThreadPoolContinuationDispatcher.Instance`. The observable behavior matches the prior RCA = true configuration: every continuation runs on a TP worker, the producer is never blocked on the consumer's continuation, EC and SC propagate identically, and inline execution on the signaler thread is excluded.
+
+**Contract enforcement is convention.** The five contract items above are documented constraints on dispatcher implementations, not statically enforced. A buggy custom dispatcher that captures EC, throws, or invokes the callback zero/multiple times is an implementation defect on the user's side. Tests should include an EC-leak guard (a producer-thread `AsyncLocal` sentinel that the continuation must not observe) to catch the most likely failure mode. See also the EC capture / restoration discipline invariant in §5.
+
+**Why `Action<object?>` and `UnsafeQueueUserWorkItem`-shaped naming.** The signature exactly matches `ThreadPool.UnsafeQueueUserWorkItem`'s, so the canonical implementation is a one-line forwarder and the EC-non-capture contract is explicit in the method name (mirroring the BCL primitive that has the matching semantics). An alternative `IThreadPoolWorkItem`-style struct API would avoid an `Action<object?>` allocation, but SpscPipe's static `s_dispatch*` callbacks are allocated once at type-init, so there is no per-dispatch delegate alloc to optimize away.
 
 ### Completion overview
 
@@ -1345,6 +1458,7 @@ If a sticky `CancelPending*` is consumed on a post-`Writer.Complete(null)` read,
 - `IsCanceled` and `IsCompleted` flags are independent in `ReadResult` for `Writer.Complete(null)` cases; for `Writer.Complete(ex)` the throw fires first and cancel is dropped.
 - Five documented divergences from BCL (see top-level takeaways): no `Reset`; `IDisposable` added; `AdvanceTo` no buffer-specific upper-bound check; cancel-from-third-thread `IsCompleted=false` lag; cancel-while-parked stash-time buffer.
 - `Dispose()` releases segment + freelist memory; precondition is no in-flight ops AND no outstanding buffer refs.
+- `SpscPipeOptions.ContinuationDispatcher` is `init`-only and defaults to null (TP). User-supplied dispatchers must obey the five-item contract on `IContinuationDispatcher.UnsafeQueueUserWorkItem`; primary use case is hot-handoff to a dedicated thread for sub-µs continuation latency.
 
 ## Section 7 — Verifiability
 
@@ -1365,6 +1479,8 @@ The design's correctness rests on a small number of state machines and invariant
 | Reader never reads past published `TailWritten` | I3 |
 | Pattern 2 stash read by signaler/canceler reflects the reader's cursor at park time (no torn read) | I9 + R2/R3 ordering on `_state` CAS |
 | Cancel-while-parked delivers the parked buffer (BCL parity) | R2-5 stash extension |
+| ExecutionContext flow correctness across the dispatcher hop: continuation observes consumer-captured EC, not producer's; dispatcher's own EC is preserved across the dispatched callback | I16, R10 |
+| Continuation runs exactly once per park cycle regardless of dispatcher choice | I11, R10 |
 
 **BCL parity tests** required for the implementation:
 - Throw timing on `Writer.Complete(ex)` — every read throws; buffered data unreachable. Verifies M4 Option A claim.
@@ -1408,6 +1524,7 @@ Whether to actually pursue TLA+ verification is an implementation-plan decision;
 | **I13** | After `Writer.Complete(_)`, the writer publishes nothing further (R6). The published `WriterState` is sticky with `IsCompleted=true` and `CompletionException` set if the completion was faulted. |
 | **I14** | After `Reader.Complete(_)`, the reader publishes nothing further. The published `ReaderState` has `HeadSegment = null` (allowing full chain recycle), `IsCompleted = true`, and `CompletionException` set if faulted. |
 | **I15** | `SpscPipe.Dispose()` precondition: no operation is currently in flight on either side, and no `ReadResult.Buffer` references are still held by the user. Violation is undefined behavior. |
+| **I16** | **EC capture / restoration discipline.** ExecutionContext capture for await continuations occurs on the consumer's thread at `IValueTaskSource.OnCompleted` time and is stored in `_core._executionContext`. EC application happens inside `_core.SetResult` / `_core.SetException` via `ExecutionContext.RunInternal`, regardless of which thread calls those methods. `IContinuationDispatcher` implementations MUST NOT capture or apply an ExecutionContext themselves; their role is purely to route the callback to a thread. Implementations using `ThreadPool.UnsafeQueueUserWorkItem` satisfy this trivially; implementations using `ThreadPool.QueueUserWorkItem` or `Task.Run` violate it. |
 
 ## Consolidated rules
 
@@ -1422,6 +1539,7 @@ Whether to actually pursue TLA+ verification is an implementation-plan decision;
 | **R7** | **(Option A, BCL-strict.)** After `Writer.Complete(ex)`, every `ReadAsync` / `TryRead` on the reader throws `ex`. After `Reader.Complete(ex)`, every `FlushAsync` on the writer throws `ex`. No drain semantics; buffered data after a faulted side is unreachable. No `_exceptionAlreadySurfaced` flag needed. |
 | **R8** | `AdvanceTo` validates monotonicity and upper bound: `consumed`/`examined` must not go backwards relative to `_totalConsumed`/`_totalExamined`; `consumed ≤ examined`; `examined ≤ _lastAcquiredWriterState.TotalWritten` (after `TryAcquire`). Out-of-range positions throw `InvalidOperationException`. The buffer-specific upper bound (within previous `ReadResult.Buffer`) is **not** validated — documented BCL divergence; catches silent-hang but not stale-`SequencePosition` corruption. |
 | **R9** | **Throw-first precedence.** Sync entry order in `ReadAsync`/`TryRead`: (1) `_readerCompleted` entry guard, (2) `TryAcquire` + integrate, (3) writer-completion-exception throw, (4) sticky cancel consume, (5) `ct.IsCancellationRequested`, (6) data/IsCompleted return, (7) park. Symmetric in `FlushAsync` (with the dual `TryAcquire`s for backpressure freshness). `BuildReadResult` produces `(IsCanceled, IsCompleted)` independently — both flags can be true simultaneously for `Writer.Complete(null)` reads. For `Writer.Complete(ex)` reads, the throw at step 3 fires first; cancel is permanently dropped. |
+| **R10** | **Continuation dispatch.** `_core.RunContinuationsAsynchronously = false`. After winning CAS Pending→Inactive, every signaler / canceler / token-callback / lost-wakeup re-check that calls `_core.SetResult` / `_core.SetException` does so via the stash-and-dispatch sequence: stash the result/exception on `_dispatchResult` / `_dispatchException`, call `(_options.ContinuationDispatcher ?? ThreadPoolContinuationDispatcher.Instance).UnsafeQueueUserWorkItem(s_dispatchCallback, awaiter)`, and let the dispatched callback clear the stash and call `_core.Set*`. Sync data returns built directly into a `ValueTask<T>` via `BuildReadResult` / `BuildFlushResult` are exempt (no continuation, no dispatch). |
 
 ## Conventions
 
