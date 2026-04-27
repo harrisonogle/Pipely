@@ -18,8 +18,8 @@ namespace SpscPipelines.HotHandoff;
 /// </list>
 ///
 /// <para>
-/// State <c>Busy | ShutdownRequested</c> = 2 (Vacant + ShutdownRequested) is terminal:
-/// no Dispatch can claim, the loop exits, no callback is dropped. See
+/// State 2 (<c>ShutdownRequested</c> set, <c>Busy</c> clear — i.e., Vacant + ShutdownRequested)
+/// is terminal: no Dispatch can claim, the loop exits, no callback is dropped. See
 /// <c>docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md</c> for the
 /// full spec and four-races correctness argument.
 /// </para>
