@@ -67,9 +67,9 @@ static async Task RunLatencyBenchmarks(int count, int size, int trials)
         using (var spsc = new SpscPipeAdapter())
             spscStats = await LatencyHarness.Run(spsc, samples, size);
 
-        LatencyHarness.PrintComparison("Transfer", "BCL Pipe", bclStats.Transfer, "SpscPipe", spscStats.Transfer);
-        LatencyHarness.PrintComparison("FlushAsync", "BCL Pipe", bclStats.FlushAsync, "SpscPipe", spscStats.FlushAsync);
-        LatencyHarness.PrintComparison("ReadAsync", "BCL Pipe", bclStats.ReadAsync, "SpscPipe", spscStats.ReadAsync);
+        LatencyHarness.PrintComparison("Transfer", "BCL Pipe", bclStats.Message, "SpscPipe", spscStats.Message);
+        LatencyHarness.PrintComparison("FlushAsync", "BCL Pipe", bclStats.Flush, "SpscPipe", spscStats.Flush);
+        LatencyHarness.PrintComparison("ReadAsync", "BCL Pipe", bclStats.Read, "SpscPipe", spscStats.Read);
     }
     else
     {
@@ -87,9 +87,13 @@ static async Task RunLatencyBenchmarks(int count, int size, int trials)
 
             Console.WriteLine();
             Console.WriteLine($"=== Trial {t}/{trials} ===");
-            LatencyHarness.PrintComparison("Transfer", "BCL Pipe", bclStats.Transfer, "SpscPipe", spscStats.Transfer);
-            LatencyHarness.PrintComparison("FlushAsync", "BCL Pipe", bclStats.FlushAsync, "SpscPipe", spscStats.FlushAsync);
-            LatencyHarness.PrintComparison("ReadAsync", "BCL Pipe", bclStats.ReadAsync, "SpscPipe", spscStats.ReadAsync);
+            LatencyHarness.PrintComparison(nameof(bclStats.Message), "BCL Pipe", bclStats.Message, "SpscPipe", spscStats.Message);
+            LatencyHarness.PrintComparison(nameof(bclStats.Flush), "BCL Pipe", bclStats.Flush, "SpscPipe", spscStats.Flush);
+            LatencyHarness.PrintComparison(nameof(bclStats.SyncFlush), "BCL Pipe", bclStats.SyncFlush, "SpscPipe", spscStats.SyncFlush);
+            LatencyHarness.PrintComparison(nameof(bclStats.AsyncFlush), "BCL Pipe", bclStats.AsyncFlush, "SpscPipe", spscStats.AsyncFlush);
+            LatencyHarness.PrintComparison(nameof(bclStats.Read), "BCL Pipe", bclStats.Read, "SpscPipe", spscStats.Read);
+            LatencyHarness.PrintComparison(nameof(bclStats.SyncRead), "BCL Pipe", bclStats.SyncRead, "SpscPipe", spscStats.SyncRead);
+            LatencyHarness.PrintComparison(nameof(bclStats.AsyncRead), "BCL Pipe", bclStats.AsyncRead, "SpscPipe", spscStats.AsyncRead);
         }
     }
 }

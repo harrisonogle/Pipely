@@ -1,10 +1,14 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Globalization;
+using System.IO.Pipelines;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace SpscPipe.Benchmarks;
 
 internal sealed record SampleStats(
+    long Count,
     long MinTicks,
     long P50Ticks,
     long P90Ticks,
@@ -18,9 +22,13 @@ internal sealed record SampleStats(
 internal sealed record LatencyStats(
     int Messages,
     int MessageBytes,
-    SampleStats Transfer,
-    SampleStats FlushAsync,
-    SampleStats ReadAsync
+    SampleStats Message,
+    SampleStats Flush,
+    SampleStats SyncFlush,
+    SampleStats AsyncFlush,
+    SampleStats Read,
+    SampleStats SyncRead,
+    SampleStats AsyncRead
 );
 
 internal sealed class LatencySamples
@@ -30,15 +38,23 @@ internal sealed class LatencySamples
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(count);
 
         Count = count;
-        Transfer = Initialize(count);
-        FlushAsync = Initialize(count);
-        ReadAsync = Initialize(count);
+        Message = Initialize(count);
+        Flush = Initialize(count);
+        SyncFlush = Initialize(count);
+        AsyncFlush = Initialize(count);
+        Read = Initialize(count);
+        SyncRead = Initialize(count);
+        AsyncRead = Initialize(count);
     }
 
     public readonly int Count;
-    public readonly long[] Transfer;
-    public readonly long[] FlushAsync;
-    public readonly long[] ReadAsync;
+    public readonly long[] Message;
+    public readonly long[] Flush;
+    public readonly long[] SyncFlush;
+    public readonly long[] AsyncFlush;
+    public readonly long[] Read;
+    public readonly long[] SyncRead;
+    public readonly long[] AsyncRead;
 
     private static long[] Initialize(int count)
     {
@@ -67,17 +83,20 @@ internal static class LatencyHarness
     // The sample buffer is caller-owned so it can be reused across trials without re-allocating
     // (which would add GC pressure that confounds the very runtime-drift we may be measuring).
     // Caller is responsible for pre-touching pages before the first call.
-    public static async Task<LatencyStats> Run(IPipeAdapter adapter, LatencySamples latencySamples, int messageBytes)
+    public static async Task<LatencyStats> Run(IPipeAdapter adapter, LatencySamples samples, int messageBytes)
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (8-byte timestamp prefix)");
 
-        int messages = latencySamples.Count;
+        int messages = samples.Count;
         long bytesTotal = (long)messages * messageBytes;
-        long[] samples = latencySamples.Transfer;
-        long[] flushSamples = latencySamples.FlushAsync;
-        long[] readSamples = latencySamples.ReadAsync;
 
-        int readSampleIdx = 0;
+        int messageIdx = 0;
+        int flushIdx = 0;
+        int syncFlushIdx = 0;
+        int asyncFlushIdx = 0;
+        int readIdx = 0;
+        int syncReadIdx = 0;
+        int asyncReadIdx = 0;
 
         var producer = Task.Run(async () =>
         {
@@ -87,9 +106,22 @@ internal static class LatencyHarness
                 long t0 = Stopwatch.GetTimestamp();
                 MemoryMarshal.Write(mem.Span, in t0);
                 adapter.Writer.Advance(messageBytes);
-                var fr = await adapter.Writer.FlushAsync();
-                long flushTicks = Stopwatch.GetTimestamp();
-                flushSamples[i] = flushTicks - t0;
+                var flushTask = adapter.Writer.FlushAsync();
+                FlushResult fr;
+                long flushTicks;
+                if (flushTask.IsCompleted)
+                {
+                    fr = flushTask.Result;
+                    flushTicks = Stopwatch.GetTimestamp();
+                    samples.SyncFlush[syncFlushIdx++] = flushTicks - t0;
+                }
+                else
+                {
+                    fr = await flushTask;
+                    flushTicks = Stopwatch.GetTimestamp();
+                    samples.AsyncFlush[asyncFlushIdx++] = flushTicks - t0;
+                }
+                samples.Flush[flushIdx++] = flushTicks - t0;
                 if (fr.IsCompleted) break;
             }
             adapter.Writer.Complete();
@@ -98,21 +130,33 @@ internal static class LatencyHarness
         var consumer = Task.Run(async () =>
         {
             long consumed = 0;
-            int sampleIdx = 0;
             byte[] tsBuf = new byte[8];
             while (consumed < bytesTotal)
             {
                 long t0 = Stopwatch.GetTimestamp();
-                var rr = await adapter.Reader.ReadAsync();
-                long readTicks = Stopwatch.GetTimestamp();
-                readSamples[readSampleIdx++] = readTicks - t0;
+                ReadResult rr;
+                long readTicks;
+                ValueTask<ReadResult> readTask = adapter.Reader.ReadAsync();
+                if (readTask.IsCompleted)
+                {
+                    rr = readTask.Result;
+                    readTicks = Stopwatch.GetTimestamp();
+                    samples.SyncRead[syncReadIdx++] = readTicks - t0;
+                }
+                else
+                {
+                    rr = await readTask;
+                    readTicks = Stopwatch.GetTimestamp();
+                    samples.AsyncRead[asyncReadIdx++] = readTicks - t0;
+                }
+                samples.Read[readIdx++] = readTicks - t0;
                 var buf = rr.Buffer;
                 while (buf.Length >= messageBytes)
                 {
                     buf.Slice(0, 8).CopyTo(tsBuf);
                     long sentTicks = MemoryMarshal.Read<long>(tsBuf);
                     long now = Stopwatch.GetTimestamp();
-                    samples[sampleIdx++] = now - sentTicks;
+                    samples.Message[messageIdx++] = now - sentTicks;
                     consumed += messageBytes;
                     buf = buf.Slice(messageBytes);
                 }
@@ -125,31 +169,70 @@ internal static class LatencyHarness
 
         await Task.WhenAll(producer, consumer);
 
-        return new LatencyStats(
+        var messageSamples = samples.Message.AsSpan(0, messageIdx);
+        var flushSamples = samples.Flush.AsSpan(0, flushIdx);
+        var syncFlushSamples = samples.SyncFlush.AsSpan(0, syncFlushIdx);
+        var asyncFlushSamples = samples.AsyncFlush.AsSpan(0, asyncFlushIdx);
+        var readSamples = samples.Read.AsSpan(0, readIdx);
+        var syncReadSamples = samples.SyncRead.AsSpan(0, syncReadIdx);
+        var asyncReadSamples = samples.AsyncRead.AsSpan(0, asyncReadIdx);
+
+        var result = new LatencyStats(
             Messages: messages,
             MessageBytes: messageBytes,
-            Transfer: ComputeStatistics(latencySamples.Transfer),
-            FlushAsync: ComputeStatistics(latencySamples.FlushAsync),
-            ReadAsync: ComputeStatistics(latencySamples.ReadAsync.AsSpan(0, readSampleIdx))
+            Message: ComputeStatistics(messageSamples),
+            Flush: ComputeStatistics(flushSamples),
+            SyncFlush: ComputeStatistics(syncFlushSamples),
+            AsyncFlush: ComputeStatistics(asyncFlushSamples),
+            Read: ComputeStatistics(readSamples),
+            SyncRead: ComputeStatistics(syncReadSamples),
+            AsyncRead: ComputeStatistics(asyncReadSamples)
         );
+
+        messageSamples.Clear();
+        flushSamples.Clear();
+        syncFlushSamples.Clear();
+        asyncFlushSamples.Clear();
+        readSamples.Clear();
+        syncReadSamples.Clear();
+        asyncReadSamples.Clear();
+
+        return result;
 
         SampleStats ComputeStatistics(Span<long> samples)
         {
-            samples.Sort();
-            long freq = Stopwatch.Frequency;
-            double meanTicks = 0;
-            for (int i = 0; i < samples.Length; i++) meanTicks += samples[i];
-            meanTicks /= samples.Length;
+            if (samples.Length > 0)
+            {
+                samples.Sort();
+                long freq = Stopwatch.Frequency;
+                double meanTicks = 0;
+                for (int i = 0; i < samples.Length; i++) meanTicks += samples[i];
+                meanTicks /= samples.Length;
 
-            return new SampleStats(
-                MinTicks: samples[0],
-                P50Ticks: Percentile(samples, 0.50),
-                P90Ticks: Percentile(samples, 0.90),
-                P99Ticks: Percentile(samples, 0.99),
-                P999Ticks: Percentile(samples, 0.999),
-                MaxTicks: samples[^1],
-                MeanTicks: meanTicks,
-                Frequency: freq);
+                return new SampleStats(
+                    Count: samples.Length,
+                    MinTicks: samples[0],
+                    P50Ticks: Percentile(samples, 0.50),
+                    P90Ticks: Percentile(samples, 0.90),
+                    P99Ticks: Percentile(samples, 0.99),
+                    P999Ticks: Percentile(samples, 0.999),
+                    MaxTicks: samples[^1],
+                    MeanTicks: meanTicks,
+                    Frequency: freq);
+            }
+            else
+            {
+                return new SampleStats(
+                    Count: samples.Length,
+                    MinTicks: -1,
+                    P50Ticks: -1,
+                    P90Ticks: -1,
+                    P99Ticks: -1,
+                    P999Ticks: -1,
+                    MaxTicks: -1,
+                    MeanTicks: -1,
+                    Frequency: -1);
+            }
         }
     }
 
@@ -159,8 +242,9 @@ internal static class LatencyHarness
     public static void PrintComparison(string statName, string baselineLabel, SampleStats baseline, string compareLabel, SampleStats compare)
     {
         Console.WriteLine();
-        Console.WriteLine($"| {statName,-12} | {baselineLabel,14} | {compareLabel,14} | Ratio |");
-        Console.WriteLine($"|:-------------|---------------:|---------------:|------:|");
+        Console.WriteLine($"| {statName,-12} | {baselineLabel,12} | {compareLabel,12} |  Ratio |");
+        Console.WriteLine($"|:-------------|-------------:|-------------:|-------:|");
+        PrintRow("Count", baseline.Count, compare.Count);
         PrintRow("Min", baseline.MinTicks, compare.MinTicks, baseline.Frequency, compare.Frequency);
         PrintRow("P50", baseline.P50Ticks, compare.P50Ticks, baseline.Frequency, compare.Frequency);
         PrintRow("P90", baseline.P90Ticks, compare.P90Ticks, baseline.Frequency, compare.Frequency);
@@ -174,8 +258,18 @@ internal static class LatencyHarness
     {
         double baselineNs = TicksToNs(baselineTicks, baselineFreq);
         double compareNs = TicksToNs(compareTicks, compareFreq);
-        double ratio = compareNs / baselineNs;
-        Console.WriteLine($"| {label,-12} | {baselineNs,11:N0} ns | {compareNs,11:N0} ns | {ratio,5:F2} |");
+        string ratio = compareNs < 0 || baselineNs < 0
+            ? "N/A"
+            : string.Format(CultureInfo.InvariantCulture, "{0,6:F2}", compareNs / baselineNs);
+        Console.WriteLine($"| {label,-12} | {baselineNs,11:N0}  | {compareNs,11:N0}  | {ratio} |");
+    }
+
+    private static void PrintRow(string label, double baselineValue, double compareValue)
+    {
+        string ratio = compareValue < 0 || baselineValue < 0
+            ? "N/A"
+            : string.Format(CultureInfo.InvariantCulture, "{0,6:F2}", compareValue / baselineValue);
+        Console.WriteLine($"| {label,-12} | {baselineValue,11:N0}  | {compareValue,11:N0}  | {ratio} |");
     }
 
     // Nearest-rank percentile: index = ceil(p * n) - 1, clamped to [0, n-1].
