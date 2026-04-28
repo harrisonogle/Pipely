@@ -12,8 +12,7 @@ public class DispatcherThroughputBench
 {
     // TEMPORARY workload — matches the latency CLI's MHz-rate per-message run
     // (1 M messages × 256 B, timestamp-only producer writes, no chunk-copy
-    // fill) so BDN can measure the same workload the latency CLI is measuring
-    // and we can isolate any methodology divergence between the two.
+    // fill) so BDN can measure the same workload the latency CLI is measuring.
     //
     // Original throughput-shape configuration, for reversion:
     //     private const int TotalBytes = 1 << 20;        // 1 MiB per iteration
@@ -24,21 +23,16 @@ public class DispatcherThroughputBench
     private const int MessageCount = 1_000_000;
     private const int ChunkSize    = 256;
 
-    // Constructed once per benchmark run, reused across all iterations.
     private HotHandoffContinuationDispatcher? _dispatcher;
 
     // TEMPORARY latency instrumentation — replicates the latency CLI's
-    // per-message processing inside BDN so we can measure the same workload
-    // both ways and compare. Per-iteration P50/P99/Mean from this samples
-    // array + per-iteration slot/TP deltas from the dispatcher's counters
-    // are captured in [IterationCleanup] and printed in [GlobalCleanup].
+    // per-message processing inside BDN so the workload matches exactly.
+    // The samples[] is pre-allocated in [GlobalSetup] (8 MB once, not per
+    // iteration) so MemoryDiagnoser still reports honest per-iteration
+    // allocations from the workload itself. Aggregate stats are printed
+    // once in [GlobalCleanup] at the end of all iterations.
     private long[] _samples = null!;
-    private int _filledSamples;
-    private long _prevSlot;
-    private long _prevTp;
-    private readonly List<IterStats> _iterStats = new();
-
-    private record struct IterStats(long P50Ns, long P99Ns, long MeanNs, long SlotDispatched, long TpOverflowed);
+    private long _totalSamplesRecorded;
 
     [GlobalSetup]
     public void SetupSamples()
@@ -47,59 +41,64 @@ public class DispatcherThroughputBench
         // Pre-touch every 4 KiB page (each long = 8 B → 512 longs per page).
         for (int i = 0; i < _samples.Length; i += 512) _samples[i] = 1;
         Array.Clear(_samples);
-        _filledSamples = 0;
-        _prevSlot = 0;
-        _prevTp = 0;
-        _iterStats.Clear();
+        _totalSamplesRecorded = 0;
     }
 
     [GlobalSetup(Target = nameof(SpscPipe_HotHandoff_ProduceAndDrain))]
     public void SetupHotHandoff() => _dispatcher = new HotHandoffContinuationDispatcher();
 
     [GlobalCleanup(Target = nameof(SpscPipe_HotHandoff_ProduceAndDrain))]
-    public void CleanupHotHandoff() => _dispatcher?.Dispose();
-
-    [IterationCleanup]
-    public void CapturePerIteration()
+    public void CleanupHotHandoff()
     {
-        if (_filledSamples == 0) { _iterStats.Add(default); return; }
-        var span = _samples.AsSpan(0, _filledSamples);
-        span.Sort();
-        long freq = Stopwatch.Frequency;
-        long p50  = TicksToNs(span[span.Length / 2], freq);
-        long p99  = TicksToNs(span[Math.Min(span.Length - 1, (int)(span.Length * 0.99))], freq);
-        double sum = 0;
-        for (int i = 0; i < span.Length; i++) sum += span[i];
-        long mean = TicksToNs((long)(sum / span.Length), freq);
+        long slot = _dispatcher?.SlotDispatchedCount ?? 0;
+        long tp   = _dispatcher?.TpOverflowedCount ?? 0;
+        long total = slot + tp;
+        _dispatcher?.Dispose();
 
-        long slotDelta = 0, tpDelta = 0;
-        if (_dispatcher is not null)
-        {
-            long currSlot = _dispatcher.SlotDispatchedCount;
-            long currTp   = _dispatcher.TpOverflowedCount;
-            slotDelta = currSlot - _prevSlot;
-            tpDelta   = currTp   - _prevTp;
-            _prevSlot = currSlot;
-            _prevTp   = currTp;
-        }
-
-        _iterStats.Add(new IterStats(p50, p99, mean, slotDelta, tpDelta));
-        _filledSamples = 0;
+        Console.WriteLine();
+        Console.WriteLine($"--- HotHandoff cumulative dispatch breakdown over benchmark ---");
+        Console.WriteLine($"  Slot (worker thread): {slot,12:N0}");
+        Console.WriteLine($"  TP overflow:          {tp,12:N0}");
+        Console.WriteLine($"  Total:                {total,12:N0}");
+        if (total > 0)
+            Console.WriteLine($"  Slot share:           {100.0 * slot / total,12:F2}%");
     }
 
     [GlobalCleanup]
-    public void PrintPerIterationStats()
+    public void PrintLastIterationLatency()
     {
-        if (_iterStats.Count == 0) return;
+        // The samples[] array contains the LAST iteration's per-message
+        // latencies (the consumer overwrites it each iteration). With BDN
+        // running many measured iterations, this is the snapshot from the
+        // final one — useful as a sanity check on the latency-CLI comparison
+        // without involving iteration-boundary hooks (which proved fragile).
+        long count = Volatile.Read(ref _totalSamplesRecorded);
+        if (count == 0) return;
+
+        // Sort just the populated portion; samples are reused across iterations.
+        int n = (int)Math.Min(count, _samples.Length);
+        var span = _samples.AsSpan(0, n);
+        span.Sort();
+        long freq = Stopwatch.Frequency;
+        long min  = TicksToNs(span[0],                                      freq);
+        long p50  = TicksToNs(span[n / 2],                                  freq);
+        long p90  = TicksToNs(span[Math.Min(n - 1, (int)(n * 0.90))],       freq);
+        long p99  = TicksToNs(span[Math.Min(n - 1, (int)(n * 0.99))],       freq);
+        long p999 = TicksToNs(span[Math.Min(n - 1, (int)(n * 0.999))],      freq);
+        long max  = TicksToNs(span[n - 1],                                  freq);
+        double sum = 0;
+        for (int i = 0; i < n; i++) sum += span[i];
+        long mean = TicksToNs((long)(sum / n), freq);
+
         Console.WriteLine();
-        Console.WriteLine($"--- Per-iteration latency + dispatch breakdown ({_iterStats.Count} iterations, including warmup) ---");
-        Console.WriteLine($"| Iter |   P50 (ns) |   P99 (ns) |  Mean (ns) |       Slot |        TP |");
-        Console.WriteLine($"|-----:|-----------:|-----------:|-----------:|-----------:|----------:|");
-        for (int i = 0; i < _iterStats.Count; i++)
-        {
-            var s = _iterStats[i];
-            Console.WriteLine($"| {i,4} | {s.P50Ns,10:N0} | {s.P99Ns,10:N0} | {s.MeanNs,10:N0} | {s.SlotDispatched,10:N0} | {s.TpOverflowed,9:N0} |");
-        }
+        Console.WriteLine($"--- Last-iteration per-message latency (n={n:N0}) ---");
+        Console.WriteLine($"  Min   : {min,10:N0} ns");
+        Console.WriteLine($"  P50   : {p50,10:N0} ns");
+        Console.WriteLine($"  P90   : {p90,10:N0} ns");
+        Console.WriteLine($"  P99   : {p99,10:N0} ns");
+        Console.WriteLine($"  P99.9 : {p999,10:N0} ns");
+        Console.WriteLine($"  Max   : {max,10:N0} ns");
+        Console.WriteLine($"  Mean  : {mean,10:N0} ns");
     }
 
     // BCL System.IO.Pipelines.Pipe — TP-driven continuations, default options
@@ -183,7 +182,7 @@ public class DispatcherThroughputBench
         });
 
         await Task.WhenAll(producer, consumer);
-        _filledSamples = messageIdx;
+        Volatile.Write(ref _totalSamplesRecorded, messageIdx);
     }
 
     private static long TicksToNs(long ticks, long freq) => (long)(ticks * 1_000_000_000.0 / freq);
