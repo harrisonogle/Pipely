@@ -10,6 +10,7 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
     public int End { get; private set; }
     public new BufferSegment? Next { get; private set; }
     public object? OwnerToken { get; private set; }   // R4-7
+    public bool    IsDonated  { get; private set; }   // recycle-path discriminator (donated vs rented)
 
     public void RentFrom(MemoryPool<byte> pool, int sizeHint, long runningIndex, object owner)
     {
@@ -21,6 +22,24 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
         Next              = null;
         base.Next         = null;
         OwnerToken        = owner;
+        IsDonated         = false;
+    }
+
+    // Adopts a foreign IMemoryOwner<byte> for buffer-ownership transfer (Append).
+    // Caller passes a pre-computed slice of `owner.Memory` so this method is allocation- and throw-free.
+    // Preconditions (caller-validated):
+    //   owner != null, slice.Length > 0, slice originates from owner.Memory.
+    public void AdoptFrom(IMemoryOwner<byte> owner, Memory<byte> slice, long runningIndex, object pipeOwner)
+    {
+        _memoryOwner      = owner;
+        AvailableMemory   = slice;
+        base.Memory       = slice;
+        base.RunningIndex = runningIndex;
+        End               = slice.Length;
+        Next              = null;
+        base.Next         = null;
+        OwnerToken        = pipeOwner;
+        IsDonated         = true;
     }
 
     public void Freeze(int bytesFilled, BufferSegment? next)
@@ -33,6 +52,7 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
 
     public void RecycleReset(long runningIndex)
     {
+        System.Diagnostics.Debug.Assert(!IsDonated, "RecycleReset must not be called on donated segments.");
         base.RunningIndex = runningIndex;
         base.Memory       = AvailableMemory;
         End               = 0;
