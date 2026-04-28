@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Runtime.InteropServices;
@@ -82,31 +83,57 @@ public class DispatcherThroughputBench
 
     private static async Task ProduceAndDrain(PipeReader reader, PipeWriter writer)
     {
+        // TEMPORARY (Mechanism-A diagnostic) — bringing back the per-message
+        // consumer that deadlocked in commits 0d10225 / 032528f, BUT with
+        // ConfigureAwait(false) on every await in producer and consumer. If
+        // the deadlock was from SC/TaskScheduler capture by the consumer's
+        // await (Mechanism A), suppressing that capture should make this run
+        // cleanly. If it still hangs, the cause is somewhere else (Mechanism
+        // B / SuppressFlow, or something else entirely).
+        long bytesTotal = (long)MessageCount * ChunkSize;
+
         var producer = Task.Run(async () =>
         {
-            // Latency CLI's timestamp-only producer pattern.
             for (int i = 0; i < MessageCount; i++)
             {
                 var memory = writer.GetMemory(ChunkSize);
                 long t = Stopwatch.GetTimestamp();
                 MemoryMarshal.Write(memory.Span, in t);
                 writer.Advance(ChunkSize);
-                await writer.FlushAsync();
+                await writer.FlushAsync().ConfigureAwait(false);
             }
             writer.Complete();
         });
 
         var consumer = Task.Run(async () =>
         {
-            while (true)
+            // Per-message-processing consumer (matches latency CLI's pattern,
+            // which is what triggered the BDN deadlock). Local samples array
+            // — fresh per benchmark invocation, no shared field.
+            var samples = new long[MessageCount];
+            long consumed = 0;
+            int messageIdx = 0;
+            byte[] tsBuf = new byte[8];
+            while (consumed < bytesTotal)
             {
-                var result = await reader.ReadAsync();
-                reader.AdvanceTo(result.Buffer.End);
-                if (result.IsCompleted) break;
+                var rr = await reader.ReadAsync().ConfigureAwait(false);
+                var buf = rr.Buffer;
+                while (buf.Length >= ChunkSize)
+                {
+                    buf.Slice(0, 8).CopyTo(tsBuf);
+                    long sentTicks = MemoryMarshal.Read<long>(tsBuf);
+                    long now = Stopwatch.GetTimestamp();
+                    samples[messageIdx++] = now - sentTicks;
+                    consumed += ChunkSize;
+                    buf = buf.Slice(ChunkSize);
+                }
+                long consumedThisRead = rr.Buffer.Length - buf.Length;
+                reader.AdvanceTo(rr.Buffer.GetPosition(consumedThisRead), rr.Buffer.End);
+                if (rr.IsCompleted && consumed >= bytesTotal) break;
             }
             reader.Complete();
         });
 
-        await Task.WhenAll(producer, consumer);
+        await Task.WhenAll(producer, consumer).ConfigureAwait(false);
     }
 }
