@@ -38,6 +38,25 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
     private object? _pendingState;
     private readonly Thread _thread;
 
+    // Diagnostic-only telemetry (spec §10 "may be added if measurements indicate
+    // a need"). Cumulative since dispatcher construction. Not part of the public
+    // contract; exposed via internal accessors for the benchmark project.
+    private long _slotDispatchedCount;
+    private long _tpOverflowedCount;
+
+    /// <summary>
+    /// Cumulative count of dispatches whose slot CAS won and ran on the dedicated
+    /// worker thread. Internal — for benchmark diagnostics only.
+    /// </summary>
+    internal long SlotDispatchedCount => Interlocked.Read(ref _slotDispatchedCount);
+
+    /// <summary>
+    /// Cumulative count of dispatches whose slot CAS lost and were forwarded to
+    /// <see cref="ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/>.
+    /// Internal — for benchmark diagnostics only.
+    /// </summary>
+    internal long TpOverflowedCount => Interlocked.Read(ref _tpOverflowedCount);
+
     public HotHandoffContinuationDispatcher()
     {
         _thread = new Thread(Loop)
@@ -55,12 +74,14 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
         {
             _pendingState = state;                            // plain
             Interlocked.Exchange(ref _pending, callback);     // full fence: publishes both fields
+            Interlocked.Increment(ref _slotDispatchedCount);  // diagnostic — see §10 / SlotDispatchedCount
             return;
         }
 
         // Slot busy or shutdown — fall through to TP. UnsafeQueueUserWorkItem
         // (not QueueUserWorkItem or Task.Run) — IContinuationDispatcher contract item #2.
         ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
+        Interlocked.Increment(ref _tpOverflowedCount);        // diagnostic — see §10 / TpOverflowedCount
     }
 
     private void Loop()

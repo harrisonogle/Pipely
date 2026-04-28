@@ -79,9 +79,30 @@ static async Task RunLatency(int count, int size, int trials, int warmup)
         var tpStats = await DispatcherLatencyHarness.Run(null, count, size);
 
         LatencyStats hhStats;
+        long slotDispatched, tpOverflowed;
         using (var dispatcher = new HotHandoffContinuationDispatcher())
-            hhStats = await DispatcherLatencyHarness.Run(dispatcher, count, size);
+        {
+            hhStats        = await DispatcherLatencyHarness.Run(dispatcher, count, size);
+            slotDispatched = dispatcher.SlotDispatchedCount;
+            tpOverflowed   = dispatcher.TpOverflowedCount;
+        }
 
         DispatcherLatencyHarness.PrintComparison("Message latency (ns)", tpStats, hhStats);
+        PrintDispatchBreakdown(slotDispatched, tpOverflowed);
     }
+}
+
+static void PrintDispatchBreakdown(long slot, long tp)
+{
+    long total = slot + tp;
+    if (total == 0) return;
+    double slotPct = 100.0 * slot / total;
+    double tpPct   = 100.0 * tp   / total;
+    Console.WriteLine();
+    Console.WriteLine("=== HotHandoff dispatch breakdown ===");
+    Console.WriteLine($"| Path                 |       Count |    %    |");
+    Console.WriteLine($"|:---------------------|------------:|--------:|");
+    Console.WriteLine($"| Slot (worker thread) | {slot,11:N0} | {slotPct,6:F2}% |");
+    Console.WriteLine($"| TP overflow          | {tp,11:N0} | {tpPct,6:F2}% |");
+    Console.WriteLine($"| Total                | {total,11:N0} | 100.00% |");
 }

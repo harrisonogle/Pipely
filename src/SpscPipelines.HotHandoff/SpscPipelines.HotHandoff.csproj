@@ -11,4 +11,10 @@
     <ProjectReference Include="..\SpscPipelines\SpscPipelines.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Exposes diagnostic-only telemetry (SlotDispatchedCount / TpOverflowedCount)
+         to the benchmark project; not part of the public contract. -->
+    <InternalsVisibleTo Include="SpscPipelines.HotHandoff.Benchmarks" />
+  </ItemGroup>
+
 </Project>
