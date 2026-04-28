@@ -379,7 +379,7 @@ Three groups, mirroring the existing test layout under `tests/`.
 - `AdoptFrom_SetsFieldsCorrectly` — calls `AdoptFrom(owner, slice, runningIndex, pipeOwner)`; verifies `AvailableMemory == slice`, `base.Memory == slice`, `End == slice.Length`, `RunningIndex == passed`, `Next == null`, `OwnerToken == pipeOwner`, `IsDonated == true`.
 - `AdoptFrom_ThenDisposeOwned_DisposesOriginalOwner` — uses a tracking `IMemoryOwner` mock; verifies `Dispose` count == 1 after `DisposeOwned`.
 - `RentFrom_ResetsIsDonated` — segment recycled from a previous donate-or-rent path with `IsDonated == true`-or-`false` via `RentFrom` ends up with `IsDonated == false`.
-- `RecycleReset_AssertsNotDonated` — defensive (DEBUG-only assertion path).
+- ~~`RecycleReset_AssertsNotDonated`~~ — deferred. The `Debug.Assert` is documentation of the invariant; testing it requires `#if DEBUG`-guarded trace-listener swapping which is brittle and offers little value over the inline assertion itself.
 - `Freeze_OnDonatedSegment_IsIdempotent` — pin the documented "End/Memory writes are idempotent" property: `donated.Freeze(donated.End, next)` produces same `End`/`base.Memory` and updated `Next`.
 
 ### 10.2 — `SpscPipeWriterAppendTests` (new file)

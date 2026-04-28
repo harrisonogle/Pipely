@@ -412,30 +412,48 @@ public class SpscPipeWriterAppendTests
     // ---------- Recycle path: donated -> DisposeOwned + drop; rented -> freelist (unchanged) ----------
 
     [Fact]
-    public async Task ReaderDrainsPastDonated_DisposesOwner_FreelistCountUnchanged()
+    public async Task ReaderDrainsPastDonated_DisposesOwner_FreelistDoesNotAbsorbIt()
     {
+        // Use a donated-only chain (donated1 + donated2) so the freelist count assertion
+        // is exact: zero donated segments should land in the freelist regardless of the
+        // recycle path's behavior on rented segments.
         using var pipe = new SpscPipelines.SpscPipe();
-        var donatedOwner = new TrackingMemoryOwner(30);
-        pipe.Writer.Append(donatedOwner);
-        // Force a subsequent rented tail so the donated segment becomes a non-tail chain segment.
-        pipe.Writer.GetMemory(50); pipe.Writer.Advance(50);
-
-        await pipe.Writer.FlushAsync();
-        var rr = await pipe.Reader.ReadAsync();
-        // Drain past the donated segment (and the rented bytes) entirely.
-        pipe.Reader.AdvanceTo(rr.Buffer.End);
+        var donated1 = new TrackingMemoryOwner(30);
+        var donated2 = new TrackingMemoryOwner(20);
+        pipe.Writer.Append(donated1);
+        pipe.Writer.Append(donated2);
 
         int freelistBefore = pipe._freelistCount;
 
-        // The next FlushAsync runs RecycleDrainedSegments after re-acquiring the reader state.
+        await pipe.Writer.FlushAsync();
+        var rr = await pipe.Reader.ReadAsync();
+        // Drain past donated1 (consume the first 30 bytes; donated2 stays as _writingHead).
+        pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(30));
+
+        // Next FlushAsync runs RecycleDrainedSegments and recycles donated1.
         await pipe.Writer.FlushAsync();
 
-        Assert.Equal(1, donatedOwner.DisposeCount);
-        // freelistCount may have grown by 1 (the rented segment that was once the writingHead
-        // before GetMemory transitioned past it — but in this minimal scenario,
-        // _writingHead never transitioned again, so the rented tail stays as _writingHead and
-        // recycle stops at it). Either way, it must NOT have grown to absorb the donated segment.
-        Assert.True(pipe._freelistCount <= freelistBefore + 1);
+        // donated1 is foreign-owner: must be Disposed, must NOT enter the freelist.
+        Assert.Equal(1, donated1.DisposeCount);
+        Assert.Equal(freelistBefore, pipe._freelistCount);
+        // donated2 is still the active tail; not yet recycled.
+        Assert.Equal(0, donated2.DisposeCount);
+    }
+
+    [Fact]
+    public async Task AdvanceTo_PositionInsideDonatedSegment_Succeeds()
+    {
+        // Same-pipe AdvanceTo to a SequencePosition inside a donated segment must work
+        // (R4-7 pipe-identity check at SpscPipe.Reader.cs:113 sees OwnerToken == pipe).
+        using var pipe = new SpscPipelines.SpscPipe();
+        var owner = new TrackingMemoryOwner(40);
+        pipe.Writer.Append(owner);
+
+        await pipe.Writer.FlushAsync();
+        var rr = await pipe.Reader.ReadAsync();
+        // Mid-segment position (5 bytes into a 40-byte donated segment).
+        pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(5));
+        Assert.Equal(5L, pipe._totalConsumed);
     }
 
     [Fact]
