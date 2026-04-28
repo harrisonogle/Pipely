@@ -48,6 +48,9 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
         base.Memory = AvailableMemory.Slice(0, bytesFilled);
         Next        = next;
         base.Next   = next;
+        // IsDonated not touched: Freeze on a donated segment writes End/base.Memory to the
+        // same values they already hold (AdoptFrom sets End == slice.Length immediately).
+        // Only Next materially changes. See spec §2.2.
     }
 
     public void RecycleReset(long runningIndex)
