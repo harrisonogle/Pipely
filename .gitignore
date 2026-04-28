@@ -430,3 +430,6 @@ FodyWeavers.xsd
 
 # TLA+ / TLC model-checker output
 spec/tla/states/
+
+# Claude Code harness runtime state
+.claude/scheduled_tasks.lock
