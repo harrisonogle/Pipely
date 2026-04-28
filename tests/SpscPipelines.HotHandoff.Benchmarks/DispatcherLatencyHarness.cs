@@ -23,7 +23,17 @@ internal static class DispatcherLatencyHarness
     // finish, samples are sorted and exact percentiles are computed by index.
     //
     // dispatcher = null → SpscPipe uses the default ThreadPoolContinuationDispatcher.
-    public static async Task<LatencyStats> Run(IContinuationDispatcher? dispatcher, int messageCount, int messageBytes)
+    //
+    // copyChunk = false (default): producer writes only the 8-byte timestamp;
+    // remaining bytes in the rented buffer are uninitialized. This is the
+    // high-rate per-message latency workload (e.g., 1 M × 256 B).
+    //
+    // copyChunk = true: producer also copies a pre-allocated zero-filled
+    // message-sized chunk into the buffer, matching
+    // DispatcherThroughputBench.ProduceAndDrain's `chunk.CopyTo(memory)` pattern.
+    // Use with --count 256 --size 4096 for apples-to-apples with the BDN
+    // throughput row.
+    public static async Task<LatencyStats> Run(IContinuationDispatcher? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (timestamp prefix)");
 
@@ -40,13 +50,7 @@ internal static class DispatcherLatencyHarness
         long bytesTotal = (long)messageCount * messageBytes;
         int messageIdx = 0;
 
-        // Pre-allocated zero-filled chunk; producer copies it into each rented
-        // buffer (after stamping the timestamp into the first 8 bytes) so the
-        // per-message work matches DispatcherThroughputBench.ProduceAndDrain's
-        // `chunk.CopyTo(memory)` pattern. With --count 256 --size 4096 this
-        // harness now runs the same workload shape as the BDN throughput row;
-        // dispatcher event patterns and slot/TP overflow rates are comparable.
-        var chunk = new byte[messageBytes];
+        byte[]? chunk = copyChunk ? new byte[messageBytes] : null;
 
         var producer = Task.Run(async () =>
         {
@@ -55,7 +59,8 @@ internal static class DispatcherLatencyHarness
                 var mem = pipe.Writer.GetMemory(messageBytes);
                 long t = Stopwatch.GetTimestamp();
                 MemoryMarshal.Write(mem.Span, in t);
-                chunk.AsSpan(8).CopyTo(mem.Span.Slice(8));
+                if (chunk is not null)
+                    chunk.AsSpan(8).CopyTo(mem.Span.Slice(8));
                 pipe.Writer.Advance(messageBytes);
                 var fr = await pipe.Writer.FlushAsync();
                 if (fr.IsCompleted) break;

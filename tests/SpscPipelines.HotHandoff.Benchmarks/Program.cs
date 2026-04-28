@@ -38,17 +38,24 @@ var warmupOption = new Option<int>("--warmup")
     DefaultValueFactory = _ => 1,
 };
 
+var copyChunkOption = new Option<bool>("--copy-chunk")
+{
+    Description = "Producer copies a full message-sized zero-filled chunk into each rented buffer (matching DispatcherThroughputBench.ProduceAndDrain's `chunk.CopyTo(memory)` per-event memcpy). When omitted (default), only the 8-byte timestamp is written and remaining bytes are uninitialized — the high-rate per-message latency workload. Pair with --count 256 --size 4096 for apples-to-apples with the BDN throughput row.",
+    DefaultValueFactory = _ => false,
+};
+
 var latencyCommand = new Command("latency", "Run the latency comparison (tp-default vs hot-handoff)")
 {
-    countOption, sizeOption, trialsOption, warmupOption,
+    countOption, sizeOption, trialsOption, warmupOption, copyChunkOption,
 };
 latencyCommand.SetAction(async parseResult =>
 {
-    int count   = parseResult.GetValue(countOption);
-    int size    = parseResult.GetValue(sizeOption);
-    int trials  = parseResult.GetValue(trialsOption);
-    int warmup  = parseResult.GetValue(warmupOption);
-    await RunLatency(count, size, trials, warmup);
+    int count      = parseResult.GetValue(countOption);
+    int size       = parseResult.GetValue(sizeOption);
+    int trials     = parseResult.GetValue(trialsOption);
+    int warmup     = parseResult.GetValue(warmupOption);
+    bool copyChunk = parseResult.GetValue(copyChunkOption);
+    await RunLatency(count, size, trials, warmup, copyChunk);
     return 0;
 });
 
@@ -59,16 +66,17 @@ var rootCommand = new RootCommand("SpscPipelines.HotHandoff benchmark harness")
 
 return await rootCommand.Parse(args).InvokeAsync();
 
-static async Task RunLatency(int count, int size, int trials, int warmup)
+static async Task RunLatency(int count, int size, int trials, int warmup, bool copyChunk)
 {
-    Console.WriteLine($"Latency comparison: {count:N0} messages × {size} B, {trials} trials, {warmup} warmup");
+    string writeMode = copyChunk ? "full chunk copy" : "timestamp-only writes";
+    Console.WriteLine($"Latency comparison: {count:N0} messages × {size} B, {trials} trials, {warmup} warmup, {writeMode}");
 
     for (int w = 0; w < warmup; w++)
     {
         Console.WriteLine($"  Warmup trial {w + 1}/{warmup} (not recorded)");
-        _ = await DispatcherLatencyHarness.Run(null, count, size);
+        _ = await DispatcherLatencyHarness.Run(null, count, size, copyChunk);
         using var dispatcher = new HotHandoffContinuationDispatcher();
-        _ = await DispatcherLatencyHarness.Run(dispatcher, count, size);
+        _ = await DispatcherLatencyHarness.Run(dispatcher, count, size, copyChunk);
     }
 
     for (int t = 0; t < trials; t++)
@@ -76,13 +84,13 @@ static async Task RunLatency(int count, int size, int trials, int warmup)
         Console.WriteLine();
         Console.WriteLine($"=== Trial {t + 1}/{trials} ===");
 
-        var tpStats = await DispatcherLatencyHarness.Run(null, count, size);
+        var tpStats = await DispatcherLatencyHarness.Run(null, count, size, copyChunk);
 
         LatencyStats hhStats;
         long slotDispatched, tpOverflowed;
         using (var dispatcher = new HotHandoffContinuationDispatcher())
         {
-            hhStats        = await DispatcherLatencyHarness.Run(dispatcher, count, size);
+            hhStats        = await DispatcherLatencyHarness.Run(dispatcher, count, size, copyChunk);
             slotDispatched = dispatcher.SlotDispatchedCount;
             tpOverflowed   = dispatcher.TpOverflowedCount;
         }
