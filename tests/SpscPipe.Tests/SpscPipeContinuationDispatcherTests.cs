@@ -1,4 +1,5 @@
 using System.Threading;
+using System.Threading.Tasks.Sources;
 using SpscPipelines;
 using Xunit;
 
@@ -283,6 +284,21 @@ public class SpscPipeContinuationDispatcherTests
 
     // ---------- D. EC contract guard — dispatchers that capture EC are caught ----------
 
+    /// <summary>
+    /// Pins that a "bad" dispatcher (one that captures EC at queue time, e.g.,
+    /// uses ThreadPool.QueueUserWorkItem instead of UnsafeQueueUserWorkItem) does
+    /// NOT corrupt the consumer's continuation EC. Under the new source-side EC
+    /// capture wiring, the consumer's EC is captured by SpscAwaiter.OnCompleted
+    /// on the CONSUMER's thread — BEFORE the bad dispatcher ever sees the work
+    /// item. s_invokeWithEc applies the source-side-captured EC via
+    /// ExecutionContext.Run, regardless of what EC the bad dispatcher captured
+    /// in its UnsafeQueueUserWorkItem. The bad dispatcher's capture is wasted
+    /// work but does not break the consumer's continuation.
+    ///
+    /// (Historical note: under the OLD wiring, the protection came from
+    /// MRVTSC.RunInternal applying the consumer's captured EC at SetResult time.
+    /// Same observable assertions; different mechanism.)
+    /// </summary>
     [Fact]
     public async Task CustomDispatcher_BadImpl_CapturingEC_IsDetectable()
     {
@@ -327,11 +343,12 @@ public class SpscPipeContinuationDispatcherTests
         // captured EC for the continuation regardless of dispatcher).
         Assert.Equal(42, observedConsumer);
 
-        // The producer's EC, if captured by the bad dispatcher, would be applied to
-        // the work item BEFORE the inner RunInternal restoration. The continuation
-        // sees consumer's EC during execution due to RunInternal — so producer's
-        // value is NOT visible. This test documents the safety property: even a
-        // dispatcher that captures EC doesn't break the consumer's continuation.
+        // The producer's EC, if captured by the bad dispatcher, never reaches the
+        // continuation: SpscAwaiter.OnCompleted already captured the consumer's
+        // EC on the consumer's thread BEFORE the bad dispatcher's queue-time
+        // capture could matter, and s_invokeWithEc applies that captured consumer
+        // EC via ExecutionContext.Run on the dispatcher's chosen thread. The bad
+        // dispatcher's EC capture is wasted work, not a correctness hazard.
         Assert.Equal(0, observedProducer);
     }
 
@@ -449,4 +466,375 @@ public class SpscPipeContinuationDispatcherTests
         Assert.False(rr.IsCanceled);
         Assert.Equal(5, rr.Buffer.Length);
     }
+
+    // ---------- C.2 — Per-cycle EC capture/apply hygiene (regression-only) ----------
+
+    /// <summary>
+    /// Pins per-cycle EC capture/apply hygiene. Each await on the same SpscPipe goes
+    /// through SpscAwaiter.OnCompleted (capturing the consumer-thread EC at that
+    /// moment) followed by s_invokeWithEc on the dispatcher's chosen thread (which
+    /// reads, applies via ExecutionContext.Run, AND clears _realContinuation /
+    /// _realState / _capturedEC). If the field clearing in s_invokeWithEc were ever
+    /// removed or reordered, cycle 2 might observe stale field state from cycle 1 —
+    /// e.g., run under cycle 1's captured EC instead of its own. The test exercises
+    /// two consecutive awaits with different consumer-side AsyncLocal values and
+    /// asserts cycle 2's continuation observes cycle 2's value.
+    ///
+    /// Note: this test does NOT differentiate the new wiring from the old wiring.
+    /// Under the old wiring, MRVTSC.RunInternal scoped each cycle's captured EC
+    /// equivalently, and the observable outcome is the same. The test's value is
+    /// regression protection going forward against accidental removal of the
+    /// per-cycle field reset in s_invokeWithEc; it is NOT a Mechanism B reproducer.
+    /// (Mechanism B's leak structurally requires SuppressFlow on both the prior
+    /// and current cycles, and is structurally identical in both wirings — neither
+    /// fixes the SuppressFlow-on-both case. The new wiring's value is mostly
+    /// architectural cleanliness plus the Mechanism A scheduler-bypass fix.)
+    /// </summary>
+    [Fact]
+    public async Task MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle()
+    {
+        var asyncLocal = new AsyncLocal<int>();
+        using var dispatcher = new DedicatedThreadDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        asyncLocal.Value = 42;
+
+        // Cycle 1: producer fires after consumer parks; consumer's continuation
+        // mutates asyncLocal to 999. The mutation is scoped to the cycle's EC frame
+        // (ExecutionContext.Run in new wiring; MRVTSC.RunInternal in old) — does NOT
+        // drift onto the dispatcher's worker thread; both wirings restore the worker's
+        // pre-cb EC after the continuation returns.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            var mem = pipe.Writer.GetMemory(5);
+            mem.Span.Clear();
+            pipe.Writer.Advance(5);
+            await pipe.Writer.FlushAsync();
+        });
+
+        var rr1 = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr1.Buffer.End);
+        asyncLocal.Value = 999;     // mutation inside cycle-1's EC scope (does not drift onto worker)
+
+        // Cycle 2: a fresh await on the same pipe. The expected continuation observation
+        // is whatever the consumer's calling-site EC has at OnCompleted time. We set
+        // it to 7 here. If cycle 2's captured EC were ever stale (e.g., s_invokeWithEc
+        // failed to clear _capturedEC between cycles), cycle 2 might run under cycle 1's
+        // captured EC (asyncLocal=42). The assertion below catches that regression.
+        asyncLocal.Value = 7;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            var mem = pipe.Writer.GetMemory(3);
+            mem.Span.Clear();
+            pipe.Writer.Advance(3);
+            await pipe.Writer.FlushAsync();
+        });
+
+        var rr2 = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr2.Buffer.End);
+
+        Assert.Equal(3, rr2.Buffer.Length);
+        Assert.Equal(7, asyncLocal.Value);
+    }
+
+    // ---------- C.3 — FlowExecutionContext suppressed (smoke for null-_capturedEC branch) ----------
+
+    /// <summary>
+    /// When the consumer awaits inside an ExecutionContext.SuppressFlow() block,
+    /// SpscAwaiter.OnCompleted captures _capturedEC = null and forwards (s_dispatch,
+    /// this) to _core.OnCompleted. s_invokeWithEc reads _capturedEC, sees null, and
+    /// takes the else branch — direct cont(st) invocation on the dispatcher's chosen
+    /// thread, no ExecutionContext.Run. This test pins that the branch is exercised
+    /// cleanly (no NRE on null EC, buffer delivered, await completes).
+    ///
+    /// Note: the spec §6 C.3 entry describes a stronger "no leak from prior cb"
+    /// property, but that property is structurally identical in old and new wirings
+    /// (both let SuppressFlow cbs mutate the worker's EC, both isolate default-flow
+    /// cbs in an EC frame). The differentiating test would require both wirings to
+    /// behave differently under the same input, which they don't for SuppressFlow
+    /// AsyncLocal observation. See the C.2 docstring for the same caveat applied
+    /// to per-cycle isolation.
+    /// </summary>
+    [Fact]
+    public async Task SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly()
+    {
+        using var dispatcher = new ForwardingDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            var mem = pipe.Writer.GetMemory(5);
+            mem.Span.Clear();
+            pipe.Writer.Advance(5);
+            await pipe.Writer.FlushAsync();
+        });
+
+        // No `using` block: AsyncFlowControl.Undo() is thread-affine and would throw
+        // when the using's Dispose runs on the post-await continuation thread (the
+        // dispatcher's worker thread, different from the SuppressFlow caller).
+        // The suppression "leaks" past method end; benign for this xunit test.
+        ExecutionContext.SuppressFlow();
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+        Assert.Equal(5, rr.Buffer.Length);
+    }
+
+    // ---------- D.1 helper — capturing SynchronizationContext ----------
+
+    /// <summary>
+    /// SynchronizationContext that records every Post call. If the consumer's await captured
+    /// this SC and posted the continuation through it, PostCount > 0. The test asserts
+    /// PostCount == 0 — the new wiring strips UseSchedulingContext, so MRVTSC never captures
+    /// the SC.
+    /// </summary>
+    private sealed class CapturingSynchronizationContext : SynchronizationContext
+    {
+        public int PostCount;
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            Interlocked.Increment(ref PostCount);
+            ThreadPool.UnsafeQueueUserWorkItem(_ => d(state), null);
+        }
+    }
+
+    // ---------- D.1 — SynchronizationContext at await site is NOT honored ----------
+
+    /// <summary>
+    /// A non-default SynchronizationContext set at the await site is NOT honored: the
+    /// continuation runs on the dispatcher's chosen thread, NOT on the SC's thread. The
+    /// new SpscAwaiter.OnCompleted strips UseSchedulingContext from the flags forwarded
+    /// to _core.OnCompleted, so MRVTSC does not capture the SC. The captured SC's
+    /// PostCount stays 0; the continuation thread name is the dispatcher's thread.
+    /// </summary>
+    [Fact]
+    public async Task SynchronizationContext_AtAwait_NotHonored_ContinuationOnDispatcherThread()
+    {
+        // Capture the test thread's ID BEFORE the await. After the await, the
+        // continuation resumes on the dispatcher's worker thread, so referencing
+        // Environment.CurrentManagedThreadId at the post-await assertion would
+        // compare the worker thread's ID to itself.
+        int testThreadId = Environment.CurrentManagedThreadId;
+        string? observedThreadName = null;
+        int? observedThreadId = null;
+
+        using var dispatcher = new DedicatedThreadDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+
+        try
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                var mem = pipe.Writer.GetMemory(5);
+                mem.Span.Clear();
+                pipe.Writer.Advance(5);
+                await pipe.Writer.FlushAsync();
+            });
+
+            var rr = await pipe.Reader.ReadAsync();
+            pipe.Reader.AdvanceTo(rr.Buffer.End);
+            observedThreadName = Thread.CurrentThread.Name;
+            observedThreadId   = Environment.CurrentManagedThreadId;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+
+        // Captured SC was bypassed — PostCount stays 0.
+        Assert.Equal(0, Volatile.Read(ref sc.PostCount));
+        // Continuation ran on the dispatcher's worker thread, not the test/SC thread.
+        Assert.Equal(nameof(DedicatedThreadDispatcher), observedThreadName);
+        Assert.NotEqual(testThreadId, observedThreadId);
+    }
+
+    // ---------- D.2 — TaskScheduler at await site is NOT honored ----------
+
+    /// <summary>
+    /// A non-default TaskScheduler captured by the consumer's await (here, via
+    /// TaskScheduler.FromCurrentSynchronizationContext on a custom SC) is NOT honored.
+    /// Same mechanism as D.1: stripping UseSchedulingContext in OnCompleted prevents
+    /// MRVTSC from capturing the scheduler. The continuation runs on the dispatcher's
+    /// chosen thread, not the scheduler's thread.
+    ///
+    /// Note on test structure: Task.Factory.StartNew with a custom TaskScheduler
+    /// (derived from CurrentSynchronizationContext) routes through SC.Post to queue
+    /// the outer lambda — so PostCount is non-zero by the time the inner await begins.
+    /// We reset PostCount immediately before the inner await so the assertion only
+    /// counts Posts that the inner await's continuation would trigger; we also place
+    /// the assertions INSIDE the StartNew lambda so they execute under the
+    /// TaskScheduler/SC context, isolating the inner await as the test's unit.
+    /// </summary>
+    [Fact]
+    public async Task TaskScheduler_AtAwait_NotHonored_ContinuationOnDispatcherThread()
+    {
+        // Capture the test thread's ID BEFORE the await. After the inner await, the
+        // continuation resumes on the dispatcher's worker thread.
+        int testThreadId = Environment.CurrentManagedThreadId;
+
+        using var dispatcher = new DedicatedThreadDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+        try
+        {
+            var scheduler = TaskScheduler.FromCurrentSynchronizationContext();
+
+            // Run the test body via Task.Factory.StartNew with the custom scheduler so the
+            // inner await's would-be-captured TaskScheduler is the custom one. Assertions
+            // are inside the lambda so they execute under that scheduler context (and
+            // immediately after the inner await, before any outer-await Post can run).
+            await Task.Factory.StartNew(async () =>
+            {
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(50);
+                    var mem = pipe.Writer.GetMemory(5);
+                    mem.Span.Clear();
+                    pipe.Writer.Advance(5);
+                    await pipe.Writer.FlushAsync();
+                });
+
+                // Reset PostCount immediately before the inner await — discount any Posts
+                // from StartNew setup or the producer Task.Run setup. From this point
+                // onwards, PostCount > 0 only if the inner await's continuation routed
+                // through SC.Post (which it should NOT under the new wiring).
+                Volatile.Write(ref sc.PostCount, 0);
+
+                var rr = await pipe.Reader.ReadAsync();
+                pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+                // Assertions inside the lambda so they execute on the dispatcher's worker
+                // thread (the inner await's continuation thread). xunit's Assert.* throws
+                // on failure; the exception propagates through .Unwrap() to the outer await.
+                Assert.Equal(0, Volatile.Read(ref sc.PostCount));
+                Assert.Equal(nameof(DedicatedThreadDispatcher), Thread.CurrentThread.Name);
+                Assert.NotEqual(testThreadId, Environment.CurrentManagedThreadId);
+            }, default, TaskCreationOptions.None, scheduler).Unwrap();
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+    }
+
+    // ---------- D.3 — ConfigureAwait(true) vs ConfigureAwait(false) parity ----------
+
+    /// <summary>
+    /// With the new source-side EC-capture wiring, ConfigureAwait(true) and
+    /// ConfigureAwait(false) produce identical observable behavior on a SpscPipe await:
+    /// both run the continuation on the dispatcher's chosen thread regardless of the
+    /// consumer's captured SC/TaskScheduler. This was the original Mechanism A pin —
+    /// the BDN deadlock disappeared when ConfigureAwait(false) was added; with the
+    /// new wiring, both directions are equivalent because the SC is never captured
+    /// (UseSchedulingContext is stripped in OnCompleted).
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ConfigureAwait_TrueAndFalse_BothRunOnDispatcherThread(bool continueOnCapturedContext)
+    {
+        // Capture the test thread's ID BEFORE the await. After the await, the
+        // continuation resumes on the dispatcher's worker thread, so referencing
+        // Environment.CurrentManagedThreadId at the post-await assertion would
+        // compare the worker thread's ID to itself.
+        int testThreadId = Environment.CurrentManagedThreadId;
+
+        using var dispatcher = new DedicatedThreadDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+
+        string? observedThreadName = null;
+        int? observedThreadId = null;
+        try
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                var mem = pipe.Writer.GetMemory(5);
+                mem.Span.Clear();
+                pipe.Writer.Advance(5);
+                await pipe.Writer.FlushAsync();
+            });
+
+            var rr = await pipe.Reader.ReadAsync().ConfigureAwait(continueOnCapturedContext);
+            pipe.Reader.AdvanceTo(rr.Buffer.End);
+            observedThreadName = Thread.CurrentThread.Name;
+            observedThreadId   = Environment.CurrentManagedThreadId;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+
+        // Both ConfigureAwait(true) and ConfigureAwait(false) yield identical results:
+        // the SC is never captured (PostCount stays 0), and the continuation runs on
+        // the dispatcher's worker thread.
+        Assert.Equal(0, Volatile.Read(ref sc.PostCount));
+        Assert.Equal(nameof(DedicatedThreadDispatcher), observedThreadName);
+        Assert.NotEqual(testThreadId, observedThreadId);
+    }
+
+    // ---------- E.1 — SetResult-fires-first race (direct-awaiter, N-iteration stress) ----------
+
+    /// <summary>
+    /// Pins the spec §4 publication ordering: when the producer signals BEFORE the
+    /// consumer has called OnCompleted, the result is delivered correctly via the rare
+    /// TP-dispatch path. MRVTSC unconditionally queues the registered s_dispatch
+    /// callback to the ThreadPool when the source is already completed at OnCompleted
+    /// time; the Volatile.Write ordering in OnCompleted ensures the TP-dispatched
+    /// s_dispatch reads _realContinuation / _realState / _capturedEC post-publication.
+    ///
+    /// Operates directly on SpscAwaiter to force the race deterministically (SpscPipe's
+    /// synchronous fast paths would short-circuit before OnCompleted is even called).
+    /// Stress N iterations to expose any non-deterministic ordering bug under
+    /// CI/jit/scheduler variance.
+    /// </summary>
+    [Fact]
+    public async Task SetResultBeforeOnCompleted_DirectAwaiter_Race_StressN_AllResultsDelivered()
+    {
+        using var dispatcher = new ForwardingDispatcher();
+
+        const int iterations = 100;
+        for (int i = 0; i < iterations; i++)
+        {
+            // Construct a fresh awaiter per iteration. The dispatcher is shared across
+            // iterations (ForwardingDispatcher just routes to TP).
+            var awaiter = new SpscAwaiter<int>(dispatcher);
+
+            // PRODUCER SIGNALS FIRST. _core stores the result; _core's _continuation
+            // is null because OnCompleted hasn't been called yet.
+            awaiter._core.SetResult(1000 + i);
+
+            // CONSUMER REGISTERS SECOND (manually). SpscAwaiter.OnCompleted writes
+            // _realContinuation / _realState / _capturedEC via Volatile.Write, then
+            // forwards (s_dispatch, this, ...) to _core.OnCompleted. _core sees a
+            // completed source and unconditionally queues s_dispatch to TP. TP runs
+            // s_dispatch, which routes through dispatcher to s_invokeWithEc, which
+            // reads the awaiter's published fields and invokes our continuation under
+            // the captured EC.
+            var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            awaiter.OnCompleted(_ =>
+            {
+                try { tcs.SetResult(awaiter._core.GetResult(awaiter.Version)); }
+                catch (Exception ex) { tcs.SetException(ex); }
+            }, state: null, awaiter.Version, ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
+
+            int result = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1000 + i, result);
+        }
+    }
+
 }
