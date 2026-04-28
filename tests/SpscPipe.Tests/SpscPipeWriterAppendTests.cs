@@ -254,4 +254,158 @@ public class SpscPipeWriterAppendTests
         Assert.Equal((byte)200, seg.AvailableMemory.Span[0]);
         Assert.Equal((byte)((200 + 99) & 0xFF), seg.AvailableMemory.Span[99]);
     }
+
+    // ---------- Post-Append interactions with the rest of the writer surface ----------
+
+    [Fact]
+    public void GetMemory_AfterAppend_TransitionsToFreshRentedTail()
+    {
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        var owner = new TrackingMemoryOwner(20);
+        pipe.Writer.Append(owner);
+        var donated = pipe._writingHead!;
+
+        var mem = pipe.Writer.GetMemory(64);
+
+        // _writingHead should have moved off the donated segment to a fresh rented tail.
+        Assert.NotSame(donated, pipe._writingHead);
+        Assert.False(pipe._writingHead!.IsDonated);
+        // The donated segment is now linked as a non-tail chain segment.
+        Assert.Same(pipe._writingHead, donated.Next);
+        // _writingHeadBytesBuffered resets to 0 for the new tail.
+        Assert.Equal(0, pipe._writingHeadBytesBuffered);
+        Assert.True(mem.Length >= 64);
+    }
+
+    [Fact]
+    public void Advance_AfterAppend_ThrowsArgumentOutOfRange()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        var owner = new TrackingMemoryOwner(20);
+        pipe.Writer.Append(owner);
+
+        // _writingHead.AvailableMemory.Length == _writingHeadBytesBuffered, so any positive
+        // Advance fails the existing bounds check at SpscPipe.Writer.cs:52.
+        Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Advance(1));
+    }
+
+    [Fact]
+    public async Task FlushAsync_AfterAppend_PublishesDonatedAsTailSegment()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        var owner = new TrackingMemoryOwner(50);
+        pipe.Writer.Append(owner);
+        var donated = pipe._writingHead!;
+
+        var fr = await pipe.Writer.FlushAsync();
+        Assert.False(fr.IsCanceled);
+        Assert.False(fr.IsCompleted);
+
+        var snap = pipe._lastPublishedWriterState;
+        Assert.Same(donated, snap.TailSegment);
+        Assert.Equal(50, snap.TailWritten);
+        Assert.Equal(50, snap.TotalWritten);
+        Assert.Same(donated, snap.HeadSegment);   // bootstrap case: donated is also chain head
+    }
+
+    [Fact]
+    public async Task FlushAsync_AfterMixedWriteAndAppend_PublishesCorrectChain()
+    {
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        var rentedMem = pipe.Writer.GetMemory(64);
+        for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
+        pipe.Writer.Advance(40);
+        var rented = pipe._writingHead!;
+
+        var owner = new TrackingMemoryOwner(20);
+        pipe.Writer.Append(owner);
+
+        await pipe.Writer.FlushAsync();
+        var snap = pipe._lastPublishedWriterState;
+        Assert.Same(rented, snap.HeadSegment);
+        Assert.Same(pipe._writingHead, snap.TailSegment);
+        Assert.True(snap.TailSegment!.IsDonated);
+        Assert.Equal(20, snap.TailWritten);
+        Assert.Equal(60, snap.TotalWritten);
+    }
+
+    [Fact]
+    public void Append_AfterGetMemoryWithZeroBuffered_FreezesEmptyRentedSegment()
+    {
+        // Spec §8: "After GetMemory + Advance(0) (zero buffered)" → previous tail is frozen
+        // with End=0; donated is spliced after. The empty rented segment is harmless and
+        // recycles to freelist on drain.
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        pipe.Writer.GetMemory(64);
+        pipe.Writer.Advance(0);
+        var prevTail = pipe._writingHead!;
+
+        var owner = new TrackingMemoryOwner(20);
+        pipe.Writer.Append(owner);
+
+        Assert.Equal(0, prevTail.End);
+        Assert.False(prevTail.IsDonated);
+        Assert.NotNull(prevTail.Next);
+        Assert.True(prevTail.Next!.IsDonated);
+        Assert.Same(prevTail.Next, pipe._writingHead);
+        Assert.Equal(20, pipe._writingHead!.End);
+        Assert.Equal(0, pipe._writingHead.RunningIndex);
+        Assert.Equal(20, pipe._totalWritten);
+    }
+
+    [Fact]
+    public async Task LargeAppend_DoesNotPark_SubsequentFlushAsyncParksWhenOverThreshold()
+    {
+        // Spec §4.4: Append doesn't gate on PauseWriterThreshold; FlushAsync does.
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(
+            pauseWriterThreshold: 1024, resumeWriterThreshold: 512));
+
+        var owner = new TrackingMemoryOwner(8 * 1024);   // well over the pause threshold
+        pipe.Writer.Append(owner);   // synchronous, never parks; no exception
+
+        Assert.Equal(8 * 1024, pipe._totalWritten);
+
+        // FlushAsync should park because unconsumed >= PauseWriterThreshold.
+        var flushTask = pipe.Writer.FlushAsync().AsTask();
+        // The task is parked; not completed synchronously.
+        Assert.False(flushTask.IsCompleted);
+
+        // Drain the buffer to release the parked writer.
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+        // Now the parked FlushAsync resolves.
+        var fr = await flushTask;
+        Assert.False(fr.IsCanceled);
+    }
+
+    [Fact]
+    public void BackToBackAppends_NoEmptyRentedTailsBetweenDonations()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        var o1 = new TrackingMemoryOwner(10);
+        var o2 = new TrackingMemoryOwner(20);
+        var o3 = new TrackingMemoryOwner(30);
+
+        pipe.Writer.Append(o1);
+        pipe.Writer.Append(o2);
+        pipe.Writer.Append(o3);
+
+        // Walk the chain and verify three donated segments back-to-back.
+        var s = pipe._chainHead!;
+        Assert.True(s.IsDonated);
+        Assert.Equal(10, s.End);
+        s = s.Next!;
+        Assert.NotNull(s);
+        Assert.True(s.IsDonated);
+        Assert.Equal(20, s.End);
+        s = s.Next!;
+        Assert.NotNull(s);
+        Assert.True(s.IsDonated);
+        Assert.Equal(30, s.End);
+        Assert.Null(s.Next);
+
+        Assert.Same(s, pipe._writingHead);
+        Assert.Equal(60, pipe._totalWritten);
+    }
 }
