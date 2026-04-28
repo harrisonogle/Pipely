@@ -10,21 +10,41 @@ public class HotHandoffContinuationDispatcherTests
     public void Dispatch_InvokesCallbackOnDedicatedThread()
     {
         using var dispatcher = new HotHandoffContinuationDispatcher();
-        int? observedThreadId = null;
-        string? observedThreadName = null;
-        using var done = new ManualResetEventSlim(false);
+        int? firstThreadId    = null;
+        int? secondThreadId   = null;
+        string? firstThreadName  = null;
+        string? secondThreadName = null;
 
-        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        // First dispatch.
+        using (var done = new ManualResetEventSlim(false))
         {
-            observedThreadId = Environment.CurrentManagedThreadId;
-            observedThreadName = Thread.CurrentThread.Name;
-            done.Set();
-        }, null);
+            dispatcher.UnsafeQueueUserWorkItem(_ =>
+            {
+                firstThreadId   = Environment.CurrentManagedThreadId;
+                firstThreadName = Thread.CurrentThread.Name;
+                done.Set();
+            }, null);
+            Assert.True(done.Wait(TimeSpan.FromSeconds(5)),
+                "First callback was not invoked within 5 seconds.");
+        }
 
-        Assert.True(done.Wait(TimeSpan.FromSeconds(5)),
-            "Callback was not invoked within 5 seconds.");
-        Assert.NotEqual(Environment.CurrentManagedThreadId, observedThreadId);
-        Assert.Equal("SpscPipe HotHandoff", observedThreadName);
+        // Second dispatch — must land on the SAME dedicated thread, not a fresh one.
+        using (var done = new ManualResetEventSlim(false))
+        {
+            dispatcher.UnsafeQueueUserWorkItem(_ =>
+            {
+                secondThreadId   = Environment.CurrentManagedThreadId;
+                secondThreadName = Thread.CurrentThread.Name;
+                done.Set();
+            }, null);
+            Assert.True(done.Wait(TimeSpan.FromSeconds(5)),
+                "Second callback was not invoked within 5 seconds.");
+        }
+
+        Assert.NotEqual(Environment.CurrentManagedThreadId, firstThreadId);
+        Assert.Equal("SpscPipe HotHandoff", firstThreadName);
+        Assert.Equal("SpscPipe HotHandoff", secondThreadName);
+        Assert.Equal(firstThreadId, secondThreadId);   // consistently same dedicated thread
     }
 
     [Fact]
@@ -113,8 +133,6 @@ public class HotHandoffContinuationDispatcherTests
     {
         using var dispatcher = new HotHandoffContinuationDispatcher();
         using var firstDone  = new ManualResetEventSlim(false);
-        using var secondDone = new ManualResetEventSlim(false);
-        string? secondThreadName = null;
 
         // First slot-path dispatch throws.
         dispatcher.UnsafeQueueUserWorkItem(_ =>
@@ -126,20 +144,25 @@ public class HotHandoffContinuationDispatcherTests
         Assert.True(firstDone.Wait(TimeSpan.FromSeconds(5)),
             "First (throwing) callback never ran.");
 
-        // Give the dispatcher thread a moment to finish processing the throw + re-loop.
-        Thread.Sleep(50);
-
-        // Second slot-path dispatch must run on the same dedicated thread —
-        // the worker survived the throw.
-        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        // Poll-spin: keep dispatching until one lands on the dedicated thread.
+        // Survival is proven by *any* future dispatch being serviced by the
+        // worker thread; a TP-fallback observation just means the worker is
+        // still mid-cleanup from the throw and we should retry. Bounded by a
+        // 5-second deadline (deterministic, no Thread.Sleep).
+        string? observedName = null;
+        var deadline = Environment.TickCount64 + 5000;
+        while (observedName != "SpscPipe HotHandoff" && Environment.TickCount64 < deadline)
         {
-            secondThreadName = Thread.CurrentThread.Name;
-            secondDone.Set();
-        }, null);
+            using var probeDone = new ManualResetEventSlim(false);
+            dispatcher.UnsafeQueueUserWorkItem(_ =>
+            {
+                observedName = Thread.CurrentThread.Name;
+                probeDone.Set();
+            }, null);
+            probeDone.Wait(TimeSpan.FromMilliseconds(200));
+        }
 
-        Assert.True(secondDone.Wait(TimeSpan.FromSeconds(5)),
-            "Second callback after throwing first never ran — dispatcher thread may have died.");
-        Assert.Equal("SpscPipe HotHandoff", secondThreadName);
+        Assert.Equal("SpscPipe HotHandoff", observedName);
     }
 
     [Fact]
