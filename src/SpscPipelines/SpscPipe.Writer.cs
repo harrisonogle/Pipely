@@ -232,4 +232,31 @@ public sealed class SpscPipeWriter : PipeWriter
             _pipe._flushAwaiter._ctr.Dispose();
         return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
     }
+
+    // ---------- Append (buffer ownership transfer) ----------
+    // Per spec docs/superpowers/specs/2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md.
+    // Ownership of `buffer` transfers to the pipe iff this method returns normally.
+    // On any exception, the caller still owns `buffer` and is responsible for disposing it.
+
+    public void Append(IMemoryOwner<byte> buffer)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        Append(buffer, 0, buffer.Memory.Length);
+    }
+
+    public void Append(IMemoryOwner<byte> buffer, int start, int length)
+    {
+        if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
+
+        var mem = buffer.Memory;
+        if ((uint)start > (uint)mem.Length || (uint)length > (uint)(mem.Length - start))
+            throw new ArgumentOutOfRangeException();
+
+        // TODO Task 5: zero-length accept-and-dispose.
+        // TODO Task 6: bootstrap path.
+        // TODO Task 7: steady-state splice.
+        throw new NotImplementedException("Append body — implemented in Tasks 5-7");
+    }
 }
