@@ -163,8 +163,8 @@ public void Append(IMemoryOwner<byte> buffer, int start, int length)
     // is not contractually stable across calls for arbitrary implementations, so re-querying
     // would risk validate/adopt divergence.
     var mem = buffer.Memory;
-    if ((uint)start > (uint)mem.Length || (uint)length > (uint)(mem.Length - start))
-        throw new ArgumentOutOfRangeException();
+    if ((uint)start > (uint)mem.Length) throw new ArgumentOutOfRangeException(nameof(start));
+    if ((uint)length > (uint)(mem.Length - start)) throw new ArgumentOutOfRangeException(nameof(length));
 
     // Q5: zero-length is accept-and-dispose, no chain mutation.
     if (length == 0)

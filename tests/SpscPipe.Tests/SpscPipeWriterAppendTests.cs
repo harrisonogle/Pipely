@@ -217,16 +217,16 @@ public class SpscPipeWriterAppendTests
 
         pipe.Writer.Append(owner1);
         var donated1 = pipe._writingHead!;
-        int  end1Before     = donated1.End;
-        long ri1Before      = donated1.RunningIndex;
+        int  end1Before    = donated1.End;
+        int  memLenBefore  = ((System.Buffers.ReadOnlySequenceSegment<byte>)donated1).Memory.Length;
 
         pipe.Writer.Append(owner2);
         var donated2 = pipe._writingHead!;
 
-        // donated1's End/Memory unchanged (idempotent Freeze write).
-        Assert.Equal(end1Before, donated1.End);
-        Assert.Equal(ri1Before, donated1.RunningIndex);
-        Assert.Same(donated2, donated1.Next);
+        // donated1's End/base.Memory unchanged (idempotent Freeze write — spec §2.2).
+        Assert.Equal(end1Before,    donated1.End);
+        Assert.Equal(memLenBefore,  ((System.Buffers.ReadOnlySequenceSegment<byte>)donated1).Memory.Length);
+        Assert.Same(donated2,       donated1.Next);
         // donated2 properly chained.
         Assert.True(donated2.IsDonated);
         Assert.Equal(50, donated2.End);

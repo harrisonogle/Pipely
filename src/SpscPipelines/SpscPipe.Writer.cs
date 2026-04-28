@@ -251,8 +251,8 @@ public sealed class SpscPipeWriter : PipeWriter
         if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
 
         var mem = buffer.Memory;
-        if ((uint)start > (uint)mem.Length || (uint)length > (uint)(mem.Length - start))
-            throw new ArgumentOutOfRangeException();
+        if ((uint)start > (uint)mem.Length) throw new ArgumentOutOfRangeException(nameof(start));
+        if ((uint)length > (uint)(mem.Length - start)) throw new ArgumentOutOfRangeException(nameof(length));
 
         // Zero-length: accept ownership, dispose synchronously, no chain mutation.
         if (length == 0)
