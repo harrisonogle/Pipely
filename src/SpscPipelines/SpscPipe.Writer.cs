@@ -261,8 +261,21 @@ public sealed class SpscPipeWriter : PipeWriter
             return;
         }
 
-        // TODO Task 6: bootstrap path.
+        var slice = mem.Slice(start, length);    // guaranteed to succeed after validation above
+
+        // Bootstrap: pipe has no writing head yet.
+        if (_pipe._writingHead == null)
+        {
+            var donated = new BufferSegment();
+            donated.AdoptFrom(buffer, slice, runningIndex: 0, pipeOwner: _pipe);
+            _pipe._chainHead   = donated;
+            _pipe._writingHead = donated;
+            _pipe._writingHeadBytesBuffered = length;
+            _pipe._totalWritten += length;
+            return;
+        }
+
         // TODO Task 7: steady-state splice.
-        throw new NotImplementedException("Append body — implemented in Tasks 6-7");
+        throw new NotImplementedException("Append body — steady-state splice in Task 7");
     }
 }

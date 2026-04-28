@@ -111,4 +111,53 @@ public class SpscPipeWriterAppendTests
         Assert.Equal(0, pipe._totalWritten);
         Assert.Null(pipe._writingHead);
     }
+
+    // ---------- Bootstrap: empty pipe + Append ----------
+
+    [Fact]
+    public void Append_NoArg_OnEmptyPipe_BootstrapsChainHeadEqualsWritingHead()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        var bytes = new byte[64];
+        for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i + 1);
+        var owner = new TrackingMemoryOwner(bytes);
+
+        pipe.Writer.Append(owner);
+
+        Assert.NotNull(pipe._chainHead);
+        Assert.Same(pipe._chainHead, pipe._writingHead);
+        Assert.Equal(64, pipe._writingHeadBytesBuffered);
+        Assert.Equal(64, pipe._totalWritten);
+
+        var seg = pipe._chainHead!;
+        Assert.Equal(0, seg.RunningIndex);
+        Assert.True(seg.IsDonated);
+        Assert.Same(pipe, seg.OwnerToken);
+        Assert.Equal(64, seg.End);
+        Assert.Equal(64, seg.AvailableMemory.Length);
+        Assert.Equal((byte)1,  seg.AvailableMemory.Span[0]);
+        Assert.Equal((byte)64, seg.AvailableMemory.Span[63]);
+
+        Assert.Equal(0, owner.DisposeCount);   // ownership transferred; not yet recycled
+    }
+
+    [Fact]
+    public void Append_ThreeArg_OnEmptyPipe_PublishedSliceMatchesStartAndLength()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        var bytes = new byte[1024];
+        for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i & 0xFF);
+        var owner = new TrackingMemoryOwner(bytes);
+
+        pipe.Writer.Append(owner, start: 100, length: 50);
+
+        Assert.NotNull(pipe._chainHead);
+        var seg = pipe._chainHead!;
+        Assert.Equal(50, seg.End);
+        Assert.Equal(50, seg.AvailableMemory.Length);
+        // Bytes 100..149 of the underlying array are exposed.
+        Assert.Equal((byte)100, seg.AvailableMemory.Span[0]);
+        Assert.Equal((byte)149, seg.AvailableMemory.Span[49]);
+        Assert.Equal(50, pipe._totalWritten);
+    }
 }
