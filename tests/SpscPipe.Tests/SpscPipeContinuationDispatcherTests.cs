@@ -654,4 +654,76 @@ public class SpscPipeContinuationDispatcherTests
         Assert.NotEqual(testThreadId, observedThreadId);
     }
 
+    // ---------- D.2 — TaskScheduler at await site is NOT honored ----------
+
+    /// <summary>
+    /// A non-default TaskScheduler captured by the consumer's await (here, via
+    /// TaskScheduler.FromCurrentSynchronizationContext on a custom SC) is NOT honored.
+    /// Same mechanism as D.1: stripping UseSchedulingContext in OnCompleted prevents
+    /// MRVTSC from capturing the scheduler. The continuation runs on the dispatcher's
+    /// chosen thread, not the scheduler's thread.
+    ///
+    /// Note on test structure: Task.Factory.StartNew with a custom TaskScheduler
+    /// (derived from CurrentSynchronizationContext) routes through SC.Post to queue
+    /// the outer lambda — so PostCount is non-zero by the time the inner await begins.
+    /// We reset PostCount immediately before the inner await so the assertion only
+    /// counts Posts that the inner await's continuation would trigger; we also place
+    /// the assertions INSIDE the StartNew lambda so they execute under the
+    /// TaskScheduler/SC context, isolating the inner await as the test's unit.
+    /// </summary>
+    [Fact]
+    public async Task TaskScheduler_AtAwait_NotHonored_ContinuationOnDispatcherThread()
+    {
+        // Capture the test thread's ID BEFORE the await. After the inner await, the
+        // continuation resumes on the dispatcher's worker thread.
+        int testThreadId = Environment.CurrentManagedThreadId;
+
+        using var dispatcher = new DedicatedThreadDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+        try
+        {
+            var scheduler = TaskScheduler.FromCurrentSynchronizationContext();
+
+            // Run the test body via Task.Factory.StartNew with the custom scheduler so the
+            // inner await's would-be-captured TaskScheduler is the custom one. Assertions
+            // are inside the lambda so they execute under that scheduler context (and
+            // immediately after the inner await, before any outer-await Post can run).
+            await Task.Factory.StartNew(async () =>
+            {
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(50);
+                    var mem = pipe.Writer.GetMemory(5);
+                    mem.Span.Clear();
+                    pipe.Writer.Advance(5);
+                    await pipe.Writer.FlushAsync();
+                });
+
+                // Reset PostCount immediately before the inner await — discount any Posts
+                // from StartNew setup or the producer Task.Run setup. From this point
+                // onwards, PostCount > 0 only if the inner await's continuation routed
+                // through SC.Post (which it should NOT under the new wiring).
+                Volatile.Write(ref sc.PostCount, 0);
+
+                var rr = await pipe.Reader.ReadAsync();
+                pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+                // Assertions inside the lambda so they execute on the dispatcher's worker
+                // thread (the inner await's continuation thread). xunit's Assert.* throws
+                // on failure; the exception propagates through .Unwrap() to the outer await.
+                Assert.Equal(0, Volatile.Read(ref sc.PostCount));
+                Assert.Equal(nameof(DedicatedThreadDispatcher), Thread.CurrentThread.Name);
+                Assert.NotEqual(testThreadId, Environment.CurrentManagedThreadId);
+            }, default, TaskCreationOptions.None, scheduler).Unwrap();
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+    }
+
 }
