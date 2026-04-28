@@ -275,7 +275,19 @@ public sealed class SpscPipeWriter : PipeWriter
             return;
         }
 
-        // TODO Task 7: steady-state splice.
-        throw new NotImplementedException("Append body — steady-state splice in Task 7");
+        // Steady state: freeze current tail with whatever's buffered, splice donated as new tail.
+        // For a previously-donated tail, Freeze re-writes End/base.Memory to the same values
+        // (length == AvailableMemory.Length already) and sets Next; the redundant writes are
+        // idempotent and benign-torn-read-safe per spec §2.2.
+        int filled = _pipe._writingHeadBytesBuffered;
+        long newRI = _pipe._writingHead.RunningIndex + filled;
+
+        var newDonated = new BufferSegment();
+        newDonated.AdoptFrom(buffer, slice, newRI, pipeOwner: _pipe);
+
+        _pipe._writingHead.Freeze(filled, newDonated);
+        _pipe._writingHead = newDonated;
+        _pipe._writingHeadBytesBuffered = length;
+        _pipe._totalWritten += length;
     }
 }

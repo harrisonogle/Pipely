@@ -160,4 +160,98 @@ public class SpscPipeWriterAppendTests
         Assert.Equal((byte)149, seg.AvailableMemory.Span[49]);
         Assert.Equal(50, pipe._totalWritten);
     }
+
+    // ---------- Steady-state splice ----------
+
+    [Fact]
+    public void Append_AfterPartialFill_FreezesPreviousTailAndSplicesDonated()
+    {
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        // Establish a partially-filled rented tail.
+        var rentedMem = pipe.Writer.GetMemory(64);
+        for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
+        pipe.Writer.Advance(40);
+        var prevTail = pipe._writingHead!;
+
+        // Now Append a donated buffer.
+        var donatedBytes = new byte[20];
+        for (int i = 0; i < donatedBytes.Length; i++) donatedBytes[i] = (byte)(100 + i);
+        var owner = new TrackingMemoryOwner(donatedBytes);
+
+        pipe.Writer.Append(owner);
+
+        // Previous tail (rented) is frozen with End=40.
+        Assert.Equal(40, prevTail.End);
+        Assert.NotNull(prevTail.Next);
+        Assert.False(prevTail.IsDonated);
+
+        // The donated segment is the new writing head.
+        var donated = pipe._writingHead!;
+        Assert.NotSame(prevTail, donated);
+        Assert.Same(donated, prevTail.Next);
+        Assert.True(donated.IsDonated);
+        Assert.Same(pipe, donated.OwnerToken);
+        Assert.Equal(20, donated.End);
+        Assert.Equal(40, donated.RunningIndex);   // prevTail.RunningIndex (0) + 40
+        Assert.Null(donated.Next);
+
+        // Counters
+        Assert.Equal(20, pipe._writingHeadBytesBuffered);
+        Assert.Equal(60, pipe._totalWritten);
+
+        // Chain head is still the original prevTail (not donated).
+        Assert.Same(prevTail, pipe._chainHead);
+        Assert.Equal(0, owner.DisposeCount);
+    }
+
+    [Fact]
+    public void Append_AfterAppend_PreviousDonatedTailIsLinkedIdempotently()
+    {
+        // Spec §2.2: when the previous _writingHead is itself donated, the steady-state
+        // Freeze(filled, newDonated) call writes End/base.Memory to the same values they
+        // already held; only Next changes meaningfully.
+        using var pipe = new SpscPipelines.SpscPipe();
+
+        var owner1 = new TrackingMemoryOwner(30);
+        var owner2 = new TrackingMemoryOwner(50);
+
+        pipe.Writer.Append(owner1);
+        var donated1 = pipe._writingHead!;
+        int  end1Before     = donated1.End;
+        long ri1Before      = donated1.RunningIndex;
+
+        pipe.Writer.Append(owner2);
+        var donated2 = pipe._writingHead!;
+
+        // donated1's End/Memory unchanged (idempotent Freeze write).
+        Assert.Equal(end1Before, donated1.End);
+        Assert.Equal(ri1Before, donated1.RunningIndex);
+        Assert.Same(donated2, donated1.Next);
+        // donated2 properly chained.
+        Assert.True(donated2.IsDonated);
+        Assert.Equal(50, donated2.End);
+        Assert.Equal(30, donated2.RunningIndex);   // donated1.RunningIndex(0) + donated1.End(30)
+
+        Assert.Equal(50, pipe._writingHeadBytesBuffered);
+        Assert.Equal(80, pipe._totalWritten);
+
+        // Chain head is donated1 (the very first segment).
+        Assert.Same(donated1, pipe._chainHead);
+    }
+
+    [Fact]
+    public void Append_WithStartOffset_SplicesOnlyTheSelectedSlice()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        var bytes = new byte[1024];
+        for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i & 0xFF);
+        var owner = new TrackingMemoryOwner(bytes);
+
+        pipe.Writer.Append(owner, start: 200, length: 100);
+
+        var seg = pipe._writingHead!;
+        Assert.Equal(100, seg.End);
+        Assert.Equal((byte)200, seg.AvailableMemory.Span[0]);
+        Assert.Equal((byte)((200 + 99) & 0xFF), seg.AvailableMemory.Span[99]);
+    }
 }
