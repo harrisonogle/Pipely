@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.IO.Pipelines;
+using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 using SpscPipelines;
 
@@ -7,8 +9,19 @@ namespace SpscPipelines.HotHandoff.Benchmarks;
 [MemoryDiagnoser]
 public class DispatcherThroughputBench
 {
-    private const int TotalBytes = 1 << 20;        // 1 MiB per iteration
-    private const int ChunkSize  = 4096;
+    // TEMPORARY workload — matches the latency CLI's MHz-rate per-message run
+    // (1 M messages × 256 B, timestamp-only producer writes, no chunk-copy
+    // fill) so BDN can measure the same workload the latency CLI is measuring
+    // and we can isolate any methodology divergence between the two.
+    //
+    // Original throughput-shape configuration, for reversion:
+    //     private const int TotalBytes = 1 << 20;        // 1 MiB per iteration
+    //     private const int ChunkSize  = 4096;
+    //     producer used `chunk.CopyTo(memory)` of a pre-allocated ChunkSize
+    //     byte[] (zero-filled) — see git history for the throughput numbers
+    //     (50.45 us HotHandoff / 70.34 us TpDefault / 105.09 us BCL).
+    private const int MessageCount = 1_000_000;
+    private const int ChunkSize    = 256;
 
     // Constructed once per benchmark run, reused across all iterations. This
     // matches the apples-to-apples comparison shape: BCL Pipe and SpscPipe's
@@ -62,15 +75,17 @@ public class DispatcherThroughputBench
     {
         var producer = Task.Run(async () =>
         {
-            int written = 0;
-            var chunk = new byte[ChunkSize];
-            while (written < TotalBytes)
+            // Latency CLI's timestamp-only producer pattern: write an 8-byte
+            // Stopwatch timestamp into the front of each rented buffer and
+            // Advance(ChunkSize). Remaining bytes are uninitialized (whatever
+            // was in the rented memory).
+            for (int i = 0; i < MessageCount; i++)
             {
-                var memory = writer.GetMemory(chunk.Length);
-                chunk.CopyTo(memory);
-                writer.Advance(chunk.Length);
+                var memory = writer.GetMemory(ChunkSize);
+                long t = Stopwatch.GetTimestamp();
+                MemoryMarshal.Write(memory.Span, in t);
+                writer.Advance(ChunkSize);
                 await writer.FlushAsync();
-                written += chunk.Length;
             }
             writer.Complete();
         });
