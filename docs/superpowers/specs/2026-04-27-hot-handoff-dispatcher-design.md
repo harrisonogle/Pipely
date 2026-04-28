@@ -129,11 +129,20 @@ private void Loop()
 public void Dispose()
 {
     Interlocked.Or(ref _state, ShutdownRequested);   // sets bit, never disturbs Busy
-    _thread.Join();                                  // returns only after loop terminates
+
+    // If Dispose is called from within a callback the dispatcher routed (i.e.,
+    // the current thread IS the worker thread), Joining would self-deadlock.
+    // The worker observes ShutdownRequested when the cb returns to Loop and
+    // exits naturally. In that case, Dispose returns before the worker
+    // terminates; the dispatcher is functionally shutdown either way.
+    if (Thread.CurrentThread != _thread)
+        _thread.Join();
 }
 ```
 
 `Or` is the right primitive because it is unconditional with respect to `Busy`: if a Dispatcher has won the slot CAS (state == 1), the `Or` produces state 3 (Busy + ShutdownRequested), and the loop will drain the in-flight callback and then transition to state 2 by clearing the Busy bit. If state was already Vacant (0), the `Or` produces state 2 directly and the loop's next idle observation exits.
+
+The `Thread.CurrentThread != _thread` guard handles the self-Dispose case: a callback that the dispatcher routed may legitimately call `dispatcher.Dispose()` from inside its body (e.g., as part of `using` scope cleanup in a code path whose await chain resumed on the worker thread). Without the guard, `Thread.Join` would block the current thread waiting for itself to exit — a deterministic deadlock. With the guard, the in-flight callback is allowed to return; the loop's next iteration then observes `ShutdownRequested` and the worker thread exits naturally. Dispose returns before the worker terminates in this case, but the dispatcher is functionally shutdown immediately after the `Or` completes (every subsequent Dispatch CAS sees state ≥ 2 and routes to TP), so callers cannot observe a window in which Dispatch could still claim the slot.
 
 ## Section 4 — Invariants and rules
 
@@ -149,7 +158,7 @@ I5. **No EC capture in the dispatcher.** The dispatcher hands the delegate to th
 
 I6. **Terminal state is unreachable for `Dispatch`.** Once `_state` carries the `ShutdownRequested` bit (states 2 and 3), every Dispatcher CAS expecting `Vacant` (state 0) fails, and every callback is routed to the TP overflow path. State 2 is additionally terminal in the sense that no transition out of it exists once the loop has observed it and returned.
 
-I7. **`Dispose` returns implies loop terminated.** `Thread.Join` blocks the disposing thread until the worker has returned from `Loop()`. The loop returns only after observing `_state == ShutdownRequested` (state 2). After `Dispose` returns, no callback is in flight on the worker thread, and any subsequent Dispatcher call routes to TP.
+I7. **`Dispose` returns implies dispatcher functionally shutdown.** Every subsequent Dispatch routes to TP (state ≥ 2 after the `Or`, so `Vacant→Busy` CAS cannot succeed). The thread-termination guarantee depends on the caller's thread identity: if `Dispose` is called from any thread other than `_thread`, `Thread.Join` blocks until the worker has returned from `Loop()` after observing `_state == ShutdownRequested` (state 2) — so `Dispose` return additionally implies no callback is in flight on the worker thread. If `Dispose` is called from `_thread` itself (only reachable from inside a callback the dispatcher routed), `Thread.Join` is skipped to avoid a self-deadlock; the worker thread terminates naturally as soon as the in-flight callback returns to the loop, but `Dispose` may return before that happens.
 
 R1. **Dispatcher CAS shape.** The Dispatch path uses `Interlocked.CompareExchange(ref _state, Busy, Vacant)`. The expected value is `Vacant` (0); any other state, including the transient state 3 or the terminal state 2, must cause CAS failure and TP fallback.
 
@@ -157,7 +166,7 @@ R2. **Loop release shape.** After invoking a callback, the loop clears `Busy` vi
 
 R3. **Loop terminate shape.** The loop returns when `Interlocked.CompareExchange(ref _state, 0, 0)` returns `ShutdownRequested` (state 2). The CAS-with-self is used as a fenced read of `_state`, not as a state-changing transition. No state-changing CAS is required for terminate, because state 2 is terminal (Section 3.1) and cannot be exited: there is no transition out of state 2 in the closed transition set, so observing state == 2 is sufficient to safely return.
 
-R4. **Dispose shape.** Dispose writes the bit unconditionally via `Interlocked.Or(ref _state, ShutdownRequested)`. It does not CAS — the producer's CAS already guarantees the `Busy` bit is preserved, and the `Or` is idempotent across multiple Dispose calls.
+R4. **Dispose shape.** Dispose writes the bit unconditionally via `Interlocked.Or(ref _state, ShutdownRequested)`. It does not CAS — the producer's CAS already guarantees the `Busy` bit is preserved, and the `Or` is idempotent across multiple Dispose calls. After the `Or`, Dispose calls `_thread.Join()` only if `Thread.CurrentThread != _thread`; the self-Dispose case (callback on the worker thread invoking `Dispose`) skips the Join to avoid a self-deadlock and lets the worker thread exit naturally after the in-flight callback returns. See I7 and §3.4 for the thread-termination contract.
 
 R5. **Throwing-continuation containment.** Every callback invocation is wrapped in `try`/`catch` (contract item #5). The catch is empty — the contract is "the dispatcher thread must survive a throwing continuation," not "the dispatcher must surface the exception somewhere." Surfacing is the consumer's responsibility via the awaiter that scheduled the continuation.
 
@@ -207,6 +216,7 @@ Tests pin observable behavior, not internal sequencing. Two layers:
 - A.7 Dispose blocks the disposing thread until any slot-path callback in flight has completed (verified by an in-callback gate).
 - A.8 After Dispose returns, every subsequent Dispatch's callback runs on a `ThreadPool` thread. This pins Race 3 from Section 5.
 - A.9 A single `HotHandoffContinuationDispatcher` instance, configured into multiple `SpscPipe` instances simultaneously, services every pipe's awaiter completions correctly. This pins contract item #3 (thread-safety across pipes).
+- A.10 A callback that calls `dispatcher.Dispose()` from inside its body (i.e., `Dispose` invoked on the worker thread itself) must not deadlock; the callback must return cleanly and every subsequent Dispatch on the same dispatcher must route to TP. This pins the self-Dispose contract added to I7 / R4 / §3.4.
 
 **Layer B — Dispatcher through `SpscPipe`** (plugged into `SpscPipeOptions.ContinuationDispatcher`):
 
