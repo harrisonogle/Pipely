@@ -76,4 +76,39 @@ public class SpscPipeWriterAppendTests
         Assert.Equal(bufferedBefore, pipe._writingHeadBytesBuffered);
         Assert.Equal(0, owner.DisposeCount);
     }
+
+    // ---------- Zero-length: accept-and-dispose ----------
+
+    [Fact]
+    public void Append_ZeroLength_ThreeArg_DisposesAndReturns_NoChainMutation()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        var owner = new TrackingMemoryOwner(64);
+
+        long totalWrittenBefore = pipe._totalWritten;
+        var writingHeadBefore   = pipe._writingHead;
+        var chainHeadBefore     = pipe._chainHead;
+
+        pipe.Writer.Append(owner, start: 10, length: 0);
+
+        Assert.Equal(1, owner.DisposeCount);
+        Assert.Equal(totalWrittenBefore, pipe._totalWritten);
+        Assert.Same(writingHeadBefore, pipe._writingHead);
+        Assert.Same(chainHeadBefore, pipe._chainHead);
+    }
+
+    [Fact]
+    public void Append_BufferWithMemoryLengthZero_NoArg_DisposesAndReturns()
+    {
+        // Memory.Length == 0 routes through the no-arg overload to the 3-arg overload
+        // with length=0; same accept-and-dispose outcome.
+        using var pipe = new SpscPipelines.SpscPipe();
+        var owner = new TrackingMemoryOwner(0);
+
+        pipe.Writer.Append(owner);
+
+        Assert.Equal(1, owner.DisposeCount);
+        Assert.Equal(0, pipe._totalWritten);
+        Assert.Null(pipe._writingHead);
+    }
 }

@@ -254,9 +254,15 @@ public sealed class SpscPipeWriter : PipeWriter
         if ((uint)start > (uint)mem.Length || (uint)length > (uint)(mem.Length - start))
             throw new ArgumentOutOfRangeException();
 
-        // TODO Task 5: zero-length accept-and-dispose.
+        // Zero-length: accept ownership, dispose synchronously, no chain mutation.
+        if (length == 0)
+        {
+            buffer.Dispose();
+            return;
+        }
+
         // TODO Task 6: bootstrap path.
         // TODO Task 7: steady-state splice.
-        throw new NotImplementedException("Append body — implemented in Tasks 5-7");
+        throw new NotImplementedException("Append body — implemented in Tasks 6-7");
     }
 }
