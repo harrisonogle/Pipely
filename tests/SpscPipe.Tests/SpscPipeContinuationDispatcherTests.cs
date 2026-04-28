@@ -1,4 +1,5 @@
 using System.Threading;
+using System.Threading.Tasks.Sources;
 using SpscPipelines;
 using Xunit;
 
@@ -784,6 +785,56 @@ public class SpscPipeContinuationDispatcherTests
         Assert.Equal(0, Volatile.Read(ref sc.PostCount));
         Assert.Equal(nameof(DedicatedThreadDispatcher), observedThreadName);
         Assert.NotEqual(testThreadId, observedThreadId);
+    }
+
+    // ---------- E.1 — SetResult-fires-first race (direct-awaiter, N-iteration stress) ----------
+
+    /// <summary>
+    /// Pins the spec §4 publication ordering: when the producer signals BEFORE the
+    /// consumer has called OnCompleted, the result is delivered correctly via the rare
+    /// TP-dispatch path. MRVTSC unconditionally queues the registered s_dispatch
+    /// callback to the ThreadPool when the source is already completed at OnCompleted
+    /// time; the Volatile.Write ordering in OnCompleted ensures the TP-dispatched
+    /// s_dispatch reads _realContinuation / _realState / _capturedEC post-publication.
+    ///
+    /// Operates directly on SpscAwaiter to force the race deterministically (SpscPipe's
+    /// synchronous fast paths would short-circuit before OnCompleted is even called).
+    /// Stress N iterations to expose any non-deterministic ordering bug under
+    /// CI/jit/scheduler variance.
+    /// </summary>
+    [Fact]
+    public async Task SetResultBeforeOnCompleted_DirectAwaiter_Race_StressN_AllResultsDelivered()
+    {
+        using var dispatcher = new ForwardingDispatcher();
+
+        const int iterations = 100;
+        for (int i = 0; i < iterations; i++)
+        {
+            // Construct a fresh awaiter per iteration. The dispatcher is shared across
+            // iterations (ForwardingDispatcher just routes to TP).
+            var awaiter = new SpscAwaiter<int>(dispatcher);
+
+            // PRODUCER SIGNALS FIRST. _core stores the result; _core's _continuation
+            // is null because OnCompleted hasn't been called yet.
+            awaiter._core.SetResult(1000 + i);
+
+            // CONSUMER REGISTERS SECOND (manually). SpscAwaiter.OnCompleted writes
+            // _realContinuation / _realState / _capturedEC via Volatile.Write, then
+            // forwards (s_dispatch, this, ...) to _core.OnCompleted. _core sees a
+            // completed source and unconditionally queues s_dispatch to TP. TP runs
+            // s_dispatch, which routes through dispatcher to s_invokeWithEc, which
+            // reads the awaiter's published fields and invokes our continuation under
+            // the captured EC.
+            var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            awaiter.OnCompleted(_ =>
+            {
+                try { tcs.SetResult(awaiter._core.GetResult(awaiter.Version)); }
+                catch (Exception ex) { tcs.SetException(ex); }
+            }, state: null, awaiter.Version, ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
+
+            int result = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1000 + i, result);
+        }
     }
 
 }
