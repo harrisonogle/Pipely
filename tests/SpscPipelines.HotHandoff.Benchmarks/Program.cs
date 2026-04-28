@@ -71,32 +71,57 @@ static async Task RunLatency(int count, int size, int trials, int warmup, bool c
     string writeMode = copyChunk ? "full chunk copy" : "timestamp-only writes";
     Console.WriteLine($"Latency comparison: {count:N0} messages × {size} B, {trials} trials, {warmup} warmup, {writeMode}");
 
+    // Phase 1 — tp-default. No HotHandoffContinuationDispatcher exists during
+    // this phase, so the TP-default measurement is not contaminated by a
+    // busy-spinning worker thread eating a core.
+    Console.WriteLine();
+    Console.WriteLine($"--- Phase 1: tp-default ({warmup} warmup + {trials} recorded trials) ---");
     for (int w = 0; w < warmup; w++)
     {
-        Console.WriteLine($"  Warmup trial {w + 1}/{warmup} (not recorded)");
+        Console.WriteLine($"  Warmup {w + 1}/{warmup} (not recorded)");
         _ = await DispatcherLatencyHarness.Run(null, count, size, copyChunk);
-        using var dispatcher = new HotHandoffContinuationDispatcher();
-        _ = await DispatcherLatencyHarness.Run(dispatcher, count, size, copyChunk);
+    }
+    var tpTrials = new LatencyStats[trials];
+    for (int t = 0; t < trials; t++)
+        tpTrials[t] = await DispatcherLatencyHarness.Run(null, count, size, copyChunk);
+
+    // Phase 2 — hot-handoff. Single dispatcher amortized across warmup +
+    // all recorded trials (matches the [GlobalSetup] amortization pattern
+    // used by DispatcherThroughputBench.SpscPipe_HotHandoff_ProduceAndDrain).
+    // Per-trial slot/TP counts are taken as deltas of the cumulative
+    // dispatcher counters between trial boundaries.
+    Console.WriteLine();
+    Console.WriteLine($"--- Phase 2: hot-handoff ({warmup} warmup + {trials} recorded trials, single dispatcher) ---");
+    var hhTrials       = new LatencyStats[trials];
+    var dispatchTrials = new (long slot, long tp)[trials];
+    using (var dispatcher = new HotHandoffContinuationDispatcher())
+    {
+        for (int w = 0; w < warmup; w++)
+        {
+            Console.WriteLine($"  Warmup {w + 1}/{warmup} (not recorded)");
+            _ = await DispatcherLatencyHarness.Run(dispatcher, count, size, copyChunk);
+        }
+        long prevSlot = dispatcher.SlotDispatchedCount;
+        long prevTp   = dispatcher.TpOverflowedCount;
+        for (int t = 0; t < trials; t++)
+        {
+            hhTrials[t] = await DispatcherLatencyHarness.Run(dispatcher, count, size, copyChunk);
+            long currSlot = dispatcher.SlotDispatchedCount;
+            long currTp   = dispatcher.TpOverflowedCount;
+            dispatchTrials[t] = (currSlot - prevSlot, currTp - prevTp);
+            prevSlot = currSlot;
+            prevTp   = currTp;
+        }
     }
 
+    // Phase 3 — print per-trial side-by-side comparison.
     for (int t = 0; t < trials; t++)
     {
         Console.WriteLine();
         Console.WriteLine($"=== Trial {t + 1}/{trials} ===");
-
-        var tpStats = await DispatcherLatencyHarness.Run(null, count, size, copyChunk);
-
-        LatencyStats hhStats;
-        long slotDispatched, tpOverflowed;
-        using (var dispatcher = new HotHandoffContinuationDispatcher())
-        {
-            hhStats        = await DispatcherLatencyHarness.Run(dispatcher, count, size, copyChunk);
-            slotDispatched = dispatcher.SlotDispatchedCount;
-            tpOverflowed   = dispatcher.TpOverflowedCount;
-        }
-
-        DispatcherLatencyHarness.PrintComparison("Message latency (ns)", tpStats, hhStats);
-        PrintDispatchBreakdown(slotDispatched, tpOverflowed);
+        DispatcherLatencyHarness.PrintComparison("Message latency (ns)", tpTrials[t], hhTrials[t]);
+        var (slot, tp) = dispatchTrials[t];
+        PrintDispatchBreakdown(slot, tp);
     }
 }
 
