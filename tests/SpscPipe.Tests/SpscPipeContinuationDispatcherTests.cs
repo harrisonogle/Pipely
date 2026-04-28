@@ -537,4 +537,48 @@ public class SpscPipeContinuationDispatcherTests
         Assert.Equal(3, rr2.Buffer.Length);
         Assert.Equal(7, asyncLocal.Value);
     }
+
+    // ---------- C.3 — FlowExecutionContext suppressed (smoke for null-_capturedEC branch) ----------
+
+    /// <summary>
+    /// When the consumer awaits inside an ExecutionContext.SuppressFlow() block,
+    /// SpscAwaiter.OnCompleted captures _capturedEC = null and forwards (s_dispatch,
+    /// this) to _core.OnCompleted. s_invokeWithEc reads _capturedEC, sees null, and
+    /// takes the else branch — direct cont(st) invocation on the dispatcher's chosen
+    /// thread, no ExecutionContext.Run. This test pins that the branch is exercised
+    /// cleanly (no NRE on null EC, buffer delivered, await completes).
+    ///
+    /// Note: the spec §6 C.3 entry describes a stronger "no leak from prior cb"
+    /// property, but that property is structurally identical in old and new wirings
+    /// (both let SuppressFlow cbs mutate the worker's EC, both isolate default-flow
+    /// cbs in an EC frame). The differentiating test would require both wirings to
+    /// behave differently under the same input, which they don't for SuppressFlow
+    /// AsyncLocal observation. See the C.2 docstring for the same caveat applied
+    /// to per-cycle isolation.
+    /// </summary>
+    [Fact]
+    public async Task SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly()
+    {
+        using var dispatcher = new ForwardingDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            var mem = pipe.Writer.GetMemory(5);
+            mem.Span.Clear();
+            pipe.Writer.Advance(5);
+            await pipe.Writer.FlushAsync();
+        });
+
+        // No `using` block: AsyncFlowControl.Undo() is thread-affine and would throw
+        // when the using's Dispose runs on the post-await continuation thread (the
+        // dispatcher's worker thread, different from the SuppressFlow caller).
+        // The suppression "leaks" past method end; benign for this xunit test.
+        ExecutionContext.SuppressFlow();
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+        Assert.Equal(5, rr.Buffer.Length);
+    }
+
 }
