@@ -323,7 +323,11 @@ public sealed partial class SpscPipe : IDisposable
         {
             var recycled = _chainHead!;
             _chainHead   = recycled.Next!;
-            PushFreelist(recycled);
+
+            if (recycled.IsDonated)
+                recycled.DisposeOwned();      // foreign owner: release; drop the BufferSegment shell
+            else
+                PushFreelist(recycled);       // pool-rented: existing freelist path (with cap-overflow handling)
         }
     }
 }

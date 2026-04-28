@@ -408,4 +408,95 @@ public class SpscPipeWriterAppendTests
         Assert.Same(s, pipe._writingHead);
         Assert.Equal(60, pipe._totalWritten);
     }
+
+    // ---------- Recycle path: donated -> DisposeOwned + drop; rented -> freelist (unchanged) ----------
+
+    [Fact]
+    public async Task ReaderDrainsPastDonated_DisposesOwner_FreelistCountUnchanged()
+    {
+        using var pipe = new SpscPipelines.SpscPipe();
+        var donatedOwner = new TrackingMemoryOwner(30);
+        pipe.Writer.Append(donatedOwner);
+        // Force a subsequent rented tail so the donated segment becomes a non-tail chain segment.
+        pipe.Writer.GetMemory(50); pipe.Writer.Advance(50);
+
+        await pipe.Writer.FlushAsync();
+        var rr = await pipe.Reader.ReadAsync();
+        // Drain past the donated segment (and the rented bytes) entirely.
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+        int freelistBefore = pipe._freelistCount;
+
+        // The next FlushAsync runs RecycleDrainedSegments after re-acquiring the reader state.
+        await pipe.Writer.FlushAsync();
+
+        Assert.Equal(1, donatedOwner.DisposeCount);
+        // freelistCount may have grown by 1 (the rented segment that was once the writingHead
+        // before GetMemory transitioned past it — but in this minimal scenario,
+        // _writingHead never transitioned again, so the rented tail stays as _writingHead and
+        // recycle stops at it). Either way, it must NOT have grown to absorb the donated segment.
+        Assert.True(pipe._freelistCount <= freelistBefore + 1);
+    }
+
+    [Fact]
+    public async Task RecyclePath_RentedSegmentStillFreelisted_RegressionGuard()
+    {
+        // Existing rented-segment recycle behavior must be preserved.
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        // Two rented segments in chain.
+        pipe.Writer.GetMemory(64); pipe.Writer.Advance(64);
+        pipe.Writer.GetMemory(64); pipe.Writer.Advance(50);
+        await pipe.Writer.FlushAsync();
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+        int freelistBefore = pipe._freelistCount;
+        await pipe.Writer.FlushAsync();
+        // The first segment is recycled to the freelist (or disposed if cap-overflow).
+        Assert.True(pipe._freelistCount > freelistBefore);
+    }
+
+    [Fact]
+    public async Task DisposePipe_WithMixedChain_DisposesAllOwners()
+    {
+        var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+
+        var donated1 = new TrackingMemoryOwner(20);
+        var donated2 = new TrackingMemoryOwner(30);
+
+        pipe.Writer.Append(donated1);
+        pipe.Writer.GetMemory(64); pipe.Writer.Advance(40);    // rented in middle
+        pipe.Writer.Append(donated2);
+        await pipe.Writer.FlushAsync();
+        // Don't drain — chain is full of un-consumed segments.
+
+        pipe.Dispose();
+
+        Assert.Equal(1, donated1.DisposeCount);
+        Assert.Equal(1, donated2.DisposeCount);
+    }
+
+    [Fact]
+    public async Task ReadResultBufferContent_IncludesDonatedBytes_InCorrectPosition()
+    {
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+
+        // Rented [0..3] = 0x01,0x02,0x03,0x04
+        var rentedMem = pipe.Writer.GetMemory(64);
+        rentedMem.Span[0] = 0x01; rentedMem.Span[1] = 0x02;
+        rentedMem.Span[2] = 0x03; rentedMem.Span[3] = 0x04;
+        pipe.Writer.Advance(4);
+
+        // Donated bytes [4..6] = 0xAA,0xBB,0xCC
+        var donatedBytes = new byte[] { 0xAA, 0xBB, 0xCC };
+        var donatedOwner = new TrackingMemoryOwner(donatedBytes);
+        pipe.Writer.Append(donatedOwner);
+
+        await pipe.Writer.FlushAsync();
+        var rr = await pipe.Reader.ReadAsync();
+        var arr = rr.Buffer.ToArray();
+        Assert.Equal(new byte[] { 0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB, 0xCC }, arr);
+
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+    }
 }
