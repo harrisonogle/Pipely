@@ -719,20 +719,28 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     // both the OnCompleted-fires-first and SetResult-fires-first races; see §4 publication
     // ordering in the source-side EC-capture spec). Read by s_invokeWithEc on the dispatcher's
     // chosen thread; cleared after read.
-    public Action<object?>? _realContinuation;
-    public object?          _realState;
-    public ExecutionContext? _capturedEC;
+    private Action<object?>? _realContinuation;
+    private object?          _realState;
+    private ExecutionContext? _capturedEC;
+
+    // Worker-thread-only scratch fields for the allocation-free ExecutionContext.Run pattern.
+    private Action<object?>? _runCb;
+    private object? _runState;
+
+    // Dispatcher for routing continuations to the consumer's chosen thread.
+    private readonly IContinuationDispatcher _dispatcher;
 
     public const int Inactive   = 0b00;
     public const int Pending    = 0b01;
     public const int StateMask  = 0b01;
     public const int CancelFlag = 0b10;
 
+    public SpscAwaiter(IContinuationDispatcher dispatcher) => _dispatcher = dispatcher;
+
     public short Version => _core.Version;
     public T GetResult(short token) => _core.GetResult(token);
     public ValueTaskSourceStatus GetStatus(short token) => _core.GetStatus(token);
-    public void OnCompleted(Action<object?> c, object? s, short token, ValueTaskSourceOnCompletedFlags f)
-        => _core.OnCompleted(c, s, token, f);
+    // OnCompleted: captures EC, forwards (s_dispatch, this) to _core with FlowExecutionContext+UseSchedulingContext stripped — full body in source-side EC-capture spec §2.2.
 }
 ```
 
@@ -781,7 +789,7 @@ Lost-wakeup re-check paths inside `ParkReadAwaiter` / `ParkFlushAwaiter` that **
 
 **Symmetric for `_lastPublishedReaderState`.** The writer's signaler (called from `AdvanceTo` via `SignalFlushIfBackpressureRelieved` and from `Reader.Complete` via `SignalFlushAwaiterIfPending`) runs on the **reader** thread; it reads `_lastPublishedReaderState`, which is reader-private and was set on the reader thread immediately before the signaler call. No cross-thread sync needed for that read. The constructed `FlushResult` is then stashed on the awaiter and dispatched; the dispatched callback's `_core.SetResult` provides release/acquire to the writer's continuation. Future maintainers adding additional signaler call sites must place them on the reader thread to preserve this property.
 
-**Cancel-via-stash transitive-fence visibility.** The cross-thread `CancelPendingRead` path (canceler on a third thread) constructs an ROS from segments reachable through the stash. Visibility chain: writer's freeze writes → (writer's `Publish` release fence) → reader's `TryAcquire` acquire fence → reader's stash writes (same thread, sequenced) → reader's CAS Inactive→Pending release → canceler's CAS Pending→Inactive acquire → canceler's reads of stash + segment fields → canceler's `_core.SetResult` call → `MRVTSC` invokes `s_dispatch` inline → `s_dispatch`'s call to `dispatcher.UnsafeQueueUserWorkItem` (which provides a happens-before edge into the dispatched callback) → `s_invokeWithEc`'s `_core.SetResult` release → continuation's `GetResult` acquire. All segment fields the canceler reads (`RunningIndex`, `Memory`, etc.) were established by the writer's freeze before the writer published, and the chain transitively carries the writes through the canceler thread, the dispatcher's hand-off, and into the continuation.
+**Cancel-via-stash transitive-fence visibility.** The cross-thread `CancelPendingRead` path (canceler on a third thread) constructs an ROS from segments reachable through the stash. Visibility chain: writer's freeze writes → (writer's `Publish` release fence) → reader's `TryAcquire` acquire fence → reader's stash writes (same thread, sequenced) → reader's CAS Inactive→Pending release → canceler's CAS Pending→Inactive acquire → canceler's reads of stash + segment fields → canceler's `_core.SetResult` call → `MRVTSC` invokes `s_dispatch` inline → `s_dispatch`'s call to `dispatcher.UnsafeQueueUserWorkItem` (which provides a happens-before edge into the dispatched callback) → canceler's _core.SetResult release (which invokes s_dispatch inline; s_dispatch enqueues s_invokeWithEc on the dispatcher; s_invokeWithEc invokes the user continuation under the captured EC) → continuation's `GetResult` acquire. All segment fields the canceler reads (`RunningIndex`, `Memory`, etc.) were established by the writer's freeze before the writer published, and the chain transitively carries the writes through the canceler thread, the dispatcher's hand-off, and into the continuation.
 
 **`Interlocked.Or` portability note.** `Interlocked.Or(ref int, int)` was added in .NET 7; this project targets net10.0, so it's available. If back-porting to older targets, fall back to a CAS loop.
 
@@ -1341,7 +1349,7 @@ internal sealed class ThreadPoolContinuationDispatcher : IContinuationDispatcher
 
 When `SpscPipeOptions.ContinuationDispatcher` is `null`, the pipe uses `ThreadPoolContinuationDispatcher.Instance`. See §5 "Continuation dispatch" and invariant I16 for the stash-and-dispatch protocol and EC discipline.
 
-**Why `Action<object?>` and `UnsafeQueueUserWorkItem`-shaped naming.** The signature exactly matches `ThreadPool.UnsafeQueueUserWorkItem`'s, so the canonical implementation is a one-line forwarder and the EC-non-capture contract is explicit in the method name (mirroring the BCL primitive that has the matching semantics). An alternative `IThreadPoolWorkItem`-style struct API would avoid an `Action<object?>` allocation, but SpscPipe's static `s_dispatch*` callbacks are allocated once at type-init, so there is no per-dispatch delegate alloc to optimize away.
+**Why `Action<object?>` and `UnsafeQueueUserWorkItem`-shaped naming.** The signature exactly matches `ThreadPool.UnsafeQueueUserWorkItem`'s, so the canonical implementation is a one-line forwarder and the EC-non-capture contract is explicit in the method name (mirroring the BCL primitive that has the matching semantics). An alternative `IThreadPoolWorkItem`-style struct API would avoid an `Action<object?>` allocation, but SpscAwaiter<T>'s static delegates (`s_dispatch`, `s_invokeWithEc`, `s_runContinuation`) are allocated once at type-init, so there is no per-dispatch delegate alloc to optimize away.
 
 ### Scheduler bypass
 

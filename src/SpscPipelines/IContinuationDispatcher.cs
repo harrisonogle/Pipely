@@ -27,11 +27,14 @@ public interface IContinuationDispatcher
     /// </item>
     /// <item>
     /// The implementation MUST NOT capture or apply an <see cref="System.Threading.ExecutionContext"/>.
-    /// SpscPipe relies on <c>ManualResetValueTaskSourceCore&lt;T&gt;</c>'s internal EC restoration
-    /// (via the consumer-captured EC from <see cref="System.Threading.Tasks.Sources.IValueTaskSource.OnCompleted"/>)
-    /// to scope the continuation correctly. Adding EC manipulation in the dispatcher will either
-    /// leak the producer's EC into the continuation (when <c>FlowExecutionContext</c> is absent
-    /// on the original await) or introduce wasteful capture/apply overhead.
+    /// EC handling for SpscPipe's awaitable continuations is performed by <c>SpscAwaiter&lt;T&gt;</c>:
+    /// it captures the consumer's <see cref="System.Threading.ExecutionContext"/> at
+    /// <see cref="System.Threading.Tasks.Sources.IValueTaskSource.OnCompleted"/> time (per the
+    /// consumer's <c>FlowExecutionContext</c> flag), passes the dispatcher a work item that carries
+    /// the captured EC alongside the continuation (via fields on the awaiter — the awaiter is the
+    /// <c>state</c> argument), and applies the EC via <see cref="System.Threading.ExecutionContext.Run"/>
+    /// at invoke time. The dispatcher is purely a thread router. Adding EC manipulation in the
+    /// dispatcher would interfere with the source-side capture/apply protocol and is forbidden.
     /// </item>
     /// <item>
     /// The implementation MUST be thread-safe; concurrent calls from multiple producer threads
