@@ -1,8 +1,9 @@
 # HotHandoff Dispatcher Benchmark Results
 
-**Compared:** `tp-default` (no `ContinuationDispatcher` set; SpscPipe uses
-`ThreadPoolContinuationDispatcher.Instance`) vs `hot-handoff`
-(`SpscPipelines.HotHandoff.HotHandoffContinuationDispatcher`).
+**Compared:**
+
+- **Latency** (custom harness, P50/P90/P99 by sort): `tp-default` (SpscPipe with `ContinuationDispatcher = null`, i.e., `ThreadPoolContinuationDispatcher.Instance`) vs `hot-handoff` (SpscPipe with `HotHandoffContinuationDispatcher`).
+- **Throughput** (BenchmarkDotNet, 1 MiB / 4 KiB chunks): three-way head-to-head — `BclPipe` (BCL `System.IO.Pipelines.Pipe`, baseline), `SpscPipe_TpDefault`, `SpscPipe_HotHandoff` — all in the same BDN process invocation so their numbers are directly comparable.
 
 **Spec reference:** `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` §8.
 
@@ -26,8 +27,8 @@ measurement that drove it.
 - Three latency trials per recorded run; warmup trial not recorded.
 - Hardware/build details captured at the top of each results section.
 - The hot-handoff worker thread sits at ~100% on its core during the busy-spin
-  loop. Latency wins must be read against this CPU cost.
-- **Throughput-benchmark caveat:** Each BDN iteration constructs and disposes a fresh `HotHandoffContinuationDispatcher`, so iteration time includes thread-startup (~30-100 µs on Linux) and `Thread.Join` cost. The throughput number is therefore a conservative lower bound for steady-state hot-handoff use, not a steady-state ceiling. The latency comparison (which constructs one dispatcher per recorded trial, not per message) is unaffected.
+  loop. Latency and throughput wins must be read against this CPU cost.
+- **Dispatcher amortization:** `SpscPipe_HotHandoff_ProduceAndDrain` constructs the dispatcher once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring `BclPipe`'s no-extra-state baseline and `SpscPipe_TpDefault`'s singleton-dispatcher baseline). Per-iteration cost for all three rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one dispatcher per recorded trial, not per message).
 
 ## Starting tunables
 
