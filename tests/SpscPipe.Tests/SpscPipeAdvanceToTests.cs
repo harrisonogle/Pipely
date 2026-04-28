@@ -82,4 +82,25 @@ public class SpscPipeAdvanceToTests
         // Try to AdvanceTo on pipe2 with positions from pipe1 — should throw (R4-7).
         Assert.Throws<InvalidOperationException>(() => pipe2.Reader.AdvanceTo(r1.Buffer.End));
     }
+
+    [Fact]
+    public async Task AdvanceTo_DonatedSegmentFromDifferentPipe_Throws()
+    {
+        // R4-7 pipe-identity check (SpscPipe.Reader.cs:113) must fire even when the
+        // SequencePosition points inside a donated segment of pipe1 — donated segments
+        // set OwnerToken = pipe1, so a cross-pipe AdvanceTo to pipe2 must reject.
+        using var pipe1 = new SpscPipelines.SpscPipe();
+        using var pipe2 = new SpscPipelines.SpscPipe();
+
+        var donatedOwner = new TrackingMemoryOwner(20);
+        pipe1.Writer.Append(donatedOwner);
+        await pipe1.Writer.FlushAsync();
+        var r1 = await pipe1.Reader.ReadAsync();
+
+        // Try to AdvanceTo on pipe2 with a position inside pipe1's donated segment.
+        Assert.Throws<InvalidOperationException>(() => pipe2.Reader.AdvanceTo(r1.Buffer.End));
+
+        // Cleanup: drain pipe1 properly so its Dispose disposes donatedOwner.
+        pipe1.Reader.AdvanceTo(r1.Buffer.End);
+    }
 }
