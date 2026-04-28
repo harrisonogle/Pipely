@@ -36,7 +36,7 @@ The method is named `UnsafeQueueUserWorkItem` deliberately — it mirrors `Threa
 ## Contract (must be followed by all implementations)
 
 1. **The callback MUST be invoked exactly once.** Failing to invoke it hangs the consumer's `await` indefinitely.
-2. **The implementation MUST NOT capture or apply an `ExecutionContext`.** SpscPipe relies on `ManualResetValueTaskSourceCore`'s internal EC restoration (using the consumer-captured EC from `OnCompleted` time) to scope the continuation correctly. Adding EC manipulation in the dispatcher will leak the *producer's* EC into the continuation in the rare case where the consumer's `await` suppressed `FlowExecutionContext`. For TP-based dispatchers, use `ThreadPool.UnsafeQueueUserWorkItem` (NOT the safe `QueueUserWorkItem` or `Task.Run`, both of which capture EC implicitly). For dedicated-thread dispatchers, hand off the callback delegate as-is.
+2. **The implementation MUST NOT capture or apply an `ExecutionContext`.** EC handling for `SpscPipe`'s awaitable continuations is performed by `SpscAwaiter<T>`: it captures the consumer's `ExecutionContext` at `OnCompleted` time (per the consumer's `FlowExecutionContext` flag), passes the dispatcher a work item that carries the captured EC alongside the continuation (via fields on the awaiter — the awaiter is the `state` argument), and applies the EC via `ExecutionContext.Run` at invoke time. The dispatcher is purely a thread router. Adding EC manipulation in the dispatcher would interfere with the source-side capture/apply protocol and is forbidden. For TP-based dispatchers, use `ThreadPool.UnsafeQueueUserWorkItem` (NOT the safe `QueueUserWorkItem` or `Task.Run`, both of which capture EC implicitly). For dedicated-thread dispatchers, hand off the callback delegate as-is.
 3. **The implementation MUST be thread-safe.** A single dispatcher instance may be shared across multiple pipes; `UnsafeQueueUserWorkItem` may be called concurrently from multiple producer threads.
 4. **The implementation MUST NOT throw.** A throwing dispatcher will crash the producer's signal path. A dispatcher in a failed state should still attempt to invoke the callback (e.g., fall back to TP) rather than throw.
 5. **The implementation SHOULD wrap the callback invocation in `try/catch`** so a throwing continuation doesn't kill the dispatcher's worker thread.
@@ -131,20 +131,33 @@ Pin the thread to a dedicated core for tightest cache-locality (P/Invoke `sched_
 - **Telemetry counters** (dispatched, fell-back-to-TP, mailbox depth) for tuning visibility.
 - **Lifecycle plumbing** for clean shutdown that drains in-flight work.
 
-## EC contract: why it matters
+## EC contract: how it works (source-side capture)
 
-When the consumer's `await pipe.Reader.ReadAsync()` suspends, the runtime captures the consumer's current `ExecutionContext` (which carries `AsyncLocal<T>` values, ambient diagnostic state, etc.) **on the consumer's thread, at `OnCompleted` time**. That captured EC is stored on the awaiter's `_core` field.
+When the consumer's `await pipe.Reader.ReadAsync()` suspends, **`SpscAwaiter<T>.OnCompleted`** captures the consumer's current `ExecutionContext` (which carries `AsyncLocal<T>` values, ambient diagnostic state, etc.) on the consumer's thread, at the moment of the `await`. The capture is gated by the `ValueTaskSourceOnCompletedFlags.FlowExecutionContext` flag the consumer's await machinery passed in: if the flag is set (the default), `_capturedEC = ExecutionContext.Capture()`; if the flag is cleared (the consumer is inside an `ExecutionContext.SuppressFlow()` block), `_capturedEC = null` — the consumer has explicitly opted out of EC propagation.
 
-When the producer eventually signals via SetResult, the inner `ExecutionContext.RunInternal(captured, callback, state)` saves the *current* (calling) thread's EC, applies the captured (consumer's) EC for the duration of the callback, then restores the calling thread's EC. The continuation runs under the *consumer's* EC — correctly observing the consumer's `AsyncLocal` values, not the producer's or the dispatcher thread's.
+`SpscAwaiter<T>` then writes the consumer-supplied `(continuation, state)` pair to its `_realContinuation` / `_realState` fields and forwards a different `(callback, state)` pair to `_core.OnCompleted` — specifically, its own internal `s_dispatch` delegate paired with `this` (the awaiter). It also strips both `FlowExecutionContext` and `UseSchedulingContext` from the flags forwarded to `_core.OnCompleted`:
 
-This works because the *captured* EC is what's applied — not whatever the dispatcher does at queue time. **A dispatcher that adds its own EC capture/apply layer (e.g., via `ThreadPool.QueueUserWorkItem` or `Task.Run`, both of which capture EC implicitly) introduces a subtle hazard:** in the rare case where the consumer's `await` suppressed `FlowExecutionContext` (so the awaiter has no captured EC to restore), the dispatcher's captured EC — *the producer's EC* — would be applied to the continuation. This silently leaks producer-side `AsyncLocal` values into the consumer's continuation.
+- **`FlowExecutionContext` is stripped** because `SpscAwaiter` already captured the EC; leaving the flag on would have `MRVTSC` capture again (redundant).
+- **`UseSchedulingContext` is stripped** because `SpscPipe`'s public contract is that the configured `IContinuationDispatcher` controls continuation routing — the consumer's captured `SynchronizationContext` / `TaskScheduler` is intentionally ignored.
 
-For typical `await` (with default flags), this hazard is masked by the inner `RunInternal`. But the contract forbids it because:
-1. There's no benefit — MRVTSC will override the EC anyway.
-2. The capture-apply overhead is wasted CPU.
-3. The exotic-edge-case correctness gap is real and hard to debug.
+When the producer signals (`_core.SetResult` / `_core.SetException`), `MRVTSC` invokes the registered `s_dispatch` callback inline on the producer's thread (because `RunContinuationsAsynchronously = false`). `s_dispatch` calls `dispatcher.UnsafeQueueUserWorkItem(s_invokeWithEc, awaiter)` — handing the work item to the configured dispatcher. The dispatcher's chosen thread invokes `s_invokeWithEc`, which:
 
-The fix is the same as the recommendation: **dispatchers must use `ThreadPool.UnsafeQueueUserWorkItem` or hand off the callback as-is to a dedicated thread**. The naming of the interface method (`UnsafeQueueUserWorkItem`) communicates this contract by convention.
+1. Reads and clears `_realContinuation`, `_realState`, `_capturedEC`.
+2. If `_capturedEC` is non-null, calls `ExecutionContext.Run(_capturedEC, s_runContinuation, awaiter)` — applying the consumer's captured EC for the duration of the continuation invocation; the dispatcher thread's pre-call EC is automatically saved and restored by `ExecutionContext.Run`.
+3. If `_capturedEC` is null (consumer suppressed flow), invokes the continuation directly on the dispatcher's chosen thread — the consumer explicitly opted out of EC propagation and accepts whatever EC that thread has.
+
+The EC isolation guarantee `SpscPipe` gives the consumer is therefore: **regardless of the `IContinuationDispatcher` configured, your `await pipe.Reader.ReadAsync()` continuation runs under the `ExecutionContext` your code had at the `await` — same as standard `Task.Run` / `await` semantics — provided `FlowExecutionContext` was set at `OnCompleted` (the default). This guarantee is robust against worker-thread-EC drift in dispatchers with long-lived worker threads (e.g., `HotHandoffContinuationDispatcher`).**
+
+A dispatcher that captures EC itself (e.g., uses the EC-capturing `ThreadPool.QueueUserWorkItem` instead of the recommended `UnsafeQueueUserWorkItem`) does NOT break the consumer's EC guarantee — `s_invokeWithEc` applies the consumer-captured EC after the dispatcher's hop — but it DOES introduce wasteful capture/apply overhead and violates contract item #2.
+
+## Scheduler bypass
+
+`SpscPipe`'s `Reader.ReadAsync` and `Writer.FlushAsync` continuations do **not** honor the consumer's captured `SynchronizationContext` or `TaskScheduler`. The continuation runs on the thread chosen by the configured `IContinuationDispatcher` (default: the .NET `ThreadPool` via `ThreadPoolContinuationDispatcher`). This is independent of the consumer's `ConfigureAwait(true|false)` choice — both produce identical observable behavior. Consumers requiring continuation on a specific scheduler should either:
+
+- (a) post explicitly via `SynchronizationContext.Post` / `TaskScheduler.FromCurrentSynchronizationContext().StartNew` after the `await`, or
+- (b) wrap the awaitable in a `Task.Run` to capture context boundaries.
+
+This is a deliberate contract choice, not an implementation accident. `SpscPipe` is a high-throughput primitive aimed at server-side workloads where consumer-side scheduler capture is not the desired routing. The explicit contract clause prevents surprise.
 
 ## Where to look in the code
 
@@ -152,10 +165,10 @@ The fix is the same as the recommendation: **dispatchers must use `ThreadPool.Un
 |------|-------|
 | Interface + default impl | `src/SpscPipelines/IContinuationDispatcher.cs` |
 | Options field | `src/SpscPipelines/SpscPipeOptions.cs` |
-| Stash fields on awaiter | `src/SpscPipelines/SpscAwaiter.cs` (`_dispatchResult`, `_dispatchException`) |
-| Static dispatch delegates + helper | `src/SpscPipelines/SpscPipe.cs` (`s_dispatch*`, `DispatchVia`) |
-| Signal-path SetResult/SetException sites | All in `SpscPipe.cs`, `SpscPipe.Reader.cs`, `SpscPipe.Writer.cs` — every `_core.SetResult`/`SetException` runs inside one of the four `s_dispatch*` static delegates |
-| Tests (EC flow, isolation, contract guard, exception, version safety) | `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs` |
+| Source-side EC capture (consumer-thread) | `src/SpscPipelines/SpscAwaiter.cs` (`OnCompleted` override; `_realContinuation` / `_realState` / `_capturedEC` fields) |
+| Source-side EC application (dispatcher-thread) | `src/SpscPipelines/SpscAwaiter.cs` (`s_dispatch`, `s_invokeWithEc`, `s_runContinuation` static delegates) |
+| Signal-path SetResult/SetException sites | All in `SpscPipe.cs`, `SpscPipe.Reader.cs`, `SpscPipe.Writer.cs` — direct `_core.SetResult` / `_core.SetException` calls; the dispatcher hop is encapsulated inside `SpscAwaiter`'s `OnCompleted` + `s_dispatch` flow |
+| Tests (EC flow, isolation, scheduler bypass, race) | `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs` |
 
 ## Spec references
 
