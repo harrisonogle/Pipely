@@ -55,7 +55,7 @@ public sealed partial class SpscPipe : IDisposable
         _readerInstance = new SpscPipeReader(this);
     }
 
-    public PipeWriter Writer => _writerInstance;
+    public SpscPipeWriter Writer => _writerInstance;
     public PipeReader Reader => _readerInstance;
 
     public void Dispose()
