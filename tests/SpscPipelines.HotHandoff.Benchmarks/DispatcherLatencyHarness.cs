@@ -40,6 +40,14 @@ internal static class DispatcherLatencyHarness
         long bytesTotal = (long)messageCount * messageBytes;
         int messageIdx = 0;
 
+        // Pre-allocated zero-filled chunk; producer copies it into each rented
+        // buffer (after stamping the timestamp into the first 8 bytes) so the
+        // per-message work matches DispatcherThroughputBench.ProduceAndDrain's
+        // `chunk.CopyTo(memory)` pattern. With --count 256 --size 4096 this
+        // harness now runs the same workload shape as the BDN throughput row;
+        // dispatcher event patterns and slot/TP overflow rates are comparable.
+        var chunk = new byte[messageBytes];
+
         var producer = Task.Run(async () =>
         {
             for (int i = 0; i < messageCount; i++)
@@ -47,6 +55,7 @@ internal static class DispatcherLatencyHarness
                 var mem = pipe.Writer.GetMemory(messageBytes);
                 long t = Stopwatch.GetTimestamp();
                 MemoryMarshal.Write(mem.Span, in t);
+                chunk.AsSpan(8).CopyTo(mem.Span.Slice(8));
                 pipe.Writer.Advance(messageBytes);
                 var fr = await pipe.Writer.FlushAsync();
                 if (fr.IsCompleted) break;
