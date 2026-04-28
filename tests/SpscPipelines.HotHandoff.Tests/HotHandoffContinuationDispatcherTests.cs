@@ -233,6 +233,53 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
+    public void Dispatch_AsyncLocalMutationInCallback_DoesNotLeakToSubsequentCallback()
+    {
+        // EC isolation contract — a callback that mutates an AsyncLocal must
+        // not pollute the dispatcher's worker thread's EC such that a later
+        // callback inherits the mutation. Without isolation, the worker
+        // thread's "current EC" would drift as cbs mutate AsyncLocal values;
+        // a subsequent cb invoked when MRVTSC has no captured EC to apply
+        // (e.g., the consumer's await suppressed FlowExecutionContext) would
+        // run under the drifted EC and observe the leaked AsyncLocal value —
+        // a cross-tenant data leak hazard.
+        //
+        // The dispatcher captures EC at construction and runs every cb wrapped
+        // in ExecutionContext.Run(_capturedEc, ...), so mutations made inside
+        // a cb are scoped to that cb's invocation and do not drift onto the
+        // worker thread's EC for subsequent cbs.
+
+        var asyncLocal = new AsyncLocal<int>();
+        asyncLocal.Value = 0;
+
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+
+        using var firstDone = new ManualResetEventSlim(false);
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            asyncLocal.Value = 999;   // mutate inside cb
+            firstDone.Set();
+        }, null);
+        Assert.True(firstDone.Wait(TimeSpan.FromSeconds(5)),
+            "First callback never completed.");
+
+        int observed = -1;
+        using var secondDone = new ManualResetEventSlim(false);
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            observed = asyncLocal.Value;
+            secondDone.Set();
+        }, null);
+        Assert.True(secondDone.Wait(TimeSpan.FromSeconds(5)),
+            "Second callback never completed.");
+
+        // Without EC isolation: observed would be 999 (worker EC polluted by
+        // first cb). With isolation: observed is 0 (each cb runs under the
+        // captured-at-construction EC, which had asyncLocal == 0).
+        Assert.Equal(0, observed);
+    }
+
+    [Fact]
     public void Dispatch_AfterDispose_AlwaysRunsOnThreadPool()
     {
         var dispatcher = new HotHandoffContinuationDispatcher();

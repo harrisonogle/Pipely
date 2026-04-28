@@ -38,6 +38,33 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
     private object? _pendingState;
     private readonly Thread _thread;
 
+    // EC isolation: captured at construction, applied to every cb invocation
+    // via ExecutionContext.Run. Prevents AsyncLocal mutations made inside one
+    // cb from drifting onto the worker thread and leaking into subsequent
+    // callbacks (the cross-tenant data leak hazard — without isolation, a cb
+    // that mutates an AsyncLocal would leave the worker thread's "current EC"
+    // mutated, and a later cb invoked when the consumer's awaiter has null
+    // captured EC — e.g., FlowExecutionContext suppressed — would inherit it).
+    // Each cb runs under a known consistent EC regardless of mutations from
+    // prior cbs or whether MRVTSC's RunInternal has a captured EC to apply.
+    private readonly ExecutionContext? _capturedEc;
+
+    // Worker-thread-only scratch fields used to pass cb/state into the
+    // ContextCallback without per-invocation allocation. Only the worker
+    // thread reads/writes these, sequentially around each ExecutionContext.Run.
+    private Action<object?>? _runCb;
+    private object? _runState;
+
+    private static readonly ContextCallback s_invokeCb = static state =>
+    {
+        var self = (HotHandoffContinuationDispatcher)state!;
+        var cb = self._runCb!;
+        var st = self._runState;
+        self._runCb = null;
+        self._runState = null;
+        cb(st);
+    };
+
     // Diagnostic-only telemetry (spec §10 "may be added if measurements indicate
     // a need"). Cumulative since dispatcher construction. Not part of the public
     // contract; exposed via internal accessors for the benchmark project.
@@ -59,6 +86,13 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
 
     public HotHandoffContinuationDispatcher()
     {
+        // Capture the constructing thread's EC. If the caller has
+        // ExecutionContext.SuppressFlow active at construction, this returns
+        // null and we fall through to direct cb invocation (the user has
+        // explicitly opted out of EC isolation). Otherwise, every cb runs
+        // wrapped in ExecutionContext.Run(_capturedEc, ...) — see Loop.
+        _capturedEc = ExecutionContext.Capture();
+
         _thread = new Thread(Loop)
         {
             IsBackground = true,
@@ -94,7 +128,27 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
             {
                 var st = _pendingState;
                 _pendingState = null;
-                try { cb(st); }
+                try
+                {
+                    if (_capturedEc is not null)
+                    {
+                        // Wrap cb in ExecutionContext.Run with the construction-time
+                        // captured EC. Any AsyncLocal mutations the cb makes are scoped
+                        // to this Run invocation; after Run returns, the worker thread's
+                        // EC is restored to its pre-Run state. This guarantees that the
+                        // next cb invocation starts under the same captured EC, with no
+                        // drift from prior cbs.
+                        _runCb = cb;
+                        _runState = st;
+                        ExecutionContext.Run(_capturedEc, s_invokeCb, this);
+                    }
+                    else
+                    {
+                        // Constructor was in a SuppressFlow scope; user explicitly
+                        // opted out of EC isolation.
+                        cb(st);
+                    }
+                }
                 catch { /* contract item #5: dispatcher thread survives a throwing continuation */ }
 
                 // Clear Busy bit; preserve ShutdownRequested if Dispose has set it.
