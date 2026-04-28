@@ -95,6 +95,15 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
     public void Dispose()
     {
         Interlocked.Or(ref _state, ShutdownRequested);
-        _thread.Join();
+
+        // If Dispose is called from within a callback the dispatcher routed
+        // (i.e., the current thread IS the worker thread), Joining would
+        // self-deadlock. The worker observes ShutdownRequested when the cb
+        // returns to Loop and exits naturally. In that case, Dispose returns
+        // before the worker terminates; the dispatcher is functionally
+        // shutdown either way (every subsequent Dispatch CAS sees state ≥ 2
+        // and routes to TP).
+        if (Thread.CurrentThread != _thread)
+            _thread.Join();
     }
 }

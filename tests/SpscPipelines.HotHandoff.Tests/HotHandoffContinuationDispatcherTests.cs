@@ -258,6 +258,45 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
+    public void Dispose_FromWithinCallback_DoesNotDeadlock_AndSubsequentDispatchesRouteToTp()
+    {
+        // Reproduces the throughput-benchmark hang: a callback running on the
+        // worker thread calls dispatcher.Dispose(). Without the
+        // Thread.CurrentThread == _thread escape, _thread.Join() self-deadlocks
+        // (thread waiting for itself to exit). With the escape, Dispose returns
+        // immediately; the worker thread terminates naturally once the cb
+        // returns to the loop.
+        var dispatcher = new HotHandoffContinuationDispatcher();
+        using var firstDone  = new ManualResetEventSlim(false);
+        using var secondDone = new ManualResetEventSlim(false);
+        bool secondOnTpThread = false;
+
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            dispatcher.Dispose();   // T_w Dispose — must not deadlock.
+            firstDone.Set();
+        }, null);
+
+        Assert.True(firstDone.Wait(TimeSpan.FromSeconds(5)),
+            "Self-Dispose deadlocked: the callback never finished.");
+
+        // After Dispose returned, every subsequent Dispatch must route to TP
+        // (state has ShutdownRequested set, so Vacant→Busy CAS cannot succeed),
+        // even though the worker thread may still be briefly alive while the
+        // outer cb finishes returning to the loop.
+        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        {
+            secondOnTpThread = Thread.CurrentThread.IsThreadPoolThread;
+            secondDone.Set();
+        }, null);
+
+        Assert.True(secondDone.Wait(TimeSpan.FromSeconds(5)),
+            "Post-self-Dispose dispatch never ran.");
+        Assert.True(secondOnTpThread,
+            "Post-self-Dispose dispatch should route to TP.");
+    }
+
+    [Fact]
     public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
     {
         using var dispatcher = new HotHandoffContinuationDispatcher();
