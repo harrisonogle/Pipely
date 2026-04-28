@@ -174,6 +174,7 @@ Steps 2–4 are unordered; only the position of *all of them* before step 6 matt
 | Linked list (`Next` pointers) | Writer | Reader walks but never mutates |
 | `BufferSegment` objects | Writer (allocated via freelist) | Reader holds references via `_readHead`, `_readTail`, and acquired `WriterState`s |
 | `IMemoryOwner<byte>` per segment | Writer (rents from `_options.Pool`) | None directly; reader sees buffer via `BufferSegment.Memory` |
+| `IMemoryOwner<byte>` (donated, post-2026-04-28-Append) | Writer (adopted from caller via `Append`) | None directly; reader sees buffer via `BufferSegment.Memory`. Released on recycle (`DisposeOwned`) or `SpscPipe.Dispose`. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` |
 | Freelist of recyclable segments | Writer-private | None |
 | `_chainHead` / `_writingHead` | Writer-private | None |
 | `_readHead` / `_readTail` cursors | Reader-private | None |
@@ -229,6 +230,8 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
 }
 ```
 
+**Buffer-ownership transfer (post-2026-04-28).** `BufferSegment` gained an `IsDonated : bool` field and an `AdoptFrom(IMemoryOwner<byte>, Memory<byte>, long, object)` initializer to support `SpscPipeWriter.Append`'s buffer-ownership-transfer path. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §3 for the full definition. The recycle path (this section) branches on `IsDonated`: rented → `PushFreelist` (existing); donated → `DisposeOwned()` and discard.
+
 **Note on `Next` semantics.** `BufferSegment.Next` is overloaded to serve both the live chain (when the segment is in `_chainHead..._writingHead`) and the writer-private freelist (when sitting on the freelist). Its semantics are well-defined only conditional on which list the segment is currently in. Recycling clears `Next` (`RecycleReset`); freelist push sets `Next` to the freelist's previous head; allocation pop reads it; `Freeze` sets `Next` to the new tail.
 
 ### Allocation path (writer rents a new tail)
@@ -267,7 +270,11 @@ void RecycleDrainedSegments()
         var recycled = _chainHead;
         _chainHead   = _chainHead.Next!;
 
-        if (_freelistCount < _options.MaxFreelistSegments)
+        if (recycled.IsDonated)
+        {
+            recycled.DisposeOwned();      // foreign owner: release; drop the BufferSegment shell (post-2026-04-28)
+        }
+        else if (_freelistCount < _options.MaxFreelistSegments)
         {
             PushFreelist(recycled);
             _freelistCount++;
@@ -294,10 +301,13 @@ After a segment is recycled to the freelist, it is still reachable via the unuse
 - `_options.MinimumSegmentSize` (default 4096) is the floor for `Pool.Rent(sizeHint)` calls.
 - Upper bound on segment size is governed by the underlying `MemoryPool<byte>.MaxBufferSize`; we don't impose a separate cap.
 - `GetMemory(sizeHint)`: if `sizeHint > 0` and the current tail can't satisfy it, transition to a new tail of size `Max(sizeHint, MinimumSegmentSize)`. Otherwise return remaining capacity in the current tail.
+- **Donated segments (post-2026-04-28-Append) bypass `_options.Pool` and `MinimumSegmentSize` entirely.** Size is donor-decided. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md`.
 
 ### `Memory<T>` benign-torn-read assumption (Nit-5)
 
 The Section 2 head==tail discipline relies on the layout of `Memory<byte>`'s internal fields (`_object`, `_index`, `_length`) and on `Slice(0, n)` preserving `_object` and `_index`. This is true today but is an implementation detail of the BCL. **Implementation should add a startup-time assertion or boot test** verifying the assumption (e.g., that `pool.Rent(1024).Memory.Slice(0, 100)` has the same `_object` reference and `_index` value as the original) so a future BCL change is caught at boot rather than as a heisenbug.
+
+**Donated segments are immune (post-2026-04-28-Append).** `BufferSegment.AdoptFrom` writes `base.Memory` to the donated slice once at adoption; subsequent `Freeze` calls during chain-link transitions re-write `base.Memory` to the same value (idempotent — `End == AvailableMemory.Length` already). No torn-read concern because both pre and post values are identical. Rented segments retain the existing benign-torn-read property unchanged. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §3.3.
 
 ### Reader bootstrap
 
@@ -352,6 +362,8 @@ public void Dispose()
 ## Section 4 — Hot paths (steady-state pseudocode)
 
 This section covers all public methods. Each method has an entry guard for its side's `_*Completed` flag and follows the **throw-first** precedence for completion-exception handling: writer-completion-exception throws before sticky-cancel consumption, before `ct.IsCancellationRequested`, before normal data path. This matches BCL's `IsCompletedOrThrow` semantics.
+
+**Buffer-ownership transfer (post-2026-04-28).** Section 4 was extended with a `Writer: Append(IMemoryOwner<byte> buffer[, int start, int length])` subsection. Defined fully in `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §4. `Append` is purely writer-thread-local — same publication boundary as `GetMemory`/`Advance`; nothing becomes visible to the reader until the next `FlushAsync`. It interacts cleanly with the rest of Section 4 without modifying any existing pseudocode.
 
 ### Writer: `GetMemory(int sizeHint)`
 
@@ -1301,6 +1313,8 @@ public sealed class SpscPipe : IDisposable
 ```
 
 `PauseWriterThreshold = 0` means unbounded (writer never parks). Validation matches BCL's `PipeOptions` shape; defaults match BCL's defaults. `MaxFreelistSegments` is our addition (N4). `ContinuationDispatcher` is `init`-only (per-pipe, immutable after construction); leaving it null preserves the prior RCA = true configuration's observable behavior — every awaited continuation runs on a ThreadPool worker.
+
+**Visibility revision (post-2026-04-28).** `SpscPipeWriter` is now `public` (was `internal`) and is no longer nested inside `SpscPipe`. `SpscPipe.Writer`'s declared return type widens to `SpscPipeWriter`. Source-compatible with existing `PipeWriter w = pipe.Writer;` callers via implicit upcast. `SpscPipeReader` stays `internal` — no reader-side surface addition motivates exposing it. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §6.
 
 ### `IContinuationDispatcher`
 
