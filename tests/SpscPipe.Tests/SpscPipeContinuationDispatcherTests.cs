@@ -726,4 +726,64 @@ public class SpscPipeContinuationDispatcherTests
         }
     }
 
+    // ---------- D.3 — ConfigureAwait(true) vs ConfigureAwait(false) parity ----------
+
+    /// <summary>
+    /// With the new source-side EC-capture wiring, ConfigureAwait(true) and
+    /// ConfigureAwait(false) produce identical observable behavior on a SpscPipe await:
+    /// both run the continuation on the dispatcher's chosen thread regardless of the
+    /// consumer's captured SC/TaskScheduler. This was the original Mechanism A pin —
+    /// the BDN deadlock disappeared when ConfigureAwait(false) was added; with the
+    /// new wiring, both directions are equivalent because the SC is never captured
+    /// (UseSchedulingContext is stripped in OnCompleted).
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ConfigureAwait_TrueAndFalse_BothRunOnDispatcherThread(bool continueOnCapturedContext)
+    {
+        // Capture the test thread's ID BEFORE the await. After the await, the
+        // continuation resumes on the dispatcher's worker thread, so referencing
+        // Environment.CurrentManagedThreadId at the post-await assertion would
+        // compare the worker thread's ID to itself.
+        int testThreadId = Environment.CurrentManagedThreadId;
+
+        using var dispatcher = new DedicatedThreadDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+
+        string? observedThreadName = null;
+        int? observedThreadId = null;
+        try
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                var mem = pipe.Writer.GetMemory(5);
+                mem.Span.Clear();
+                pipe.Writer.Advance(5);
+                await pipe.Writer.FlushAsync();
+            });
+
+            var rr = await pipe.Reader.ReadAsync().ConfigureAwait(continueOnCapturedContext);
+            pipe.Reader.AdvanceTo(rr.Buffer.End);
+            observedThreadName = Thread.CurrentThread.Name;
+            observedThreadId   = Environment.CurrentManagedThreadId;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+
+        // Both ConfigureAwait(true) and ConfigureAwait(false) yield identical results:
+        // the SC is never captured (PostCount stays 0), and the continuation runs on
+        // the dispatcher's worker thread.
+        Assert.Equal(0, Volatile.Read(ref sc.PostCount));
+        Assert.Equal(nameof(DedicatedThreadDispatcher), observedThreadName);
+        Assert.NotEqual(testThreadId, observedThreadId);
+    }
+
 }
