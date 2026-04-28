@@ -10,14 +10,14 @@ public class SpscAwaiterTests
     [Fact]
     public void NewAwaiter_StateIsInactive()
     {
-        var a = new SpscAwaiter<int>();
+        var a = new SpscAwaiter<int>(ThreadPoolContinuationDispatcher.Instance);
         Assert.Equal(SpscAwaiter<int>.Inactive, a._state);
     }
 
     [Fact]
     public void Or_CancelFlag_SetsBitAndReturnsOldValue()
     {
-        var a = new SpscAwaiter<int>();
+        var a = new SpscAwaiter<int>(ThreadPoolContinuationDispatcher.Instance);
         int old = Interlocked.Or(ref a._state, SpscAwaiter<int>.CancelFlag);
 
         Assert.Equal(SpscAwaiter<int>.Inactive, old);
@@ -27,7 +27,7 @@ public class SpscAwaiterTests
     [Fact]
     public void OwnerCanClearCancelFlagViaCAS()
     {
-        var a = new SpscAwaiter<int>();
+        var a = new SpscAwaiter<int>(ThreadPoolContinuationDispatcher.Instance);
         a._state = SpscAwaiter<int>.CancelFlag;     // simulate canceler's Or
 
         int prior = Interlocked.CompareExchange(ref a._state, SpscAwaiter<int>.Inactive, SpscAwaiter<int>.CancelFlag);
@@ -39,7 +39,7 @@ public class SpscAwaiterTests
     [Fact]
     public async Task ParkThenSignal_DeliversResult()
     {
-        var a = new SpscAwaiter<int>();
+        var a = new SpscAwaiter<int>(ThreadPoolContinuationDispatcher.Instance);
         a._core.Reset();
 
         // Owner: CAS Inactive → Pending.
@@ -62,7 +62,7 @@ public class SpscAwaiterTests
     [Fact]
     public async Task ParkThenCancelerSetsFlagThenSignaler_FlagPreservedAfterDelivery()
     {
-        var a = new SpscAwaiter<int>();
+        var a = new SpscAwaiter<int>(ThreadPoolContinuationDispatcher.Instance);
         a._core.Reset();
 
         Interlocked.CompareExchange(ref a._state, SpscAwaiter<int>.Pending, SpscAwaiter<int>.Inactive);
@@ -88,7 +88,7 @@ public class SpscAwaiterTests
     [Fact]
     public async Task CancelerWinsCAS_DeliversResultAndClearsFlag()
     {
-        var a = new SpscAwaiter<int>();
+        var a = new SpscAwaiter<int>(ThreadPoolContinuationDispatcher.Instance);
         a._core.Reset();
 
         Interlocked.CompareExchange(ref a._state, SpscAwaiter<int>.Pending, SpscAwaiter<int>.Inactive);
@@ -111,7 +111,7 @@ public class SpscAwaiterTests
     [Fact]
     public void StashFields_AreReadableAfterAssignment()
     {
-        var a = new SpscAwaiter<int>();
+        var a = new SpscAwaiter<int>(ThreadPoolContinuationDispatcher.Instance);
         var head = new BufferSegment();
         head.RentFrom(System.Buffers.MemoryPool<byte>.Shared, 1024, 0, this);
         var tail = new BufferSegment();

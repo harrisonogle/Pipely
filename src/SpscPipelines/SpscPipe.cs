@@ -6,48 +6,11 @@ namespace SpscPipelines;
 
 public sealed partial class SpscPipe : IDisposable
 {
-    // Static dispatch delegates (allocated once at type-init; zero per-dispatch alloc).
-    // Each delegate reads the stashed result/exception off the awaiter, clears the stash,
-    // then invokes _core.SetResult/_core.SetException. With RCA = false on _core, the
-    // SetResult/SetException call runs the registered continuation inline on whichever
-    // thread the IContinuationDispatcher routed the callback to. See spec R10.
-    private static readonly Action<object?> s_dispatchReadSetResult = static state =>
-    {
-        var a = (SpscAwaiter<ReadResult>)state!;
-        var v = a._dispatchResult;
-        a._dispatchResult = default;
-        a._core.SetResult(v!);
-    };
-
-    private static readonly Action<object?> s_dispatchReadSetException = static state =>
-    {
-        var a = (SpscAwaiter<ReadResult>)state!;
-        var ex = a._dispatchException!;
-        a._dispatchException = null;
-        a._core.SetException(ex);
-    };
-
-    private static readonly Action<object?> s_dispatchFlushSetResult = static state =>
-    {
-        var a = (SpscAwaiter<FlushResult>)state!;
-        var v = a._dispatchResult;
-        a._dispatchResult = default;
-        a._core.SetResult(v!);
-    };
-
-    private static readonly Action<object?> s_dispatchFlushSetException = static state =>
-    {
-        var a = (SpscAwaiter<FlushResult>)state!;
-        var ex = a._dispatchException!;
-        a._dispatchException = null;
-        a._core.SetException(ex);
-    };
-
     internal readonly SpscPipeOptions _options;
     internal readonly TripleBuffer<WriterState> _writerTb = new();
     internal readonly TripleBuffer<ReaderState> _readerTb = new();
-    internal readonly SpscAwaiter<ReadResult>  _readAwaiter  = new();
-    internal readonly SpscAwaiter<FlushResult> _flushAwaiter = new();
+    internal readonly SpscAwaiter<ReadResult>  _readAwaiter;
+    internal readonly SpscAwaiter<FlushResult> _flushAwaiter;
 
     // Writer-side cursors (writer thread only).
     internal BufferSegment? _chainHead;
@@ -84,7 +47,10 @@ public sealed partial class SpscPipe : IDisposable
     public SpscPipe() : this(SpscPipeOptions.Default) { }
     public SpscPipe(SpscPipeOptions options)
     {
-        _options        = options;
+        _options = options;
+        var dispatcher = options.ContinuationDispatcher ?? ThreadPoolContinuationDispatcher.Instance;
+        _readAwaiter    = new SpscAwaiter<ReadResult>(dispatcher);
+        _flushAwaiter   = new SpscAwaiter<FlushResult>(dispatcher);
         _writerInstance = new SpscPipeWriter(this);
         _readerInstance = new SpscPipeReader(this);
     }
@@ -170,13 +136,6 @@ public sealed partial class SpscPipe : IDisposable
         _freelistCount++;
     }
 
-    // Helper: route a continuation through the configured IContinuationDispatcher (default = TP).
-    // The dispatcher hop must always happen AFTER the caller has won CAS Pending→Inactive and
-    // stashed the result/exception on the awaiter — see spec R10 for the protocol.
-    internal void DispatchVia(Action<object?> callback, object? state)
-        => (_options.ContinuationDispatcher ?? ThreadPoolContinuationDispatcher.Instance)
-            .UnsafeQueueUserWorkItem(callback, state);
-
     internal bool HasReadableProgress() => _lastAcquiredWriterState.TotalWritten > _totalExamined;
 
     internal void IntegrateAcquiredWriterState()
@@ -221,8 +180,7 @@ public sealed partial class SpscPipe : IDisposable
                 // Throw-first: writer-completed-with-ex delivered as exception.
                 if (w.IsCompleted && w.CompletionException != null)
                 {
-                    _readAwaiter._dispatchException = w.CompletionException;
-                    DispatchVia(s_dispatchReadSetException, _readAwaiter);
+                    _readAwaiter._core.SetException(w.CompletionException);
                     return;
                 }
 
@@ -234,8 +192,7 @@ public sealed partial class SpscPipe : IDisposable
                     : new ReadOnlySequence<byte>(head, headIdx, w.TailSegment!, w.TailWritten);
 
                 _readPending = true;
-                _readAwaiter._dispatchResult = new ReadResult(buffer, isCanceled: false, isCompleted: w.IsCompleted);
-                DispatchVia(s_dispatchReadSetResult, _readAwaiter);
+                _readAwaiter._core.SetResult(new ReadResult(buffer, isCanceled: false, isCompleted: w.IsCompleted));
                 return;
             }
         }
@@ -251,8 +208,7 @@ public sealed partial class SpscPipe : IDisposable
             if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
             {
                 Interlocked.Increment(ref _readAwaiter._tokenCancelWonCount);
-                _readAwaiter._dispatchException = new OperationCanceledException(_readAwaiter._token);
-                DispatchVia(s_dispatchReadSetException, _readAwaiter);
+                _readAwaiter._core.SetException(new OperationCanceledException(_readAwaiter._token));
                 return;
             }
         }
@@ -268,8 +224,7 @@ public sealed partial class SpscPipe : IDisposable
             if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
             {
                 Interlocked.Increment(ref _flushAwaiter._tokenCancelWonCount);
-                _flushAwaiter._dispatchException = new OperationCanceledException(_flushAwaiter._token);
-                DispatchVia(s_dispatchFlushSetException, _flushAwaiter);
+                _flushAwaiter._core.SetException(new OperationCanceledException(_flushAwaiter._token));
                 return;
             }
         }
@@ -352,15 +307,9 @@ public sealed partial class SpscPipe : IDisposable
     {
         var r = _lastPublishedReaderState;
         if (r.IsCompleted && r.CompletionException != null)
-        {
-            _flushAwaiter._dispatchException = r.CompletionException;
-            DispatchVia(s_dispatchFlushSetException, _flushAwaiter);
-        }
+            _flushAwaiter._core.SetException(r.CompletionException);
         else
-        {
-            _flushAwaiter._dispatchResult = new FlushResult(isCanceled: false, isCompleted: r.IsCompleted);
-            DispatchVia(s_dispatchFlushSetResult, _flushAwaiter);
-        }
+            _flushAwaiter._core.SetResult(new FlushResult(isCanceled: false, isCompleted: r.IsCompleted));
     }
 
     internal void RecycleDrainedSegments()

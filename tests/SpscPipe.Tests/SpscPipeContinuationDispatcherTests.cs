@@ -283,6 +283,21 @@ public class SpscPipeContinuationDispatcherTests
 
     // ---------- D. EC contract guard — dispatchers that capture EC are caught ----------
 
+    /// <summary>
+    /// Pins that a "bad" dispatcher (one that captures EC at queue time, e.g.,
+    /// uses ThreadPool.QueueUserWorkItem instead of UnsafeQueueUserWorkItem) does
+    /// NOT corrupt the consumer's continuation EC. Under the new source-side EC
+    /// capture wiring, the consumer's EC is captured by SpscAwaiter.OnCompleted
+    /// on the CONSUMER's thread — BEFORE the bad dispatcher ever sees the work
+    /// item. s_invokeWithEc applies the source-side-captured EC via
+    /// ExecutionContext.Run, regardless of what EC the bad dispatcher captured
+    /// in its UnsafeQueueUserWorkItem. The bad dispatcher's capture is wasted
+    /// work but does not break the consumer's continuation.
+    ///
+    /// (Historical note: under the OLD wiring, the protection came from
+    /// MRVTSC.RunInternal applying the consumer's captured EC at SetResult time.
+    /// Same observable assertions; different mechanism.)
+    /// </summary>
     [Fact]
     public async Task CustomDispatcher_BadImpl_CapturingEC_IsDetectable()
     {
@@ -327,11 +342,12 @@ public class SpscPipeContinuationDispatcherTests
         // captured EC for the continuation regardless of dispatcher).
         Assert.Equal(42, observedConsumer);
 
-        // The producer's EC, if captured by the bad dispatcher, would be applied to
-        // the work item BEFORE the inner RunInternal restoration. The continuation
-        // sees consumer's EC during execution due to RunInternal — so producer's
-        // value is NOT visible. This test documents the safety property: even a
-        // dispatcher that captures EC doesn't break the consumer's continuation.
+        // The producer's EC, if captured by the bad dispatcher, never reaches the
+        // continuation: SpscAwaiter.OnCompleted already captured the consumer's
+        // EC on the consumer's thread BEFORE the bad dispatcher's queue-time
+        // capture could matter, and s_invokeWithEc applies that captured consumer
+        // EC via ExecutionContext.Run on the dispatcher's chosen thread. The bad
+        // dispatcher's EC capture is wasted work, not a correctness hazard.
         Assert.Equal(0, observedProducer);
     }
 
@@ -448,5 +464,77 @@ public class SpscPipeContinuationDispatcherTests
         var rr = await readTask;
         Assert.False(rr.IsCanceled);
         Assert.Equal(5, rr.Buffer.Length);
+    }
+
+    // ---------- C.2 — Per-cycle EC capture/apply hygiene (regression-only) ----------
+
+    /// <summary>
+    /// Pins per-cycle EC capture/apply hygiene. Each await on the same SpscPipe goes
+    /// through SpscAwaiter.OnCompleted (capturing the consumer-thread EC at that
+    /// moment) followed by s_invokeWithEc on the dispatcher's chosen thread (which
+    /// reads, applies via ExecutionContext.Run, AND clears _realContinuation /
+    /// _realState / _capturedEC). If the field clearing in s_invokeWithEc were ever
+    /// removed or reordered, cycle 2 might observe stale field state from cycle 1 —
+    /// e.g., run under cycle 1's captured EC instead of its own. The test exercises
+    /// two consecutive awaits with different consumer-side AsyncLocal values and
+    /// asserts cycle 2's continuation observes cycle 2's value.
+    ///
+    /// Note: this test does NOT differentiate the new wiring from the old wiring.
+    /// Under the old wiring, MRVTSC.RunInternal scoped each cycle's captured EC
+    /// equivalently, and the observable outcome is the same. The test's value is
+    /// regression protection going forward against accidental removal of the
+    /// per-cycle field reset in s_invokeWithEc; it is NOT a Mechanism B reproducer.
+    /// (Mechanism B's leak structurally requires SuppressFlow on both the prior
+    /// and current cycles, and is structurally identical in both wirings — neither
+    /// fixes the SuppressFlow-on-both case. The new wiring's value is mostly
+    /// architectural cleanliness plus the Mechanism A scheduler-bypass fix.)
+    /// </summary>
+    [Fact]
+    public async Task MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle()
+    {
+        var asyncLocal = new AsyncLocal<int>();
+        using var dispatcher = new DedicatedThreadDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        asyncLocal.Value = 42;
+
+        // Cycle 1: producer fires after consumer parks; consumer's continuation
+        // mutates asyncLocal to 999. The mutation is scoped to the cycle's EC frame
+        // (ExecutionContext.Run in new wiring; MRVTSC.RunInternal in old) — does NOT
+        // drift onto the dispatcher's worker thread; both wirings restore the worker's
+        // pre-cb EC after the continuation returns.
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            var mem = pipe.Writer.GetMemory(5);
+            mem.Span.Clear();
+            pipe.Writer.Advance(5);
+            await pipe.Writer.FlushAsync();
+        });
+
+        var rr1 = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr1.Buffer.End);
+        asyncLocal.Value = 999;     // mutation inside cycle-1's EC scope (does not drift onto worker)
+
+        // Cycle 2: a fresh await on the same pipe. The expected continuation observation
+        // is whatever the consumer's calling-site EC has at OnCompleted time. We set
+        // it to 7 here. If cycle 2's captured EC were ever stale (e.g., s_invokeWithEc
+        // failed to clear _capturedEC between cycles), cycle 2 might run under cycle 1's
+        // captured EC (asyncLocal=42). The assertion below catches that regression.
+        asyncLocal.Value = 7;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(50);
+            var mem = pipe.Writer.GetMemory(3);
+            mem.Span.Clear();
+            pipe.Writer.Advance(3);
+            await pipe.Writer.FlushAsync();
+        });
+
+        var rr2 = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr2.Buffer.End);
+
+        Assert.Equal(3, rr2.Buffer.Length);
+        Assert.Equal(7, asyncLocal.Value);
     }
 }

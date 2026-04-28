@@ -182,8 +182,7 @@ public sealed partial class SpscPipe
 
                 Interlocked.Increment(ref _pipe._readAwaiter._cancelPendingWonCount);
                 _pipe._readPending = true;
-                _pipe._readAwaiter._dispatchResult = new ReadResult(buffer, isCanceled: true, isCompleted: false);
-                _pipe.DispatchVia(s_dispatchReadSetResult, _pipe._readAwaiter);
+                _pipe._readAwaiter._core.SetResult(new ReadResult(buffer, isCanceled: true, isCompleted: false));
             }
         }
 
@@ -226,8 +225,7 @@ public sealed partial class SpscPipe
                         if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
                         {
                             Interlocked.Increment(ref _pipe._readAwaiter._lostWakeupResolvedCount);
-                            _pipe._readAwaiter._dispatchException = _pipe._lastAcquiredWriterState.CompletionException;
-                            _pipe.DispatchVia(s_dispatchReadSetException, _pipe._readAwaiter);
+                            _pipe._readAwaiter._core.SetException(_pipe._lastAcquiredWriterState.CompletionException);
                             return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
                         }
                     }
@@ -261,8 +259,7 @@ public sealed partial class SpscPipe
             {
                 Interlocked.Increment(ref _pipe._readAwaiter._lostCancelResolvedCount);
                 _pipe._readPending = true;
-                _pipe._readAwaiter._dispatchResult = _pipe.BuildReadResult(isCanceled: true);
-                _pipe.DispatchVia(s_dispatchReadSetResult, _pipe._readAwaiter);
+                _pipe._readAwaiter._core.SetResult(_pipe.BuildReadResult(isCanceled: true));
                 return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
             }
 
