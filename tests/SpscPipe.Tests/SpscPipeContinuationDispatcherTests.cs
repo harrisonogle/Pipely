@@ -581,4 +581,77 @@ public class SpscPipeContinuationDispatcherTests
         Assert.Equal(5, rr.Buffer.Length);
     }
 
+    // ---------- D.1 helper — capturing SynchronizationContext ----------
+
+    /// <summary>
+    /// SynchronizationContext that records every Post call. If the consumer's await captured
+    /// this SC and posted the continuation through it, PostCount > 0. The test asserts
+    /// PostCount == 0 — the new wiring strips UseSchedulingContext, so MRVTSC never captures
+    /// the SC.
+    /// </summary>
+    private sealed class CapturingSynchronizationContext : SynchronizationContext
+    {
+        public int PostCount;
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            Interlocked.Increment(ref PostCount);
+            ThreadPool.UnsafeQueueUserWorkItem(_ => d(state), null);
+        }
+    }
+
+    // ---------- D.1 — SynchronizationContext at await site is NOT honored ----------
+
+    /// <summary>
+    /// A non-default SynchronizationContext set at the await site is NOT honored: the
+    /// continuation runs on the dispatcher's chosen thread, NOT on the SC's thread. The
+    /// new SpscAwaiter.OnCompleted strips UseSchedulingContext from the flags forwarded
+    /// to _core.OnCompleted, so MRVTSC does not capture the SC. The captured SC's
+    /// PostCount stays 0; the continuation thread name is the dispatcher's thread.
+    /// </summary>
+    [Fact]
+    public async Task SynchronizationContext_AtAwait_NotHonored_ContinuationOnDispatcherThread()
+    {
+        // Capture the test thread's ID BEFORE the await. After the await, the
+        // continuation resumes on the dispatcher's worker thread, so referencing
+        // Environment.CurrentManagedThreadId at the post-await assertion would
+        // compare the worker thread's ID to itself.
+        int testThreadId = Environment.CurrentManagedThreadId;
+        string? observedThreadName = null;
+        int? observedThreadId = null;
+
+        using var dispatcher = new DedicatedThreadDispatcher();
+        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+
+        try
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                var mem = pipe.Writer.GetMemory(5);
+                mem.Span.Clear();
+                pipe.Writer.Advance(5);
+                await pipe.Writer.FlushAsync();
+            });
+
+            var rr = await pipe.Reader.ReadAsync();
+            pipe.Reader.AdvanceTo(rr.Buffer.End);
+            observedThreadName = Thread.CurrentThread.Name;
+            observedThreadId   = Environment.CurrentManagedThreadId;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+
+        // Captured SC was bypassed — PostCount stays 0.
+        Assert.Equal(0, Volatile.Read(ref sc.PostCount));
+        // Continuation ran on the dispatcher's worker thread, not the test/SC thread.
+        Assert.Equal(nameof(DedicatedThreadDispatcher), observedThreadName);
+        Assert.NotEqual(testThreadId, observedThreadId);
+    }
+
 }
