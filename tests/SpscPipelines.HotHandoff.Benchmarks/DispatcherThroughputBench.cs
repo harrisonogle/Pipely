@@ -1,7 +1,4 @@
-using System.Buffers;
-using System.Diagnostics;
 using System.IO.Pipelines;
-using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 using SpscPipelines;
 
@@ -10,44 +7,24 @@ namespace SpscPipelines.HotHandoff.Benchmarks;
 [MemoryDiagnoser]
 public class DispatcherThroughputBench
 {
-    // TEMPORARY workload — matches the latency CLI's MHz-rate per-message run
-    // (1 M messages × 256 B, timestamp-only producer writes, no chunk-copy
-    // fill).
-    //
-    // Original throughput-shape configuration, for reversion:
-    //     private const int TotalBytes = 1 << 20;        // 1 MiB per iteration
-    //     private const int ChunkSize  = 4096;
-    //     producer used `chunk.CopyTo(memory)` of a pre-allocated ChunkSize
-    //     byte[] (zero-filled) — see git history for the throughput numbers
-    //     (50.45 us HotHandoff / 70.34 us TpDefault / 105.09 us BCL).
-    private const int MessageCount = 1_000_000;
-    private const int ChunkSize    = 256;
+    private const int TotalBytes = 1 << 20;        // 1 MiB per iteration
+    private const int ChunkSize  = 4096;
 
+    // Constructed once per benchmark run, reused across all iterations. This
+    // matches the apples-to-apples comparison shape: BCL Pipe and SpscPipe's
+    // default TP dispatcher both have zero per-iteration "dispatcher" startup
+    // cost (the BCL pipe uses TP directly; SpscPipe-TP uses the singleton
+    // ThreadPoolContinuationDispatcher.Instance). The HotHandoff equivalent
+    // must also amortize its thread-startup cost across iterations rather
+    // than pay it per measurement. Per-iteration cost is now solely
+    // pipe ctor + produce-and-drain on both sides.
     private HotHandoffContinuationDispatcher? _dispatcher;
 
     [GlobalSetup(Target = nameof(SpscPipe_HotHandoff_ProduceAndDrain))]
     public void SetupHotHandoff() => _dispatcher = new HotHandoffContinuationDispatcher();
 
     [GlobalCleanup(Target = nameof(SpscPipe_HotHandoff_ProduceAndDrain))]
-    public void CleanupHotHandoff()
-    {
-        // TEMPORARY diagnostic: print cumulative slot/TP-overflow counts at
-        // the end of all HotHandoff iterations. This gives ground-truth
-        // dispatch frequency at this workload, replacing the speculative
-        // estimate from allocation counts.
-        long slot = _dispatcher?.SlotDispatchedCount ?? 0;
-        long tp   = _dispatcher?.TpOverflowedCount ?? 0;
-        long total = slot + tp;
-        _dispatcher?.Dispose();
-
-        Console.WriteLine();
-        Console.WriteLine($"--- HotHandoff cumulative dispatch breakdown over benchmark ---");
-        Console.WriteLine($"  Slot (worker thread): {slot,12:N0}");
-        Console.WriteLine($"  TP overflow:          {tp,12:N0}");
-        Console.WriteLine($"  Total:                {total,12:N0}");
-        if (total > 0)
-            Console.WriteLine($"  Slot share:           {100.0 * slot / total,12:F2}%");
-    }
+    public void CleanupHotHandoff() => _dispatcher?.Dispose();
 
     // BCL System.IO.Pipelines.Pipe — TP-driven continuations, default options
     // (64K pause / 32K resume — same thresholds as SpscPipeOptions.Default).
@@ -83,57 +60,32 @@ public class DispatcherThroughputBench
 
     private static async Task ProduceAndDrain(PipeReader reader, PipeWriter writer)
     {
-        // TEMPORARY (Mechanism-A diagnostic) — bringing back the per-message
-        // consumer that deadlocked in commits 0d10225 / 032528f, BUT with
-        // ConfigureAwait(false) on every await in producer and consumer. If
-        // the deadlock was from SC/TaskScheduler capture by the consumer's
-        // await (Mechanism A), suppressing that capture should make this run
-        // cleanly. If it still hangs, the cause is somewhere else (Mechanism
-        // B / SuppressFlow, or something else entirely).
-        long bytesTotal = (long)MessageCount * ChunkSize;
-
         var producer = Task.Run(async () =>
         {
-            for (int i = 0; i < MessageCount; i++)
+            int written = 0;
+            var chunk = new byte[ChunkSize];
+            while (written < TotalBytes)
             {
-                var memory = writer.GetMemory(ChunkSize);
-                long t = Stopwatch.GetTimestamp();
-                MemoryMarshal.Write(memory.Span, in t);
-                writer.Advance(ChunkSize);
-                await writer.FlushAsync().ConfigureAwait(false);
+                var memory = writer.GetMemory(chunk.Length);
+                chunk.CopyTo(memory);
+                writer.Advance(chunk.Length);
+                await writer.FlushAsync();
+                written += chunk.Length;
             }
             writer.Complete();
         });
 
         var consumer = Task.Run(async () =>
         {
-            // Per-message-processing consumer (matches latency CLI's pattern,
-            // which is what triggered the BDN deadlock). Local samples array
-            // — fresh per benchmark invocation, no shared field.
-            var samples = new long[MessageCount];
-            long consumed = 0;
-            int messageIdx = 0;
-            byte[] tsBuf = new byte[8];
-            while (consumed < bytesTotal)
+            while (true)
             {
-                var rr = await reader.ReadAsync().ConfigureAwait(false);
-                var buf = rr.Buffer;
-                while (buf.Length >= ChunkSize)
-                {
-                    buf.Slice(0, 8).CopyTo(tsBuf);
-                    long sentTicks = MemoryMarshal.Read<long>(tsBuf);
-                    long now = Stopwatch.GetTimestamp();
-                    samples[messageIdx++] = now - sentTicks;
-                    consumed += ChunkSize;
-                    buf = buf.Slice(ChunkSize);
-                }
-                long consumedThisRead = rr.Buffer.Length - buf.Length;
-                reader.AdvanceTo(rr.Buffer.GetPosition(consumedThisRead), rr.Buffer.End);
-                if (rr.IsCompleted && consumed >= bytesTotal) break;
+                var result = await reader.ReadAsync();
+                reader.AdvanceTo(result.Buffer.End);
+                if (result.IsCompleted) break;
             }
             reader.Complete();
         });
 
-        await Task.WhenAll(producer, consumer).ConfigureAwait(false);
+        await Task.WhenAll(producer, consumer);
     }
 }
