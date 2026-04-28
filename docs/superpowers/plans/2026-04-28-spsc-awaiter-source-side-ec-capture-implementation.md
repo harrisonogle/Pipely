@@ -111,23 +111,31 @@ The architecture-establishing task. Write test C.2 (cross-cycle `AsyncLocal` iso
 Append this test method at the end of the `SpscPipeContinuationDispatcherTests` class in `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs` (just before the closing brace):
 
 ```csharp
-// ---------- C.2 — Cross-cycle EC isolation (Mechanism B regression) ----------
+// ---------- C.2 — Per-cycle EC capture/apply hygiene (regression-only) ----------
 
 /// <summary>
-/// Pins per-cycle EC isolation: cycle N's mutations to an AsyncLocal made inside
-/// the continuation do not leak into cycle N+1's continuation. Under the OLD wiring
-/// (no source-side EC capture), if cycle 2's OnCompleted was on the dispatcher's
-/// worker thread (which it can be when the consumer awaits a second time without
-/// yielding back to a fresh thread), MRVTSC.OnCompleted captured the worker thread's
-/// CURRENT EC — already polluted by cycle 1's continuation mutation. Under the new
-/// wiring, OnCompleted captures the consumer's thread EC at the time of the await
-/// (here, the await's calling thread is the dispatcher worker carrying cycle-1's
-/// drift) and applies it via ExecutionContext.Run — so cycle 2's continuation sees
-/// the value the consumer set at its CALLING SITE (asyncLocal=7), not the worker
-/// thread's drifted value (999).
+/// Pins per-cycle EC capture/apply hygiene. Each await on the same SpscPipe goes
+/// through SpscAwaiter.OnCompleted (capturing the consumer-thread EC at that
+/// moment) followed by s_invokeWithEc on the dispatcher's chosen thread (which
+/// reads, applies via ExecutionContext.Run, AND clears _realContinuation /
+/// _realState / _capturedEC). If the field clearing in s_invokeWithEc were ever
+/// removed or reordered, cycle 2 might observe stale field state from cycle 1 —
+/// e.g., run under cycle 1's captured EC instead of its own. The test exercises
+/// two consecutive awaits with different consumer-side AsyncLocal values and
+/// asserts cycle 2's continuation observes cycle 2's value.
+///
+/// Note: this test does NOT differentiate the new wiring from the old wiring.
+/// Under the old wiring, MRVTSC.RunInternal scoped each cycle's captured EC
+/// equivalently, and the observable outcome is the same. The test's value is
+/// regression protection going forward against accidental removal of the
+/// per-cycle field reset in s_invokeWithEc; it is NOT a Mechanism B reproducer.
+/// (Mechanism B's leak structurally requires SuppressFlow on both the prior
+/// and current cycles, and is structurally identical in both wirings — neither
+/// fixes the SuppressFlow-on-both case. The new wiring's value is mostly
+/// architectural cleanliness plus the Mechanism A scheduler-bypass fix.)
 /// </summary>
 [Fact]
-public async Task CrossCycleAsyncLocal_DoesNotLeakBetweenContinuations()
+public async Task MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle()
 {
     var asyncLocal = new AsyncLocal<int>();
     using var dispatcher = new DedicatedThreadDispatcher();
@@ -136,10 +144,10 @@ public async Task CrossCycleAsyncLocal_DoesNotLeakBetweenContinuations()
     asyncLocal.Value = 42;
 
     // Cycle 1: producer fires after consumer parks; consumer's continuation
-    // mutates AsyncLocal to 999 — that mutation drifts onto the dispatcher's
-    // worker thread under the OLD wiring (because the continuation ran under
-    // MRVTSC's RunInternal, which only restores AT THE END if the worker
-    // thread's pre-call EC is captured).
+    // mutates asyncLocal to 999. The mutation is scoped to the cycle's EC frame
+    // (ExecutionContext.Run in new wiring; MRVTSC.RunInternal in old) — does NOT
+    // drift onto the dispatcher's worker thread; both wirings restore the worker's
+    // pre-cb EC after the continuation returns.
     _ = Task.Run(async () =>
     {
         await Task.Delay(50);
@@ -151,11 +159,13 @@ public async Task CrossCycleAsyncLocal_DoesNotLeakBetweenContinuations()
 
     var rr1 = await pipe.Reader.ReadAsync();
     pipe.Reader.AdvanceTo(rr1.Buffer.End);
-    asyncLocal.Value = 999;     // cycle-1 mutation that, under buggy wiring, can drift onto worker
+    asyncLocal.Value = 999;     // mutation inside cycle-1's EC scope (does not drift onto worker)
 
-    // Cycle 2: a fresh await on the same pipe. The asyncLocal value the test
-    // expects to observe in the continuation is whatever the consumer's
-    // CALLING-SITE EC has at OnCompleted time. We set it to 7 here.
+    // Cycle 2: a fresh await on the same pipe. The expected continuation observation
+    // is whatever the consumer's calling-site EC has at OnCompleted time. We set
+    // it to 7 here. If cycle 2's captured EC were ever stale (e.g., s_invokeWithEc
+    // failed to clear _capturedEC between cycles), cycle 2 might run under cycle 1's
+    // captured EC (asyncLocal=42). The assertion below catches that regression.
     asyncLocal.Value = 7;
     _ = Task.Run(async () =>
     {
@@ -170,24 +180,21 @@ public async Task CrossCycleAsyncLocal_DoesNotLeakBetweenContinuations()
     pipe.Reader.AdvanceTo(rr2.Buffer.End);
 
     Assert.Equal(3, rr2.Buffer.Length);
-    // Continuation runs under cycle-2's captured EC (asyncLocal=7), not the
-    // worker thread's drifted EC from cycle 1 (asyncLocal=999), nor cycle-1's
-    // captured EC (asyncLocal=42).
     Assert.Equal(7, asyncLocal.Value);
 }
 ```
 
-- [ ] **Step 2: Run the test, observe baseline behavior**
+- [ ] **Step 2: Run the test (regression-only baseline)**
 
 Run:
 
 ```bash
-dotnet test tests/SpscPipe.Tests --nologo --filter CrossCycleAsyncLocal_DoesNotLeakBetweenContinuations
+dotnet test tests/SpscPipe.Tests --nologo --filter MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle
 ```
 
-Expected: behavior depends on which thread the second `OnCompleted` is invoked from. The test exists primarily to lock the property going forward; whether it currently passes or fails on the baseline is a diagnostic, not the gating criterion. After the architecture switch in steps 3-13 below, the test MUST pass deterministically.
+Expected: PASS. Under the old wiring, `MRVTSC.RunInternal` scopes each cycle's captured EC equivalently to the new wiring; the test pins per-cycle EC capture/apply as a forward regression guard, not a mechanism reproducer. The test must continue to PASS after the architecture switch in subsequent steps.
 
-(Do not commit yet — the implementation arrives in steps 3-13.)
+(Do not commit yet — the implementation arrives in subsequent steps.)
 
 - [ ] **Step 3: Replace `src/SpscPipelines/SpscAwaiter.cs` with the new EC-capture form**
 
@@ -836,7 +843,77 @@ dotnet build SpscPipe.slnx
 
 Expected: clean.
 
-- [ ] **Step 9: Run the full test suite**
+- [ ] **Step 9: Update `CustomDispatcher_BadImpl_CapturingEC_IsDetectable` docstring (rationale shift under new wiring)**
+
+The existing test `CustomDispatcher_BadImpl_CapturingEC_IsDetectable` in `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs` continues to pass under the new wiring, but its inline rationale comments still refer to `MRVTSC.RunInternal` as the mechanism that protects the consumer from the bad dispatcher's EC capture. That mechanism is no longer in play — under the new wiring, `SpscAwaiter.OnCompleted` captures the consumer's EC on the consumer's thread *before* the bad dispatcher ever sees the work item; `s_invokeWithEc` applies that captured EC regardless of what EC the bad dispatcher captured.
+
+Same observable assertions, different reason. Update the inline comments and (if absent) add an XML doc summary so a future reader doesn't think the test passes for the old reason.
+
+Apply this edit to `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs`:
+
+Find the test method (currently has no XML doc summary, just the `[Fact]` attribute):
+
+```csharp
+    [Fact]
+    public async Task CustomDispatcher_BadImpl_CapturingEC_IsDetectable()
+```
+
+Replace with:
+
+```csharp
+    /// <summary>
+    /// Pins that a "bad" dispatcher (one that captures EC at queue time, e.g.,
+    /// uses ThreadPool.QueueUserWorkItem instead of UnsafeQueueUserWorkItem) does
+    /// NOT corrupt the consumer's continuation EC. Under the new source-side EC
+    /// capture wiring, the consumer's EC is captured by SpscAwaiter.OnCompleted
+    /// on the CONSUMER's thread — BEFORE the bad dispatcher ever sees the work
+    /// item. s_invokeWithEc applies the source-side-captured EC via
+    /// ExecutionContext.Run, regardless of what EC the bad dispatcher captured
+    /// in its UnsafeQueueUserWorkItem. The bad dispatcher's capture is wasted
+    /// work but does not break the consumer's continuation.
+    ///
+    /// (Historical note: under the OLD wiring, the protection came from
+    /// MRVTSC.RunInternal applying the consumer's captured EC at SetResult time.
+    /// Same observable assertions; different mechanism.)
+    /// </summary>
+    [Fact]
+    public async Task CustomDispatcher_BadImpl_CapturingEC_IsDetectable()
+```
+
+Then within the test body, locate the closing comment block before `Assert.Equal(0, observedProducer);`:
+
+```csharp
+        // The producer's EC, if captured by the bad dispatcher, would be applied to
+        // the work item BEFORE the inner RunInternal restoration. The continuation
+        // sees consumer's EC during execution due to RunInternal — so producer's
+        // value is NOT visible. This test documents the safety property: even a
+        // dispatcher that captures EC doesn't break the consumer's continuation.
+        Assert.Equal(0, observedProducer);
+```
+
+Replace with:
+
+```csharp
+        // The producer's EC, if captured by the bad dispatcher, never reaches the
+        // continuation: SpscAwaiter.OnCompleted already captured the consumer's
+        // EC on the consumer's thread BEFORE the bad dispatcher's queue-time
+        // capture could matter, and s_invokeWithEc applies that captured consumer
+        // EC via ExecutionContext.Run on the dispatcher's chosen thread. The bad
+        // dispatcher's EC capture is wasted work, not a correctness hazard.
+        Assert.Equal(0, observedProducer);
+```
+
+(Build to confirm the file still compiles; the test should still pass.)
+
+Run:
+
+```bash
+dotnet build SpscPipe.slnx
+```
+
+Expected: clean.
+
+- [ ] **Step 10: Run the full test suite**
 
 Run:
 
@@ -845,14 +922,14 @@ dotnet test SpscPipe.slnx --nologo
 ```
 
 Expected: ALL tests pass, including:
-- The new `CrossCycleAsyncLocal_DoesNotLeakBetweenContinuations` from step 1.
-- The existing `CustomDispatcher_AsyncLocalFlowsToContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_RestoredAfterContinuation`, `CustomDispatcher_BadImpl_CapturingEC_IsDetectable` (note: with the new wiring, the `BadEcCapturingDispatcher` is harmless because the consumer's EC is captured BEFORE the bad dispatcher gets to capture it; the test's existing assertions remain correct).
+- The new `MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle` from step 1.
+- The existing `CustomDispatcher_AsyncLocalFlowsToContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_RestoredAfterContinuation`, `CustomDispatcher_BadImpl_CapturingEC_IsDetectable` (the last one with its docstring updated in step 9 to reflect the new mechanism).
 - The HotHandoff tests including the `RepeatedIteration_PerMessageConsumer_DoesNotHang` BDN-pattern stress test — which was the live regression smoke for Mechanism A.
 - All `BclParityTests`, `SpscPipeAdvanceToTests`, `SpscPipeCancellationTests`, `SpscPipeDisposeTests`, `SpscPipeLifecycleTests`, `SpscPipeReaderTests`, `SpscPipeReadInProgressTests`, `SpscPipeWriterTests`, `SpscAwaiterTests`, `BufferSegmentTests`.
 
 If a test fails, do NOT proceed — diagnose. The existing tests pin observable behavior; a failure means the new wiring broke the contract somewhere.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add src/SpscPipelines/SpscAwaiter.cs src/SpscPipelines/SpscPipe.cs src/SpscPipelines/SpscPipe.Reader.cs src/SpscPipelines/SpscPipe.Writer.cs tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs tests/SpscPipe.Tests/SpscAwaiterTests.cs
@@ -863,11 +940,10 @@ ExecutionContext capture and continuation routing move from the
 consumer-side flag-honoring path (current MRVTSC behavior) to the
 source-side SpscAwaiter<T>. Closes Mechanism A (consumer-captured
 SC/TaskScheduler silently overrode the dispatcher's chosen routing,
-producing the BDN deadlock + 3.5x perf regression) and Mechanism B
-(when FlowExecutionContext was suppressed at OnCompleted time, MRVTSC
-skipped RunInternal and the continuation ran under the dispatcher
-worker thread's drifted EC, leaking AsyncLocal mutations across
-park cycles — worst case: cross-tenant data leak in a request path).
+producing the BDN deadlock + 3.5x perf regression) and centralizes
+EC capture/apply in our code (architectural cleanliness; Mechanism
+B's leak under SuppressFlow is structurally identical in both
+wirings — see test C.2's docstring for context).
 
 Implementation
 - SpscAwaiter<T>: 3 new fields (_realContinuation, _realState,
@@ -894,8 +970,11 @@ Implementation
   takes (Action<object?>, object?) work items.
 
 Tests
-- New: CrossCycleAsyncLocal_DoesNotLeakBetweenContinuations (Mechanism
-  B regression test — pins per-cycle EC isolation).
+- New: MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle (forward
+  regression guard for s_invokeWithEc's per-cycle field reset).
+- Updated: CustomDispatcher_BadImpl_CapturingEC_IsDetectable docstring
+  to reflect new mechanism (source-side capture beats the bad
+  dispatcher to the punch); same observable assertions.
 - Existing tests pass unchanged (the SpscPipe-level EC tests, the
   HotHandoff dispatcher tests including the BDN-pattern stress
   RepeatedIteration_PerMessageConsumer_DoesNotHang, the cancellation/
@@ -911,29 +990,37 @@ EOF
 
 ---
 
-## Task 3: Test C.3 — `FlowExecutionContext` suppression
+## Task 3: Test C.3 — `FlowExecutionContext` suppression branch (smoke)
 
-Pins the spec invariant from §6 / §2.3: when the consumer's `await` is inside an `ExecutionContext.SuppressFlow()` block, the awaiter captures `null` EC, `s_invokeWithEc` falls through to direct `cont(st)` invocation, and the continuation runs under whatever EC the dispatcher's chosen thread has at the moment — without any AsyncLocal assertion (consumer explicitly opted out of EC propagation).
+Pins that the `_capturedEC == null` else-branch in `s_invokeWithEc` is exercised cleanly: when the consumer awaits inside an `ExecutionContext.SuppressFlow()` block, the awaiter captures `null` EC, `s_invokeWithEc` falls through to direct `cont(st)` invocation (no `ExecutionContext.Run`), the buffer is delivered, the continuation runs without NRE.
 
-This test exercises the `else` branch of the EC-application code in `s_invokeWithEc`. The implicit pin is "no crash / no hang / observable buffer matches expected" — the EC-suppress path doesn't NRE on the null `_capturedEC`.
+**Limitation acknowledged.** The spec §6 C.3 entry describes a stronger property — "no AsyncLocal pollution from prior cb leaks in" — but that property is not differentially testable between the old and new wirings: under both wirings, default-flow prior cycles run inside an EC frame (`MRVTSC.RunInternal` in old; our `ExecutionContext.Run` in new) which restores the worker's pre-call EC, so the worker thread's EC carries no drift from default-flow prior cbs in either wiring. SuppressFlow on *both* a prior and the current cycle does drift the worker, identically in both wirings. So C.3's testable property reduces to "the SuppressFlow branch in `s_invokeWithEc` exists, is exercised, and doesn't NRE on null EC" — a smoke test, not a regression for a fixed bug.
 
 **Files:**
 - Modify: `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the test**
 
 Append this test method to the `SpscPipeContinuationDispatcherTests` class:
 
 ```csharp
-// ---------- C.3 — FlowExecutionContext suppressed (consumer opted out of EC propagation) ----------
+// ---------- C.3 — FlowExecutionContext suppressed (smoke for null-_capturedEC branch) ----------
 
 /// <summary>
-/// When the consumer awaits inside an ExecutionContext.SuppressFlow() block, the awaiter's
-/// OnCompleted captures _capturedEC = null. s_invokeWithEc takes the else branch — direct
-/// cont(st) invocation, no ExecutionContext.Run. The buffer is delivered correctly; the
-/// continuation runs under the dispatcher's chosen thread's CURRENT EC (whatever that is)
-/// rather than under any captured EC. This test pins that the suppress-flow branch is
-/// exercised cleanly (no NRE, no hang).
+/// When the consumer awaits inside an ExecutionContext.SuppressFlow() block,
+/// SpscAwaiter.OnCompleted captures _capturedEC = null and forwards (s_dispatch,
+/// this) to _core.OnCompleted. s_invokeWithEc reads _capturedEC, sees null, and
+/// takes the else branch — direct cont(st) invocation on the dispatcher's chosen
+/// thread, no ExecutionContext.Run. This test pins that the branch is exercised
+/// cleanly (no NRE on null EC, buffer delivered, await completes).
+///
+/// Note: the spec §6 C.3 entry describes a stronger "no leak from prior cb"
+/// property, but that property is structurally identical in old and new wirings
+/// (both let SuppressFlow cbs mutate the worker's EC, both isolate default-flow
+/// cbs in an EC frame). The differentiating test would require both wirings to
+/// behave differently under the same input, which they don't for SuppressFlow
+/// AsyncLocal observation. See the C.2 docstring for the same caveat applied
+/// to per-cycle isolation.
 /// </summary>
 [Fact]
 public async Task SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly()
@@ -952,10 +1039,12 @@ public async Task SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly()
 
     using (ExecutionContext.SuppressFlow())
     {
-        // Inside SuppressFlow, the await's OnCompleted is called with FlowExecutionContext = 0,
-        // so SpscAwaiter.OnCompleted captures _capturedEC = null. s_invokeWithEc takes the
-        // null-EC branch and invokes the continuation directly. No EC capture, no Run, no
-        // restoration — the simplest path.
+        // Inside SuppressFlow, the await's OnCompleted is called with
+        // FlowExecutionContext = 0, so SpscAwaiter.OnCompleted captures
+        // _capturedEC = null. s_invokeWithEc takes the null-EC branch and
+        // invokes the continuation directly. No EC capture, no Run, no
+        // restoration — the simplest path. The assertion pins the buffer
+        // is delivered (no NRE / no hang).
         var rr = await pipe.Reader.ReadAsync();
         pipe.Reader.AdvanceTo(rr.Buffer.End);
         Assert.Equal(5, rr.Buffer.Length);
@@ -1316,88 +1405,109 @@ EOF
 
 ---
 
-## Task 7: Test E.1 — `SetResult`-fires-first race stress
+## Task 7: Test E.1 — `SetResult`-fires-first race stress (direct-awaiter)
 
-Pins the spec §4 publication ordering: when the producer signals BEFORE the consumer has called `OnCompleted`, the result is delivered correctly via the rare TP-dispatch path. The `Volatile.Write` ordering in `OnCompleted` ensures the TP-dispatched `s_dispatch` reads `_realContinuation` / `_realState` / `_capturedEC` post-publication.
+Pins the spec §4 publication ordering: when the producer signals BEFORE the consumer has called `OnCompleted`, the result is delivered correctly via the rare TP-dispatch path. `MRVTSC` unconditionally queues the registered `s_dispatch` callback to the ThreadPool when the source is already completed; the `Volatile.Write` ordering in `OnCompleted` ensures the TP-dispatched `s_dispatch` reads `_realContinuation` / `_realState` / `_capturedEC` post-publication.
 
-The existing `CustomDispatcher_SetResultBeforeOnCompleted_RaceHandled` test pins the single-shot version. This new test pins the stress version: N iterations where every iteration triggers the SetResult-fires-first race.
+This test operates **directly on a `SpscAwaiter<int>`** rather than going through `SpscPipe`. `SpscPipe.Reader.ReadAsync` has a synchronous fast path (`HasReadableProgress` after `TryAcquire`+integrate) that delivers data without ever calling `OnCompleted` if the producer has already published — so a SpscPipe-level test of "producer-flushes-before-consumer-awaits" never exercises the rare race path. Operating directly on `SpscAwaiter` lets us call `_core.SetResult(value)` first and then manually invoke `awaiter.OnCompleted(...)`, which forces `MRVTSC` to see a completed source and queue `s_dispatch` to TP — the actual race the spec calls out. `SpscAwaiter<T>` is `internal` and `SpscPipe.Tests` already has `InternalsVisibleTo` access.
 
 **Files:**
 - Modify: `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the test**
 
 Append to `SpscPipeContinuationDispatcherTests`:
 
 ```csharp
-// ---------- E.1 — SetResult-fires-first race, N-iteration stress ----------
+// ---------- E.1 — SetResult-fires-first race (direct-awaiter, N-iteration stress) ----------
 
 /// <summary>
 /// Pins the spec §4 publication ordering: when the producer signals BEFORE the
 /// consumer has called OnCompleted, the result is delivered correctly via the rare
-/// TP-dispatch path (MRVTSC unconditionally queues the registered s_dispatch to TP
-/// when the source is already completed). The Volatile.Write ordering in
-/// OnCompleted ensures the TP-dispatched s_dispatch reads _realContinuation /
-/// _realState / _capturedEC post-publication.
+/// TP-dispatch path. MRVTSC unconditionally queues the registered s_dispatch
+/// callback to the ThreadPool when the source is already completed at OnCompleted
+/// time; the Volatile.Write ordering in OnCompleted ensures the TP-dispatched
+/// s_dispatch reads _realContinuation / _realState / _capturedEC post-publication.
 ///
-/// Stress this race for 100 iterations to give CI/jit/scheduler variance a chance
-/// to surface any ordering bug.
+/// Operates directly on SpscAwaiter to force the race deterministically (SpscPipe's
+/// synchronous fast paths would short-circuit before OnCompleted is even called).
+/// Stress N iterations to expose any non-deterministic ordering bug under
+/// CI/jit/scheduler variance.
 /// </summary>
 [Fact]
-public async Task SetResultBeforeOnCompleted_Race_StressN_AllResultsDelivered()
+public async Task SetResultBeforeOnCompleted_DirectAwaiter_Race_StressN_AllResultsDelivered()
 {
     using var dispatcher = new ForwardingDispatcher();
 
     const int iterations = 100;
     for (int i = 0; i < iterations; i++)
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        // Construct a fresh awaiter per iteration. The dispatcher is shared across
+        // iterations (ForwardingDispatcher just routes to TP).
+        var awaiter = new SpscAwaiter<int>(dispatcher);
 
-        // Producer writes BEFORE the consumer awaits — the producer's SetResult
-        // beats the consumer's OnCompleted. Consumer's subsequent ReadAsync sees
-        // the completed source: it returns synchronously (BuildReadResult fast
-        // path) because TryAcquire+integrate yields a HasReadableProgress result.
-        // To force the SetResult-fires-first race specifically through the
-        // PARK / TP-dispatch path, we'd need to coerce a park first — but that
-        // requires the writer to publish AFTER the reader CAS-Pendings. Tightly
-        // serializing this in user code is hard; the existing single-shot test
-        // and this stress version both rely on the natural windows. The stress
-        // value is in repeating the race to expose any non-deterministic bug.
-        var mem = pipe.Writer.GetMemory(5);
-        mem.Span.Clear();
-        pipe.Writer.Advance(5);
-        await pipe.Writer.FlushAsync();
+        // PRODUCER SIGNALS FIRST. _core stores the result; _core's _continuation
+        // is null because OnCompleted hasn't been called yet.
+        awaiter._core.SetResult(1000 + i);
 
-        var rr = await pipe.Reader.ReadAsync();
-        Assert.False(rr.IsCanceled);
-        Assert.Equal(5, rr.Buffer.Length);
-        pipe.Reader.AdvanceTo(rr.Buffer.End);
+        // CONSUMER REGISTERS SECOND (manually). SpscAwaiter.OnCompleted writes
+        // _realContinuation / _realState / _capturedEC via Volatile.Write, then
+        // forwards (s_dispatch, this, ...) to _core.OnCompleted. _core sees a
+        // completed source and unconditionally queues s_dispatch to TP. TP runs
+        // s_dispatch, which routes through dispatcher to s_invokeWithEc, which
+        // reads the awaiter's published fields and invokes our continuation under
+        // the captured EC.
+        var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        awaiter.OnCompleted(_ =>
+        {
+            try { tcs.SetResult(awaiter._core.GetResult(awaiter.Version)); }
+            catch (Exception ex) { tcs.SetException(ex); }
+        }, state: null, awaiter.Version, ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
+
+        int result = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1000 + i, result);
     }
 }
 ```
+
+Note: this test requires `using System.Threading.Tasks.Sources;` at the top of the file for `ValueTaskSourceOnCompletedFlags`. If that using is not already present, add it. Verify with:
+
+```bash
+grep -n 'using System.Threading.Tasks.Sources' tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs
+```
+
+If missing, add the using directive at the top of the file alongside the existing `using System.Threading;`.
 
 - [ ] **Step 2: Run the test**
 
 Run:
 
 ```bash
-dotnet test tests/SpscPipe.Tests --nologo --filter SetResultBeforeOnCompleted_Race_StressN_AllResultsDelivered
+dotnet test tests/SpscPipe.Tests --nologo --filter SetResultBeforeOnCompleted_DirectAwaiter_Race_StressN_AllResultsDelivered
 ```
 
-Expected: PASS. 100 iterations, every iteration delivers the 5-byte result. No version-mismatch exceptions, no hangs.
+Expected: PASS. 100 iterations; every iteration's `tcs.Task` completes within the 5s WaitAsync timeout with `result == 1000 + i`. No `IValueTaskSource`-version-mismatch exceptions, no hangs, no `OperationCanceledException` from the timeout. Each iteration drives the rare race (because `_core.SetResult` was called before `awaiter.OnCompleted`), so the stress meaningfully exercises `MRVTSC`'s "queue to TP if source already completed" branch and our publication-ordering correctness.
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
-SpscAwaiter tests: E.1 — SetResult-fires-first race (N-iteration stress)
+SpscAwaiter tests: E.1 — SetResult-fires-first race (direct-awaiter stress)
 
-Pins the spec §4 publication ordering: 100 iterations of producer-
-signals-before-consumer-awaits, all results delivered correctly.
-Volatile.Write ordering in OnCompleted ensures the TP-dispatched
-s_dispatch reads _realContinuation/_realState/_capturedEC post-
-publication, regardless of how the race interleaves.
+Pins the spec §4 publication ordering by operating directly on
+SpscAwaiter<int> rather than through SpscPipe (whose synchronous
+fast paths would bypass the race). Each iteration calls
+_core.SetResult(value) BEFORE manually invoking awaiter.OnCompleted,
+forcing MRVTSC to see a completed source and unconditionally queue
+s_dispatch to the ThreadPool. The TP-dispatched s_dispatch routes
+through the dispatcher to s_invokeWithEc, which reads the awaiter's
+published _realContinuation/_realState/_capturedEC and invokes the
+continuation under the captured EC.
+
+100 iterations expose CI/jit/scheduler variance against ordering
+bugs. Volatile.Write ordering in OnCompleted closes the race
+across the queue/dequeue happens-before edges.
 
 Spec ref: §4 publication ordering, §6 E.1.
 
@@ -1786,7 +1896,7 @@ The `IContinuationDispatcher` contract item #2 forbids EC capture in the dispatc
 
 Both paths satisfy contract item #2 without dispatcher-side EC manipulation. EC correctness — including cross-tenant isolation when `FlowExecutionContext` is suppressed — is the responsibility of `SpscAwaiter<T>` (the source) per the source-side EC-capture spec; the dispatcher's role is purely to route work items to threads.
 
-The existing tests in `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs` (specifically `CustomDispatcher_AsyncLocalFlowsToContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_RestoredAfterContinuation`, `CrossCycleAsyncLocal_DoesNotLeakBetweenContinuations`, `SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly`) pin the EC behavior at the SpscPipe level for any conforming dispatcher; the corresponding tests in this project (`SpscPipe_WithHotHandoff_AsyncLocalFlowsToContinuation`, `SpscPipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation`) pin it specifically through `HotHandoffContinuationDispatcher`.
+The existing tests in `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs` (specifically `CustomDispatcher_AsyncLocalFlowsToContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_RestoredAfterContinuation`, `MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle`, `SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly`) pin the EC behavior at the SpscPipe level for any conforming dispatcher; the corresponding tests in this project (`SpscPipe_WithHotHandoff_AsyncLocalFlowsToContinuation`, `SpscPipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation`) pin it specifically through `HotHandoffContinuationDispatcher`.
 ```
 
 - [ ] **Step 2: Update Section 11 spec references — add cross-reference to the new spec**
@@ -1873,7 +1983,7 @@ Run:
 dotnet test SpscPipe.slnx -c Debug --nologo
 ```
 
-Expected: all tests pass (the existing test count + 7 new tests added by Tasks 2-7 — `CrossCycleAsyncLocal_DoesNotLeakBetweenContinuations`, `SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly`, `SynchronizationContext_AtAwait_NotHonored_ContinuationOnDispatcherThread`, `TaskScheduler_AtAwait_NotHonored_ContinuationOnDispatcherThread`, two `ConfigureAwait_TrueAndFalse_BothRunOnDispatcherThread` cases (Theory with `[InlineData(true)]` / `[InlineData(false)]`), and `SetResultBeforeOnCompleted_Race_StressN_AllResultsDelivered`).
+Expected: all tests pass (the existing test count + 7 new tests added by Tasks 2-7 — `MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle`, `SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly`, `SynchronizationContext_AtAwait_NotHonored_ContinuationOnDispatcherThread`, `TaskScheduler_AtAwait_NotHonored_ContinuationOnDispatcherThread`, two `ConfigureAwait_TrueAndFalse_BothRunOnDispatcherThread` cases (Theory with `[InlineData(true)]` / `[InlineData(false)]`), and `SetResultBeforeOnCompleted_DirectAwaiter_Race_StressN_AllResultsDelivered`).
 
 ```bash
 dotnet test SpscPipe.slnx -c Release --nologo
