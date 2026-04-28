@@ -1,3 +1,7 @@
+using System.Buffers;
+using System.Diagnostics;
+using System.IO.Pipelines;
+using System.Runtime.InteropServices;
 using SpscPipelines.HotHandoff;
 
 namespace SpscPipelines.HotHandoff.Tests;
@@ -453,5 +457,113 @@ public class HotHandoffContinuationDispatcherTests
         });
 
         await Task.WhenAll(producer, consumer).WaitAsync(TimeSpan.FromSeconds(30));
+    }
+
+    // ---------- Layer C: BDN-pattern stress repro (diagnostic) ----------
+
+    /// <summary>
+    /// Reproduces the BDN deadlock pattern outside of BDN to determine whether
+    /// it's a HotHandoff dispatcher bug or BDN-harness-specific.
+    ///
+    /// Background: when the BDN throughput benchmark's consumer was modified
+    /// to do per-message timestamp processing (CopyTo + MemoryMarshal.Read +
+    /// Stopwatch.GetTimestamp + sample-write per chunk, mirroring the latency
+    /// CLI's pattern), BDN's WorkloadJitting hung deterministically on the
+    /// HotHandoff benchmark — twice in a row, on commits 0d10225 and 032528f.
+    /// Reverting to a simple-drain consumer (commit 99293c1) cleared it. The
+    /// latency CLI runs the same per-message consumer code happily, so the
+    /// hypothesis was that the combination of (sustained back-to-back
+    /// iterations sharing one dispatcher) + (per-message consumer that holds
+    /// the slot longer via inline continuation processing) surfaces a
+    /// HotHandoff bug that the latency CLI's slower iteration cadence doesn't.
+    ///
+    /// This test reproduces that exact pattern outside of BDN, with all
+    /// per-iteration state local (no shared <c>_samples</c> field) so we are
+    /// testing the dispatcher's behavior under sustained-iteration pressure
+    /// alone, not any cross-iteration state interactions.
+    ///
+    /// Outcome interpretation:
+    /// <list type="bullet">
+    /// <item>If this test passes within the timeout, the BDN deadlock is in
+    ///       BDN's harness layer (or in the cross-iteration state we ruled
+    ///       out here), not in HotHandoff itself.</item>
+    /// <item>If this test hangs, HotHandoff has a real bug under this pattern;
+    ///       we have a reproducer to investigate further.</item>
+    /// </list>
+    /// </summary>
+    [Fact]
+    public async Task SpscPipe_WithHotHandoff_RepeatedIteration_PerMessageConsumer_DoesNotHang()
+    {
+        using var dispatcher = new HotHandoffContinuationDispatcher();
+        const int iterations   = 30;            // BDN's WorkloadJitting hung at op 16; 30 gives margin.
+        const int messageCount = 1_000_000;     // Same as the BDN temp workload (commit c1ba6b9).
+        const int chunkSize    = 256;           // Same as the BDN temp workload.
+
+        var driver = Task.Run(async () =>
+        {
+            for (int iter = 0; iter < iterations; iter++)
+            {
+                using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions
+                {
+                    ContinuationDispatcher = dispatcher,
+                });
+                await ProduceAndDrainPerMessage(pipe.Reader, pipe.Writer, messageCount, chunkSize);
+            }
+        });
+
+        // Bounded timeout: the workload should complete in ~10-30 seconds in
+        // normal conditions. If the dispatcher hangs under this pattern,
+        // WaitAsync throws TimeoutException rather than blocking the test
+        // runner indefinitely.
+        await driver.WaitAsync(TimeSpan.FromMinutes(2));
+    }
+
+    private static async Task ProduceAndDrainPerMessage(
+        PipeReader reader, PipeWriter writer, int messageCount, int chunkSize)
+    {
+        long bytesTotal = (long)messageCount * chunkSize;
+        // Local samples array — fresh per iteration. Rules out cross-iteration
+        // state interactions as a confounder.
+        var samples = new long[messageCount];
+
+        var producer = Task.Run(async () =>
+        {
+            for (int i = 0; i < messageCount; i++)
+            {
+                var memory = writer.GetMemory(chunkSize);
+                long t = Stopwatch.GetTimestamp();
+                MemoryMarshal.Write(memory.Span, in t);
+                writer.Advance(chunkSize);
+                await writer.FlushAsync();
+            }
+            writer.Complete();
+        });
+
+        var consumer = Task.Run(async () =>
+        {
+            long consumed = 0;
+            int messageIdx = 0;
+            byte[] tsBuf = new byte[8];
+            while (consumed < bytesTotal)
+            {
+                var rr = await reader.ReadAsync();
+                var buf = rr.Buffer;
+                while (buf.Length >= chunkSize)
+                {
+                    buf.Slice(0, 8).CopyTo(tsBuf);
+                    long sentTicks = MemoryMarshal.Read<long>(tsBuf);
+                    long now = Stopwatch.GetTimestamp();
+                    samples[messageIdx++] = now - sentTicks;
+                    consumed += chunkSize;
+                    buf = buf.Slice(chunkSize);
+                }
+                long consumedThisRead = rr.Buffer.Length - buf.Length;
+                reader.AdvanceTo(rr.Buffer.GetPosition(consumedThisRead), rr.Buffer.End);
+                if (rr.IsCompleted && consumed >= bytesTotal) break;
+            }
+            reader.Complete();
+        });
+
+        await Task.WhenAll(producer, consumer);
     }
 }
