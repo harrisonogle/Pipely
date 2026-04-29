@@ -1,21 +1,20 @@
-using SpscPipelines;
 using Xunit;
 
-namespace SpscPipelines.Tests;
+namespace Pipely.Tests;
 
-public class SpscPipeDisposeTests
+public class PipeDisposeTests
 {
     [Fact]
     public void Dispose_NeverUsed_NoThrow()
     {
-        var pipe = new SpscPipelines.SpscPipe();
+        var pipe = new Pipely.Pipe();
         pipe.Dispose();
     }
 
     [Fact]
     public void DoubleDispose_NoThrow()
     {
-        var pipe = new SpscPipelines.SpscPipe();
+        var pipe = new Pipely.Pipe();
         pipe.Dispose();
         pipe.Dispose();
     }
@@ -23,7 +22,7 @@ public class SpscPipeDisposeTests
     [Fact]
     public async Task Dispose_AfterUse_ReleasesSegments()
     {
-        var pipe = new SpscPipelines.SpscPipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100); pipe.Writer.Advance(100);
         await pipe.Writer.FlushAsync();
         var r = await pipe.Reader.ReadAsync();
@@ -40,7 +39,7 @@ public class SpscPipeDisposeTests
     [Fact]
     public void CancelPendingRead_AfterDispose_Throws()
     {
-        var pipe = new SpscPipelines.SpscPipe();
+        var pipe = new Pipely.Pipe();
         pipe.Dispose();
         Assert.Throws<ObjectDisposedException>(() => pipe.Reader.CancelPendingRead());
     }
@@ -48,7 +47,7 @@ public class SpscPipeDisposeTests
     [Fact]
     public void CancelPendingFlush_AfterDispose_Throws()
     {
-        var pipe = new SpscPipelines.SpscPipe();
+        var pipe = new Pipely.Pipe();
         pipe.Dispose();
         Assert.Throws<ObjectDisposedException>(() => pipe.Writer.CancelPendingFlush());
     }

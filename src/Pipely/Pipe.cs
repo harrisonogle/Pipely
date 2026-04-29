@@ -2,15 +2,15 @@ using System.Buffers;
 using System.IO.Pipelines;
 using System.Threading;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed partial class SpscPipe : IDisposable
+public sealed partial class Pipe : IDisposable
 {
-    internal readonly SpscPipeOptions _options;
+    internal readonly PipeOptions _options;
     internal readonly TripleBuffer<WriterState> _writerTb = new();
     internal readonly TripleBuffer<ReaderState> _readerTb = new();
-    internal readonly SpscAwaiter<ReadResult>  _readAwaiter;
-    internal readonly SpscAwaiter<FlushResult> _flushAwaiter;
+    internal readonly PipelyAwaiter<ReadResult>  _readAwaiter;
+    internal readonly PipelyAwaiter<FlushResult> _flushAwaiter;
 
     // Writer-side cursors (writer thread only).
     internal BufferSegment? _chainHead;
@@ -43,21 +43,21 @@ public sealed partial class SpscPipe : IDisposable
     // Pipe-level (mutated by Dispose only).
     internal bool _disposed;
 
-    private readonly SpscPipeWriter _writerInstance;
-    private readonly SpscPipeReader _readerInstance;
+    private readonly PipeWriter _writerInstance;
+    private readonly PipeReader _readerInstance;
 
-    public SpscPipe() : this(SpscPipeOptions.Default) { }
-    public SpscPipe(SpscPipeOptions options)
+    public Pipe() : this(PipeOptions.Default) { }
+    public Pipe(PipeOptions options)
     {
         _options = options;
         var dispatcher = options.ContinuationDispatcher ?? ThreadPoolContinuationDispatcher.Instance;
-        _readAwaiter    = new SpscAwaiter<ReadResult>(dispatcher);
-        _flushAwaiter   = new SpscAwaiter<FlushResult>(dispatcher);
-        _writerInstance = new SpscPipeWriter(this);
-        _readerInstance = new SpscPipeReader(this);
+        _readAwaiter    = new PipelyAwaiter<ReadResult>(dispatcher);
+        _flushAwaiter   = new PipelyAwaiter<FlushResult>(dispatcher);
+        _writerInstance = new PipeWriter(this);
+        _readerInstance = new PipeReader(this);
     }
 
-    public SpscPipeWriter Writer => _writerInstance;
+    public PipeWriter Writer => _writerInstance;
     public PipeReader Reader => _readerInstance;
 
     public void Dispose()
@@ -193,8 +193,8 @@ public sealed partial class SpscPipe : IDisposable
         while (true)
         {
             int oldV = _readAwaiter._state;
-            if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) return;
-            int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+            if ((oldV & PipelyAwaiter<ReadResult>.StateMask) != PipelyAwaiter<ReadResult>.Pending) return;
+            int desired = oldV & ~PipelyAwaiter<ReadResult>.StateMask;
             if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
             {
                 Interlocked.Increment(ref _readAwaiter._signalWonCount);
@@ -229,8 +229,8 @@ public sealed partial class SpscPipe : IDisposable
         while (true)
         {
             int oldV = _readAwaiter._state;
-            if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) return;
-            int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+            if ((oldV & PipelyAwaiter<ReadResult>.StateMask) != PipelyAwaiter<ReadResult>.Pending) return;
+            int desired = oldV & ~PipelyAwaiter<ReadResult>.StateMask;
             if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
             {
                 Interlocked.Increment(ref _readAwaiter._tokenCancelWonCount);
@@ -245,8 +245,8 @@ public sealed partial class SpscPipe : IDisposable
         while (true)
         {
             int oldV = _flushAwaiter._state;
-            if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
-            int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+            if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) return;
+            int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
             if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
             {
                 Interlocked.Increment(ref _flushAwaiter._tokenCancelWonCount);
@@ -282,7 +282,7 @@ public sealed partial class SpscPipe : IDisposable
     internal void SignalFlushIfBackpressureRelieved()
     {
         // Fast path: no parked writer.
-        if ((_flushAwaiter._state & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
+        if ((_flushAwaiter._state & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) return;
 
         // Refresh writer state to compute unconsumed accurately.
         if (_writerTb.TryAcquire())
@@ -299,8 +299,8 @@ public sealed partial class SpscPipe : IDisposable
         while (true)
         {
             int oldV = _flushAwaiter._state;
-            if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
-            int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+            if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) return;
+            int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
             if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
             {
                 Interlocked.Increment(ref _flushAwaiter._signalWonCount);
@@ -317,8 +317,8 @@ public sealed partial class SpscPipe : IDisposable
         while (true)
         {
             int oldV = _flushAwaiter._state;
-            if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
-            int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+            if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) return;
+            int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
             if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
             {
                 Interlocked.Increment(ref _flushAwaiter._signalWonCount);

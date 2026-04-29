@@ -1,15 +1,14 @@
 using System.Threading;
 using System.Threading.Tasks.Sources;
-using SpscPipelines;
 using Xunit;
 
-namespace SpscPipelines.Tests;
+namespace Pipely.Tests;
 
-public class SpscPipeContinuationDispatcherTests
+public class PipeContinuationDispatcherTests
 {
     // ---------- Helper dispatchers ----------
 
-    private sealed class RecordingDispatcher : IContinuationDispatcher
+    private sealed class RecordingDispatcher : Pipely.IContinuationDispatcher
     {
         private readonly Action<Action<object?>>? _onDispatch;
         public RecordingDispatcher(Action<Action<object?>>? onDispatch = null) => _onDispatch = onDispatch;
@@ -27,7 +26,7 @@ public class SpscPipeContinuationDispatcherTests
     /// Used when we need a "real" custom dispatcher but don't care about the thread.
     /// IDisposable for symmetry with the other helpers; nothing to dispose.
     /// </summary>
-    private sealed class ForwardingDispatcher : IContinuationDispatcher, IDisposable
+    private sealed class ForwardingDispatcher : Pipely.IContinuationDispatcher, IDisposable
     {
         public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
             => ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
@@ -41,7 +40,7 @@ public class SpscPipeContinuationDispatcherTests
     /// if a dispatcher misbehaves and captures EC, because MRVTSC's RunInternal restores the consumer's EC
     /// regardless of which thread (or under what context) the dispatched callback runs.
     /// </summary>
-    private sealed class BadEcCapturingDispatcher : IContinuationDispatcher
+    private sealed class BadEcCapturingDispatcher : Pipely.IContinuationDispatcher
     {
         public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
             => ThreadPool.QueueUserWorkItem(s => callback(s), state);
@@ -59,7 +58,7 @@ public class SpscPipeContinuationDispatcherTests
     ///   doesn't kill the dispatcher thread.
     /// - Disposable: shutdown signals the worker loop to exit and joins.
     /// </summary>
-    private sealed class DedicatedThreadDispatcher : IContinuationDispatcher, IDisposable
+    private sealed class DedicatedThreadDispatcher : Pipely.IContinuationDispatcher, IDisposable
     {
         private readonly Thread _thread;
         private readonly Action? _setupOnThread;
@@ -147,7 +146,7 @@ public class SpscPipeContinuationDispatcherTests
     {
         int dispatchCount = 0;
         var dispatcher = new RecordingDispatcher(_ => Interlocked.Increment(ref dispatchCount));
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         var readTask = pipe.Reader.ReadAsync().AsTask();
         Assert.False(readTask.IsCompleted);
@@ -172,7 +171,7 @@ public class SpscPipeContinuationDispatcherTests
     {
         var asyncLocal = new AsyncLocal<int>();
         using var dispatcher = new ForwardingDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         asyncLocal.Value = 42;
 
@@ -208,7 +207,7 @@ public class SpscPipeContinuationDispatcherTests
         var dispatcherLocal = new AsyncLocal<int>();
         using var dispatcher = new DedicatedThreadDispatcher(
             setupOnThread: () => dispatcherLocal.Value = 999);
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         consumerLocal.Value = 42;
 
@@ -254,7 +253,7 @@ public class SpscPipeContinuationDispatcherTests
             captureBeforeCallback:  () => observedOnDispatcherThreadBeforeCallback = dispatcherLocal.Value,
             captureAfterCallback:   () => observedOnDispatcherThreadAfterCallback  = dispatcherLocal.Value);
 
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         var consumerLocal = new AsyncLocal<int>();
         consumerLocal.Value = 42;
@@ -288,7 +287,7 @@ public class SpscPipeContinuationDispatcherTests
     /// Pins that a "bad" dispatcher (one that captures EC at queue time, e.g.,
     /// uses ThreadPool.QueueUserWorkItem instead of UnsafeQueueUserWorkItem) does
     /// NOT corrupt the consumer's continuation EC. Under the new source-side EC
-    /// capture wiring, the consumer's EC is captured by SpscAwaiter.OnCompleted
+    /// capture wiring, the consumer's EC is captured by Pipely.PipelyAwaiter.OnCompleted
     /// on the CONSUMER's thread — BEFORE the bad dispatcher ever sees the work
     /// item. s_invokeWithEc applies the source-side-captured EC via
     /// ExecutionContext.Run, regardless of what EC the bad dispatcher captured
@@ -304,7 +303,7 @@ public class SpscPipeContinuationDispatcherTests
     {
         // A "bad" dispatcher that uses ThreadPool.QueueUserWorkItem (captures EC).
         var badDispatcher = new BadEcCapturingDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = badDispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = badDispatcher });
 
         var consumerLocal = new AsyncLocal<int>();
         var producerLocal = new AsyncLocal<int>();
@@ -344,7 +343,7 @@ public class SpscPipeContinuationDispatcherTests
         Assert.Equal(42, observedConsumer);
 
         // The producer's EC, if captured by the bad dispatcher, never reaches the
-        // continuation: SpscAwaiter.OnCompleted already captured the consumer's
+        // continuation: Pipely.PipelyAwaiter.OnCompleted already captured the consumer's
         // EC on the consumer's thread BEFORE the bad dispatcher's queue-time
         // capture could matter, and s_invokeWithEc applies that captured consumer
         // EC via ExecutionContext.Run on the dispatcher's chosen thread. The bad
@@ -358,7 +357,7 @@ public class SpscPipeContinuationDispatcherTests
     public async Task CustomDispatcher_ContinuationException_DoesNotKillDispatcherThread()
     {
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         // First read: producer fires in background, consumer parks on ReadAsync, the
         // dispatcher resumes the continuation on its dedicated thread. The continuation
@@ -411,7 +410,7 @@ public class SpscPipeContinuationDispatcherTests
     public async Task CustomDispatcher_RapidParkResumeCycles_NoVersionMismatch()
     {
         using var dispatcher = new ForwardingDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         const int totalCycles  = 1000;
         const int messageBytes = 8;
@@ -451,7 +450,7 @@ public class SpscPipeContinuationDispatcherTests
     public async Task CustomDispatcher_SetResultBeforeOnCompleted_RaceHandled()
     {
         using var dispatcher = new ForwardingDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         // Producer writes BEFORE consumer awaits. The consumer's ReadAsync should return
         // synchronously (sync data return — no dispatcher hop, no continuation, no parking).
@@ -470,8 +469,8 @@ public class SpscPipeContinuationDispatcherTests
     // ---------- C.2 — Per-cycle EC capture/apply hygiene (regression-only) ----------
 
     /// <summary>
-    /// Pins per-cycle EC capture/apply hygiene. Each await on the same SpscPipe goes
-    /// through SpscAwaiter.OnCompleted (capturing the consumer-thread EC at that
+    /// Pins per-cycle EC capture/apply hygiene. Each await on the same Pipe goes
+    /// through Pipely.PipelyAwaiter.OnCompleted (capturing the consumer-thread EC at that
     /// moment) followed by s_invokeWithEc on the dispatcher's chosen thread (which
     /// reads, applies via ExecutionContext.Run, AND clears _realContinuation /
     /// _realState / _capturedEC). If the field clearing in s_invokeWithEc were ever
@@ -495,7 +494,7 @@ public class SpscPipeContinuationDispatcherTests
     {
         var asyncLocal = new AsyncLocal<int>();
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         asyncLocal.Value = 42;
 
@@ -543,7 +542,7 @@ public class SpscPipeContinuationDispatcherTests
 
     /// <summary>
     /// When the consumer awaits inside an ExecutionContext.SuppressFlow() block,
-    /// SpscAwaiter.OnCompleted captures _capturedEC = null and forwards (s_dispatch,
+    /// Pipely.PipelyAwaiter.OnCompleted captures _capturedEC = null and forwards (s_dispatch,
     /// this) to _core.OnCompleted. s_invokeWithEc reads _capturedEC, sees null, and
     /// takes the else branch — direct cont(st) invocation on the dispatcher's chosen
     /// thread, no ExecutionContext.Run. This test pins that the branch is exercised
@@ -561,7 +560,7 @@ public class SpscPipeContinuationDispatcherTests
     public async Task SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly()
     {
         using var dispatcher = new ForwardingDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         _ = Task.Run(async () =>
         {
@@ -605,7 +604,7 @@ public class SpscPipeContinuationDispatcherTests
     /// <summary>
     /// A non-default SynchronizationContext set at the await site is NOT honored: the
     /// continuation runs on the dispatcher's chosen thread, NOT on the SC's thread. The
-    /// new SpscAwaiter.OnCompleted strips UseSchedulingContext from the flags forwarded
+    /// new Pipely.PipelyAwaiter.OnCompleted strips UseSchedulingContext from the flags forwarded
     /// to _core.OnCompleted, so MRVTSC does not capture the SC. The captured SC's
     /// PostCount stays 0; the continuation thread name is the dispatcher's thread.
     /// </summary>
@@ -621,7 +620,7 @@ public class SpscPipeContinuationDispatcherTests
         int? observedThreadId = null;
 
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
@@ -680,7 +679,7 @@ public class SpscPipeContinuationDispatcherTests
         int testThreadId = Environment.CurrentManagedThreadId;
 
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
@@ -731,7 +730,7 @@ public class SpscPipeContinuationDispatcherTests
 
     /// <summary>
     /// With the new source-side EC-capture wiring, ConfigureAwait(true) and
-    /// ConfigureAwait(false) produce identical observable behavior on a SpscPipe await:
+    /// ConfigureAwait(false) produce identical observable behavior on a Pipe await:
     /// both run the continuation on the dispatcher's chosen thread regardless of the
     /// consumer's captured SC/TaskScheduler. This was the original Mechanism A pin —
     /// the BDN deadlock disappeared when ConfigureAwait(false) was added; with the
@@ -750,7 +749,7 @@ public class SpscPipeContinuationDispatcherTests
         int testThreadId = Environment.CurrentManagedThreadId;
 
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
@@ -797,7 +796,7 @@ public class SpscPipeContinuationDispatcherTests
     /// time; the Volatile.Write ordering in OnCompleted ensures the TP-dispatched
     /// s_dispatch reads _realContinuation / _realState / _capturedEC post-publication.
     ///
-    /// Operates directly on SpscAwaiter to force the race deterministically (SpscPipe's
+    /// Operates directly on Pipely.PipelyAwaiter to force the race deterministically (Pipe's
     /// synchronous fast paths would short-circuit before OnCompleted is even called).
     /// Stress N iterations to expose any non-deterministic ordering bug under
     /// CI/jit/scheduler variance.
@@ -812,13 +811,13 @@ public class SpscPipeContinuationDispatcherTests
         {
             // Construct a fresh awaiter per iteration. The dispatcher is shared across
             // iterations (ForwardingDispatcher just routes to TP).
-            var awaiter = new SpscAwaiter<int>(dispatcher);
+            var awaiter = new Pipely.PipelyAwaiter<int>(dispatcher);
 
             // PRODUCER SIGNALS FIRST. _core stores the result; _core's _continuation
             // is null because OnCompleted hasn't been called yet.
             awaiter._core.SetResult(1000 + i);
 
-            // CONSUMER REGISTERS SECOND (manually). SpscAwaiter.OnCompleted writes
+            // CONSUMER REGISTERS SECOND (manually). Pipely.PipelyAwaiter.OnCompleted writes
             // _realContinuation / _realState / _capturedEC via Volatile.Write, then
             // forwards (s_dispatch, this, ...) to _core.OnCompleted. _core sees a
             // completed source and unconditionally queues s_dispatch to TP. TP runs

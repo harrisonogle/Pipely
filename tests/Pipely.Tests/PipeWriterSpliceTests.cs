@@ -1,31 +1,30 @@
 using System.Buffers;
-using SpscPipelines;
 using Xunit;
 
-namespace SpscPipelines.Tests;
+namespace Pipely.Tests;
 
-public class SpscPipeWriterSpliceTests
+public class PipeWriterSpliceTests
 {
     // ---------- Argument validation: ownership stays with caller on throw ----------
 
     [Fact]
     public void Splice_NullBuffer_NoArg_Throws_ArgumentNull()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         Assert.Throws<ArgumentNullException>(() => pipe.Writer.Splice(null!));
     }
 
     [Fact]
     public void Splice_NullBuffer_ThreeArg_Throws_ArgumentNull()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         Assert.Throws<ArgumentNullException>(() => pipe.Writer.Splice(null!, 0, 0));
     }
 
     [Fact]
     public void Splice_DisposedPipe_Throws_ObjectDisposed_CallerStillOwns()
     {
-        var pipe = new SpscPipelines.SpscPipe();
+        var pipe = new Pipely.Pipe();
         pipe.Dispose();
 
         var owner = new TrackingMemoryOwner(64);
@@ -36,7 +35,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void Splice_CompletedWriter_Throws_InvalidOp_CallerStillOwns()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         pipe._writerCompleted = true;          // simulate post-Complete state (internal flag)
 
         var owner = new TrackingMemoryOwner(64);
@@ -51,7 +50,7 @@ public class SpscPipeWriterSpliceTests
     [InlineData(64, 1)]    // start past end + positive length
     public void Splice_RangeViolation_Throws_OutOfRange_CallerStillOwns(int start, int length)
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
         Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Splice(owner, start, length));
         Assert.Equal(0, owner.DisposeCount);
@@ -60,7 +59,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void Splice_ValidationThrows_PipeStateUntouched()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         // Establish a known state.
         pipe.Writer.GetMemory(40);
         pipe.Writer.Advance(40);
@@ -82,7 +81,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void Splice_ZeroLength_ThreeArg_DisposesAndReturns_NoChainMutation()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
 
         long totalWrittenBefore = pipe._totalWritten;
@@ -102,7 +101,7 @@ public class SpscPipeWriterSpliceTests
     {
         // Memory.Length == 0 routes through the no-arg overload to the 3-arg overload
         // with length=0; same accept-and-dispose outcome.
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(0);
 
         pipe.Writer.Splice(owner);
@@ -117,7 +116,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void Splice_NoArg_OnEmptyPipe_BootstrapsChainHeadEqualsWritingHead()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var bytes = new byte[64];
         for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i + 1);
         var owner = new TrackingMemoryOwner(bytes);
@@ -144,7 +143,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void Splice_ThreeArg_OnEmptyPipe_PublishedSliceMatchesStartAndLength()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var bytes = new byte[1024];
         for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i & 0xFF);
         var owner = new TrackingMemoryOwner(bytes);
@@ -166,7 +165,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void Splice_AfterPartialFill_FreezesPreviousTailAndSplicesDonated()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         // Establish a partially-filled rented tail.
         var rentedMem = pipe.Writer.GetMemory(64);
         for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
@@ -210,7 +209,7 @@ public class SpscPipeWriterSpliceTests
         // Spec §2.2: when the previous _writingHead is itself donated, the steady-state
         // Freeze(filled, newDonated) call writes End/base.Memory to the same values they
         // already held; only Next changes meaningfully.
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
 
         var owner1 = new TrackingMemoryOwner(30);
         var owner2 = new TrackingMemoryOwner(50);
@@ -242,7 +241,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void Splice_WithStartOffset_SplicesOnlyTheSelectedSlice()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var bytes = new byte[1024];
         for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i & 0xFF);
         var owner = new TrackingMemoryOwner(bytes);
@@ -260,7 +259,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void GetMemory_AfterSplice_TransitionsToFreshRentedTail()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(owner);
         var donated = pipe._writingHead!;
@@ -280,19 +279,19 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void Advance_AfterSplice_ThrowsArgumentOutOfRange()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(owner);
 
         // _writingHead.AvailableMemory.Length == _writingHeadBytesBuffered, so any positive
-        // Advance fails the existing bounds check at SpscPipe.Writer.cs:52.
+        // Advance fails the existing bounds check at Pipe.Writer.cs:52.
         Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Advance(1));
     }
 
     [Fact]
     public async Task FlushAsync_AfterSplice_PublishesDonatedAsTailSegment()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(50);
         pipe.Writer.Splice(owner);
         var donated = pipe._writingHead!;
@@ -311,7 +310,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public async Task FlushAsync_AfterMixedWriteAndSplice_PublishesCorrectChain()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         var rentedMem = pipe.Writer.GetMemory(64);
         for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
         pipe.Writer.Advance(40);
@@ -335,7 +334,7 @@ public class SpscPipeWriterSpliceTests
         // Spec §8: "After GetMemory + Advance(0) (zero buffered)" → previous tail is frozen
         // with End=0; donated is spliced after. The empty rented segment is harmless and
         // recycles to freelist on drain.
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         pipe.Writer.GetMemory(64);
         pipe.Writer.Advance(0);
         var prevTail = pipe._writingHead!;
@@ -357,7 +356,7 @@ public class SpscPipeWriterSpliceTests
     public async Task LargeSplice_DoesNotPark_SubsequentFlushAsyncParksWhenOverThreshold()
     {
         // Spec §4.4: Splice doesn't gate on PauseWriterThreshold; FlushAsync does.
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
             pauseWriterThreshold: 1024, resumeWriterThreshold: 512));
 
         var owner = new TrackingMemoryOwner(8 * 1024);   // well over the pause threshold
@@ -382,7 +381,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public void BackToBackSplices_NoEmptyRentedTailsBetweenDonations()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var o1 = new TrackingMemoryOwner(10);
         var o2 = new TrackingMemoryOwner(20);
         var o3 = new TrackingMemoryOwner(30);
@@ -418,7 +417,7 @@ public class SpscPipeWriterSpliceTests
         // is exact: zero donated segments should land in the rented freelist regardless of
         // the recycle path's behavior on rented segments. Donated shells go to the
         // separate _donatedShellFreelist instead.
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var donated1 = new TrackingMemoryOwner(30);
         var donated2 = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(donated1);
@@ -448,8 +447,8 @@ public class SpscPipeWriterSpliceTests
     public async Task AdvanceTo_PositionInsideDonatedSegment_Succeeds()
     {
         // Same-pipe AdvanceTo to a SequencePosition inside a donated segment must work
-        // (R4-7 pipe-identity check at SpscPipe.Reader.cs:113 sees OwnerToken == pipe).
-        using var pipe = new SpscPipelines.SpscPipe();
+        // (R4-7 pipe-identity check at Pipe.Reader.cs:113 sees OwnerToken == pipe).
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(40);
         pipe.Writer.Splice(owner);
 
@@ -464,7 +463,7 @@ public class SpscPipeWriterSpliceTests
     public async Task RecyclePath_RentedSegmentStillFreelisted_RegressionGuard()
     {
         // Existing rented-segment recycle behavior must be preserved.
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         // Two rented segments in chain.
         pipe.Writer.GetMemory(64); pipe.Writer.Advance(64);
         pipe.Writer.GetMemory(64); pipe.Writer.Advance(50);
@@ -481,7 +480,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public async Task DisposePipe_WithMixedChain_DisposesAllOwners()
     {
-        var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
 
         var donated1 = new TrackingMemoryOwner(20);
         var donated2 = new TrackingMemoryOwner(30);
@@ -504,7 +503,7 @@ public class SpscPipeWriterSpliceTests
         // After a donated segment recycles into the shell freelist, the next Splice
         // pops that shell instead of allocating a new BufferSegment. The popped shell
         // gets fully reinitialized via AdoptFrom — caller cannot distinguish from fresh.
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var donated1 = new TrackingMemoryOwner(30);
         var donated2 = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(donated1);
@@ -535,8 +534,8 @@ public class SpscPipeWriterSpliceTests
         // With MaxFreelistSegments = 2, only 2 shells should pool; the rest drop to GC.
         // We don't have a public way to observe GC drops directly, but we can assert
         // the freelist count never exceeds the cap.
-        var options = new SpscPipeOptions(maxFreelistSegments: 2);
-        using var pipe = new SpscPipelines.SpscPipe(options);
+        var options = new Pipely.PipeOptions(maxFreelistSegments: 2);
+        using var pipe = new Pipely.Pipe(options);
 
         // Cycle: append + flush + drain + flush, repeated, with a final donated tail
         // each cycle that doesn't get recycled (so the chain has > 2 recyclable donateds).
@@ -564,7 +563,7 @@ public class SpscPipeWriterSpliceTests
         // After Dispose, the shell freelist is reset. No IMemoryOwners to dispose
         // (those were released in RecycleDrainedSegments before pooling); just clear
         // the head + count.
-        var pipe = new SpscPipelines.SpscPipe();
+        var pipe = new Pipely.Pipe();
         var donated1 = new TrackingMemoryOwner(8);
         var donated2 = new TrackingMemoryOwner(8);
         pipe.Writer.Splice(donated1);
@@ -594,7 +593,7 @@ public class SpscPipeWriterSpliceTests
         // Two segments are required to trigger a recycle: donated1 is frozen (no longer
         // _writingHead) once donated2 is appended, so RecycleDrainedSegments can recycle it.
         // With only one segment, _chainHead == _writingHead and the recycle loop never fires.
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var donated1 = new TrackingMemoryOwner(8);
         var donated2 = new TrackingMemoryOwner(8);
         pipe.Writer.Splice(donated1);
@@ -616,7 +615,7 @@ public class SpscPipeWriterSpliceTests
     [Fact]
     public async Task ReadResultBufferContent_IncludesDonatedBytes_InCorrectPosition()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
 
         // Rented [0..3] = 0x01,0x02,0x03,0x04
         var rentedMem = pipe.Writer.GetMemory(64);

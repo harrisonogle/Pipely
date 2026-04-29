@@ -1,10 +1,9 @@
-using SpscPipelines;
 
-namespace SpscPipelines.HotHandoff;
+namespace Pipely.HotHandoff;
 
 /// <summary>
-/// <see cref="IContinuationDispatcher"/> implementation that routes the first hop of
-/// each SpscPipe continuation to a dedicated busy-spinning thread, with ThreadPool
+/// <see cref="Pipely.IContinuationDispatcher"/> implementation that routes the first hop of
+/// each Pipe continuation to a dedicated busy-spinning thread, with ThreadPool
 /// overflow when the dedicated thread is already invoking another continuation.
 ///
 /// <para>
@@ -24,7 +23,7 @@ namespace SpscPipelines.HotHandoff;
 /// full spec and four-races correctness argument.
 /// </para>
 /// </summary>
-public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, IDisposable
+public sealed class HotHandoffContinuationDispatcher : Pipely.IContinuationDispatcher, IDisposable
 {
     private const int Vacant            = 0;
     private const int Busy              = 1;
@@ -62,7 +61,7 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
         _thread = new Thread(Loop)
         {
             IsBackground = true,
-            Name = "SpscPipe HotHandoff",
+            Name = "Pipe HotHandoff",
         };
         _thread.Start();
     }
@@ -79,7 +78,7 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
         }
 
         // Slot busy or shutdown — fall through to TP. UnsafeQueueUserWorkItem
-        // (not QueueUserWorkItem or Task.Run) — IContinuationDispatcher contract item #2.
+        // (not QueueUserWorkItem or Task.Run) — Pipely.IContinuationDispatcher contract item #2.
         ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
         Interlocked.Increment(ref _tpOverflowedCount);        // diagnostic — see §10 / TpOverflowedCount
     }

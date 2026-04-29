@@ -1,15 +1,14 @@
 using System.Buffers;
-using SpscPipelines;
 using Xunit;
 
-namespace SpscPipelines.Tests;
+namespace Pipely.Tests;
 
-public class SpscPipeCancellationTests
+public class PipeCancellationTests
 {
     [Fact]
     public async Task CancelPendingRead_WhileNotParked_NextReadReturnsCanceled()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         pipe.Reader.CancelPendingRead();
 
         var result = await pipe.Reader.ReadAsync();
@@ -19,7 +18,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task CancelPendingRead_WhileParked_DeliversCanceled()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var readTask = pipe.Reader.ReadAsync().AsTask();
         Assert.False(readTask.IsCompleted);
 
@@ -31,7 +30,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task CancelPendingRead_FromThirdThread_DeliversStashBuffer()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var mem = pipe.Writer.GetMemory(3);
         mem.Span[0] = 1; mem.Span[1] = 2; mem.Span[2] = 3;
         pipe.Writer.Advance(3);
@@ -53,7 +52,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task ReadAsync_WithCanceledToken_Throws()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var cts = new CancellationTokenSource();
         cts.Cancel();
         // ThrowsAnyAsync allows TaskCanceledException (subtype of OperationCanceledException),
@@ -64,7 +63,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task ReadAsync_TokenCancelsWhileParked_Throws()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var cts = new CancellationTokenSource();
         var readTask = pipe.Reader.ReadAsync(cts.Token).AsTask();
         Assert.False(readTask.IsCompleted);
@@ -77,7 +76,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task CancelPendingFlush_WhileParked_DeliversCanceled()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(pauseWriterThreshold: 50, resumeWriterThreshold: 25));
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(pauseWriterThreshold: 50, resumeWriterThreshold: 25));
         pipe.Writer.GetMemory(100); pipe.Writer.Advance(100);
         var flushTask = pipe.Writer.FlushAsync().AsTask();
         Assert.False(flushTask.IsCompleted);

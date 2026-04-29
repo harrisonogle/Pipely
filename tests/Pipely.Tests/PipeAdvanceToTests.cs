@@ -1,15 +1,14 @@
 using System.Buffers;
-using SpscPipelines;
 using Xunit;
 
-namespace SpscPipelines.Tests;
+namespace Pipely.Tests;
 
-public class SpscPipeAdvanceToTests
+public class PipeAdvanceToTests
 {
     [Fact]
     public async Task AdvanceTo_PartialConsume_PreservesRemainder()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var mem = pipe.Writer.GetMemory(10);
         for (int i = 0; i < 10; i++) mem.Span[i] = (byte)i;
         pipe.Writer.Advance(10);
@@ -27,7 +26,7 @@ public class SpscPipeAdvanceToTests
     [Fact]
     public async Task AdvanceTo_FullConsume_NextReadHasEmptyBuffer_IfNoData()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var mem = pipe.Writer.GetMemory(10);
         for (int i = 0; i < 10; i++) mem.Span[i] = (byte)i;
         pipe.Writer.Advance(10);
@@ -42,7 +41,7 @@ public class SpscPipeAdvanceToTests
     [Fact]
     public async Task AdvanceTo_BackwardsConsumed_Throws()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var mem = pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
         await pipe.Writer.FlushAsync();
         var r1 = await pipe.Reader.ReadAsync();
@@ -56,7 +55,7 @@ public class SpscPipeAdvanceToTests
     [Fact]
     public async Task AdvanceTo_OnEmptyBuffer_DoesNotThrow_WithDefaultPositions()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         // Simulate empty IsCompleted=true ReadResult by direct publish.
         pipe._writerTb.ProducerSlot() = new WriterState { IsCompleted = true };
         pipe._writerTb.Publish();
@@ -72,8 +71,8 @@ public class SpscPipeAdvanceToTests
     [Fact]
     public async Task AdvanceTo_FromDifferentPipe_Throws()
     {
-        using var pipe1 = new SpscPipelines.SpscPipe();
-        using var pipe2 = new SpscPipelines.SpscPipe();
+        using var pipe1 = new Pipely.Pipe();
+        using var pipe2 = new Pipely.Pipe();
 
         pipe1.Writer.GetMemory(5); pipe1.Writer.Advance(5);
         await pipe1.Writer.FlushAsync();
@@ -86,11 +85,11 @@ public class SpscPipeAdvanceToTests
     [Fact]
     public async Task AdvanceTo_DonatedSegmentFromDifferentPipe_Throws()
     {
-        // R4-7 pipe-identity check (SpscPipe.Reader.cs:113) must fire even when the
+        // R4-7 pipe-identity check (Pipe.Reader.cs:113) must fire even when the
         // SequencePosition points inside a donated segment of pipe1 — donated segments
         // set OwnerToken = pipe1, so a cross-pipe AdvanceTo to pipe2 must reject.
-        using var pipe1 = new SpscPipelines.SpscPipe();
-        using var pipe2 = new SpscPipelines.SpscPipe();
+        using var pipe1 = new Pipely.Pipe();
+        using var pipe2 = new Pipely.Pipe();
 
         var donatedOwner = new TrackingMemoryOwner(20);
         pipe1.Writer.Splice(donatedOwner);

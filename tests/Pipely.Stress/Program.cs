@@ -1,10 +1,9 @@
-using SpscPipelines;
-using SpscPipelines.Stress;
+using Pipely.Stress;
 
 int seedCount = args.Length > 0 ? int.Parse(args[0]) : 10;
 long bytesPerSeed = args.Length > 1 ? long.Parse(args[1]) : 1L << 22;   // 4 MiB
 
-var harness = new StressHarness(SpscPipeOptions.Default, TimeSpan.FromSeconds(30));
+var harness = new StressHarness(Pipely.PipeOptions.Default, TimeSpan.FromSeconds(30));
 int failures = 0;
 
 for (int i = 0; i < seedCount; i++)

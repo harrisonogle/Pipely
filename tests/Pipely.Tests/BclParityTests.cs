@@ -1,11 +1,10 @@
 using System.Buffers;
 using System.IO.Pipelines;
-using SpscPipelines;
 using Xunit;
 
-namespace SpscPipelines.Tests;
+namespace Pipely.Tests;
 
-public enum PipeKind { Bcl, Spsc }
+public enum PipeKind { Bcl, Pipely }
 
 public class BclParityTests
 {
@@ -16,8 +15,8 @@ public class BclParityTests
             case PipeKind.Bcl:
                 var bcl = new Pipe(bclOpts ?? PipeOptions.Default);
                 return (bcl.Reader, bcl.Writer, NoOpDisposable.Instance);
-            case PipeKind.Spsc:
-                var spsc = new SpscPipelines.SpscPipe();    // defaults match BCL defaults
+            case PipeKind.Pipely:
+                var spsc = new Pipely.Pipe();    // defaults match BCL defaults
                 return (spsc.Reader, spsc.Writer, spsc);
             default:
                 throw new ArgumentOutOfRangeException(nameof(kind));
@@ -32,7 +31,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task WriterCompleteEx_NextReadAsyncThrows(PipeKind kind)
     {
         var (reader, writer, disp) = CreatePipe(kind);
@@ -47,7 +46,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task ReaderCompleteEx_NextFlushAsyncThrows(PipeKind kind)
     {
         var (reader, writer, disp) = CreatePipe(kind);
@@ -62,7 +61,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task BackpressureHysteresis_ParkAtPause_ResumeAtBelowResume(PipeKind kind)
     {
         const int pauseAt  = 100;
@@ -76,7 +75,7 @@ public class BclParityTests
         }
         else
         {
-            var spsc = new SpscPipelines.SpscPipe(new SpscPipeOptions(pauseWriterThreshold: pauseAt, resumeWriterThreshold: resumeAt));
+            var spsc = new Pipely.Pipe(new Pipely.PipeOptions(pauseWriterThreshold: pauseAt, resumeWriterThreshold: resumeAt));
             reader = spsc.Reader; writer = spsc.Writer; disp = spsc;
         }
 
@@ -95,7 +94,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task EmptyPipe_TryReadReturnsFalse_ReadAsyncParks(PipeKind kind)
     {
         var (reader, writer, disp) = CreatePipe(kind);
@@ -111,7 +110,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task RoundTripBytes_PreservesContent(PipeKind kind)
     {
         var (reader, writer, disp) = CreatePipe(kind);
@@ -131,7 +130,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task ReadAsync_TwiceWithoutAdvanceTo_BothThrow(PipeKind kind)
     {
         var (reader, writer, disp) = CreatePipe(kind);
@@ -145,7 +144,7 @@ public class BclParityTests
         }
     }
 
-    // NOTE: Originally documented as "SpscCoalesces_BclThrows" — BCL Pipe historically threw
+    // NOTE: Originally documented as "PipelyCoalesces_BclThrows" — BCL Pipe historically threw
     // InvalidOperationException on a second Writer.Complete. As of .NET 10, BCL also coalesces
     // (verified empirically: a second Writer.Complete on a completed BCL Pipe is a no-op). This
     // test now asserts both pipes coalesce, eliminating a previously documented divergence.
@@ -156,7 +155,7 @@ public class BclParityTests
         bcl.Writer.Complete();
         bcl.Writer.Complete();   // no throw (BCL net10.0 coalesces)
 
-        using var spsc = new SpscPipelines.SpscPipe();
+        using var spsc = new Pipely.Pipe();
         spsc.Writer.Complete();
         spsc.Writer.Complete();   // no throw
     }

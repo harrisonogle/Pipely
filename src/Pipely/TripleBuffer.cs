@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-namespace SpscPipelines;
+namespace Pipely;
 
 public sealed class TripleBuffer<T> where T : struct
 {

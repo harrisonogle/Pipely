@@ -1,9 +1,9 @@
 using System.Threading;
 using System.Threading.Tasks.Sources;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
+internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
 {
     // RCA = false: with source-side EC capture, every signal-path SetResult/SetException
     // invokes our registered s_dispatch INLINE on the producer thread (RCA=false ⇒ MRVTSC
@@ -18,7 +18,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     public CancellationTokenRegistration _ctr;
     public CancellationToken _token;
 
-    // Pattern 2 stash (used by SpscAwaiter<ReadResult>; ignored by SpscAwaiter<FlushResult>).
+    // Pattern 2 stash (used by PipelyAwaiter<ReadResult>; ignored by PipelyAwaiter<FlushResult>).
     public BufferSegment? _stashHead;
     public int _stashHeadIdx;
     public BufferSegment? _stashTail;
@@ -42,7 +42,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
 
     // The dispatcher this awaiter routes continuations through. Set once at construction;
     // immutable for the awaiter's lifetime. Stored on the awaiter so s_dispatch can reach it
-    // without a back-pointer to SpscPipe.
+    // without a back-pointer to Pipe.
     private readonly IContinuationDispatcher _dispatcher;
 
     public const int Inactive   = 0b00;
@@ -52,7 +52,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
 
     // Diagnostic counters (Interlocked-incremented at each CAS resolution site). Cost ~5-10 ns
     // per increment, only on park/signal paths (off the synchronous hot path). Read by the
-    // benchmark project (`tests/SpscPipelines.Benchmarks/SpscPipeAdapter.cs`) after a run completes;
+    // benchmark project (`tests/Pipely.Benchmarks/PipeAdapter.cs`) after a run completes;
     // unrelated to the EC-capture work.
     public long _parkCount;
     public long _signalWonCount;
@@ -61,7 +61,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     public long _lostWakeupResolvedCount;
     public long _lostCancelResolvedCount;
 
-    public SpscAwaiter(IContinuationDispatcher dispatcher) => _dispatcher = dispatcher;
+    public PipelyAwaiter(IContinuationDispatcher dispatcher) => _dispatcher = dispatcher;
 
     public short Version => _core.Version;
     public T GetResult(short token) => _core.GetResult(token);
@@ -102,7 +102,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     // through the dispatcher.
     private static readonly Action<object?> s_dispatch = static state =>
     {
-        var awaiter = (SpscAwaiter<T>)state!;
+        var awaiter = (PipelyAwaiter<T>)state!;
         awaiter._dispatcher.UnsafeQueueUserWorkItem(s_invokeWithEc!, awaiter);
     };
 
@@ -111,7 +111,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     // the consumer-captured EC if any, and invokes the continuation.
     private static readonly Action<object?> s_invokeWithEc = static state =>
     {
-        var awaiter = (SpscAwaiter<T>)state!;
+        var awaiter = (PipelyAwaiter<T>)state!;
         var cont = awaiter._realContinuation;
         var st   = awaiter._realState;
         var ec   = awaiter._capturedEC;
@@ -140,7 +140,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     // ContextCallback wrapper used by ExecutionContext.Run inside s_invokeWithEc.
     private static readonly ContextCallback s_runContinuation = static state =>
     {
-        var awaiter = (SpscAwaiter<T>)state!;
+        var awaiter = (PipelyAwaiter<T>)state!;
         var cb = awaiter._runCb!;
         var st = awaiter._runState;
         awaiter._runCb = null;

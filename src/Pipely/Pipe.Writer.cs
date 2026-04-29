@@ -3,16 +3,16 @@ using System.IO.Pipelines;
 using System.Runtime.ExceptionServices;
 using System.Threading;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed class SpscPipeWriter : PipeWriter
+public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
 {
-    private readonly SpscPipe _pipe;
-    internal SpscPipeWriter(SpscPipe pipe) => _pipe = pipe;
+    private readonly Pipe _pipe;
+    internal PipeWriter(Pipe pipe) => _pipe = pipe;
 
     public override Memory<byte> GetMemory(int sizeHint = 0)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
         if (sizeHint < 0) throw new ArgumentOutOfRangeException(nameof(sizeHint));
         if (sizeHint == 0) sizeHint = 1;
@@ -44,7 +44,7 @@ public sealed class SpscPipeWriter : PipeWriter
 
     public override void Advance(int bytes)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
         if (_pipe._writingHead == null) throw new InvalidOperationException("Advance without prior GetMemory.");
         if (_pipe._writingHeadBytesBuffered + bytes > _pipe._writingHead.AvailableMemory.Length)
@@ -55,7 +55,7 @@ public sealed class SpscPipeWriter : PipeWriter
 
     public override ValueTask<FlushResult> FlushAsync(CancellationToken ct = default)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
 
         // Throw-first: refresh reader state, then throw if reader-completed-with-ex.
@@ -69,8 +69,8 @@ public sealed class SpscPipeWriter : PipeWriter
         while (true)
         {
             int oldV = _pipe._flushAwaiter._state;
-            if ((oldV & SpscAwaiter<FlushResult>.CancelFlag) == 0) break;
-            int desired = oldV & ~SpscAwaiter<FlushResult>.CancelFlag;
+            if ((oldV & PipelyAwaiter<FlushResult>.CancelFlag) == 0) break;
+            int desired = oldV & ~PipelyAwaiter<FlushResult>.CancelFlag;
             if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                 return new ValueTask<FlushResult>(_pipe.BuildFlushResult(isCanceled: true));
         }
@@ -116,7 +116,7 @@ public sealed class SpscPipeWriter : PipeWriter
 
     public override void Complete(Exception? exception = null)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) return;     // double-Complete coalesces
         _pipe._writerCompleted = true;
 
@@ -138,14 +138,14 @@ public sealed class SpscPipeWriter : PipeWriter
 
     public override void CancelPendingFlush()
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
-        int oldV = Interlocked.Or(ref _pipe._flushAwaiter._state, SpscAwaiter<FlushResult>.CancelFlag);
-        if ((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Pending
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
+        int oldV = Interlocked.Or(ref _pipe._flushAwaiter._state, PipelyAwaiter<FlushResult>.CancelFlag);
+        if ((oldV & PipelyAwaiter<FlushResult>.StateMask) == PipelyAwaiter<FlushResult>.Pending
             && Interlocked.CompareExchange(
                    ref _pipe._flushAwaiter._state,
-                   SpscAwaiter<FlushResult>.Inactive,
-                   SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
-               == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
+                   PipelyAwaiter<FlushResult>.Inactive,
+                   PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag)
+               == (PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag))
         {
             Interlocked.Increment(ref _pipe._flushAwaiter._cancelPendingWonCount);
             _pipe._flushAwaiter._ctr.Dispose();
@@ -162,9 +162,9 @@ public sealed class SpscPipeWriter : PipeWriter
         while (true)
         {
             int oldV = _pipe._flushAwaiter._state;
-            System.Diagnostics.Debug.Assert((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Inactive,
+            System.Diagnostics.Debug.Assert((oldV & PipelyAwaiter<FlushResult>.StateMask) == PipelyAwaiter<FlushResult>.Inactive,
                          "SPSC violation: concurrent FlushAsync");
-            int desired = (oldV & SpscAwaiter<FlushResult>.CancelFlag) | SpscAwaiter<FlushResult>.Pending;
+            int desired = (oldV & PipelyAwaiter<FlushResult>.CancelFlag) | PipelyAwaiter<FlushResult>.Pending;
             if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
             {
                 Interlocked.Increment(ref _pipe._flushAwaiter._parkCount);
@@ -182,8 +182,8 @@ public sealed class SpscPipeWriter : PipeWriter
                 while (true)
                 {
                     int oldV = _pipe._flushAwaiter._state;
-                    if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
-                    int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                    if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) break;
+                    int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
                     if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                     {
                         Interlocked.Increment(ref _pipe._flushAwaiter._lostWakeupResolvedCount);
@@ -202,8 +202,8 @@ public sealed class SpscPipeWriter : PipeWriter
                 while (true)
                 {
                     int oldV = _pipe._flushAwaiter._state;
-                    if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
-                    int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                    if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) break;
+                    int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
                     if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                     {
                         Interlocked.Increment(ref _pipe._flushAwaiter._lostWakeupResolvedCount);
@@ -215,20 +215,20 @@ public sealed class SpscPipeWriter : PipeWriter
 
         // Lost-cancel re-check.
         int v = _pipe._flushAwaiter._state;
-        if ((v & SpscAwaiter<FlushResult>.CancelFlag) != 0
+        if ((v & PipelyAwaiter<FlushResult>.CancelFlag) != 0
             && Interlocked.CompareExchange(
                    ref _pipe._flushAwaiter._state,
-                   SpscAwaiter<FlushResult>.Inactive,
-                   SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
-               == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
+                   PipelyAwaiter<FlushResult>.Inactive,
+                   PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag)
+               == (PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag))
         {
             Interlocked.Increment(ref _pipe._flushAwaiter._lostCancelResolvedCount);
             _pipe._flushAwaiter._core.SetResult(_pipe.BuildFlushResult(isCanceled: true));
             return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
         }
 
-        _pipe._flushAwaiter._ctr = ct.UnsafeRegister(static p => ((SpscPipe)p!).OnFlushAwaiterTokenCancel(), _pipe);
-        if ((_pipe._flushAwaiter._state & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending)
+        _pipe._flushAwaiter._ctr = ct.UnsafeRegister(static p => ((Pipe)p!).OnFlushAwaiterTokenCancel(), _pipe);
+        if ((_pipe._flushAwaiter._state & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending)
             _pipe._flushAwaiter._ctr.Dispose();
         return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
     }
@@ -247,7 +247,7 @@ public sealed class SpscPipeWriter : PipeWriter
     public void Splice(IMemoryOwner<byte> buffer, int start, int length)
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
 
         var mem = buffer.Memory;

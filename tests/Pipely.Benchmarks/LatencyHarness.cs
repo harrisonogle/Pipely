@@ -5,7 +5,7 @@ using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace SpscPipelines.Benchmarks;
+namespace Pipely.Benchmarks;
 
 internal sealed record SampleStats(
     long Count,
@@ -300,7 +300,7 @@ internal static class LatencyHarness
     }
 
     // Side-by-side comparison table for time-based metrics. "Ratio" column matches BDN convention:
-    // ratio = comparison / baseline, formatted as decimal (e.g., 0.67 = SpscPipe 33% faster).
+    // ratio = comparison / baseline, formatted as decimal (e.g., 0.67 = Pipe 33% faster).
     // Baseline (BCL) is implicit at 1.00 by virtue of being the denominator.
     // Values are formatted in nanoseconds. Mean is omitted as it's heavily skewed by tail outliers;
     // P50 + P90/P99/P99.9 already characterize the distribution more honestly.

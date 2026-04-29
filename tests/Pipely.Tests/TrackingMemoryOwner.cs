@@ -1,7 +1,7 @@
-// tests/SpscPipelines.Tests/TrackingMemoryOwner.cs
+// tests/Pipely.Tests/TrackingMemoryOwner.cs
 using System.Buffers;
 
-namespace SpscPipelines.Tests;
+namespace Pipely.Tests;
 
 internal sealed class TrackingMemoryOwner : IMemoryOwner<byte>
 {

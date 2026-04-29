@@ -1,6 +1,6 @@
 using System.Buffers;
 
-namespace SpscPipelines;
+namespace Pipely;
 
 internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
 {
@@ -71,7 +71,7 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
         AvailableMemory = default;
     }
 
-    // Used by SpscPipe's freelist to link recycled segments without affecting End/Memory.
+    // Used by Pipe's freelist to link recycled segments without affecting End/Memory.
     // (Avoids overloading Freeze/RecycleReset for the freelist-link use case.)
     public void SetFreelistNext(BufferSegment? next)
     {

@@ -1,8 +1,8 @@
 using System.Buffers;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed class SpscPipeOptions
+public sealed class PipeOptions
 {
     public MemoryPool<byte> Pool { get; }
     public int  MinimumSegmentSize    { get; }
@@ -19,7 +19,7 @@ public sealed class SpscPipeOptions
     /// </summary>
     public IContinuationDispatcher? ContinuationDispatcher { get; init; }
 
-    public SpscPipeOptions(
+    public PipeOptions(
         MemoryPool<byte>? pool = null,
         int  minimumSegmentSize    = 4096,
         long pauseWriterThreshold  = 65536,
@@ -40,5 +40,5 @@ public sealed class SpscPipeOptions
         MaxFreelistSegments   = maxFreelistSegments;
     }
 
-    public static SpscPipeOptions Default { get; } = new();
+    public static PipeOptions Default { get; } = new();
 }

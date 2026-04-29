@@ -1,14 +1,13 @@
-using SpscPipelines;
 using Xunit;
 
-namespace SpscPipelines.Tests;
+namespace Pipely.Tests;
 
-public class SpscPipeLifecycleTests
+public class PipeLifecycleTests
 {
     [Fact]
     public async Task WriterCompleteNull_ReaderSeesIsCompletedAfterDrain()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var mem = pipe.Writer.GetMemory(5); mem.Span.Fill(0xAA); pipe.Writer.Advance(5);
         await pipe.Writer.FlushAsync();
         pipe.Writer.Complete();
@@ -27,7 +26,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public async Task WriterCompleteEx_EveryReadAsyncThrows()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var ex = new InvalidOperationException("writer error");
         pipe.Writer.Complete(ex);
 
@@ -41,7 +40,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public async Task ReaderComplete_WriterFlushReturnsIsCompleted()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         pipe.Reader.Complete();
 
         var r = await pipe.Writer.FlushAsync();
@@ -51,7 +50,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public async Task ReaderCompleteEx_WriterFlushThrows()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var ex = new InvalidOperationException("reader error");
         pipe.Reader.Complete(ex);
 
@@ -62,7 +61,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public void DoubleComplete_NoOp()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         pipe.Writer.Complete();
         pipe.Writer.Complete(new Exception("ignored"));         // no-op coalesce
         pipe.Reader.Complete();
@@ -72,7 +71,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public async Task ReaderComplete_AllChainSegmentsRecycledOnNextFlush()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         // Fill two segments.
         for (int i = 0; i < 2; i++)
         {

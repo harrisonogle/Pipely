@@ -1,13 +1,12 @@
 using BenchmarkDotNet.Running;
-using SpscPipelines.HotHandoff;
-using SpscPipelines.HotHandoff.Benchmarks;
+using Pipely.HotHandoff.Benchmarks;
 using System.CommandLine;
 
 // Anything that isn't the latency sub-command (including no args, or BDN args
 // like --filter / --job) is forwarded to BenchmarkSwitcher. FromAssembly
 // auto-discovers every public [Benchmark] class in the project, so adding a
 // second BDN class later requires no Program.cs edit (matches the pattern in
-// tests/SpscPipelines.Benchmarks/Program.cs).
+// tests/Pipely.Benchmarks/Program.cs).
 if (args.Length == 0 || args[0] != "latency")
 {
     BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
@@ -59,7 +58,7 @@ latencyCommand.SetAction(async parseResult =>
     return 0;
 });
 
-var rootCommand = new RootCommand("SpscPipelines.HotHandoff benchmark harness")
+var rootCommand = new RootCommand("Pipely.HotHandoff benchmark harness")
 {
     latencyCommand,
 };
@@ -71,7 +70,7 @@ static async Task RunLatency(int count, int size, int trials, int warmup, bool c
     string writeMode = copyChunk ? "full chunk copy" : "timestamp-only writes";
     Console.WriteLine($"Latency comparison: {count:N0} messages × {size} B, {trials} trials, {warmup} warmup, {writeMode}");
 
-    // Phase 1 — tp-default. No HotHandoffContinuationDispatcher exists during
+    // Phase 1 — tp-default. No Pipely.HotHandoff.HotHandoffContinuationDispatcher exists during
     // this phase, so the TP-default measurement is not contaminated by a
     // busy-spinning worker thread eating a core.
     Console.WriteLine();
@@ -87,14 +86,14 @@ static async Task RunLatency(int count, int size, int trials, int warmup, bool c
 
     // Phase 2 — hot-handoff. Single dispatcher amortized across warmup +
     // all recorded trials (matches the [GlobalSetup] amortization pattern
-    // used by DispatcherThroughputBench.SpscPipe_HotHandoff_ProduceAndDrain).
+    // used by DispatcherThroughputBench.Pipe_HotHandoff_ProduceAndDrain).
     // Per-trial slot/TP counts are taken as deltas of the cumulative
     // dispatcher counters between trial boundaries.
     Console.WriteLine();
     Console.WriteLine($"--- Phase 2: hot-handoff ({warmup} warmup + {trials} recorded trials, single dispatcher) ---");
     var hhTrials       = new LatencyStats[trials];
     var dispatchTrials = new (long slot, long tp)[trials];
-    using (var dispatcher = new HotHandoffContinuationDispatcher())
+    using (var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher())
     {
         for (int w = 0; w < warmup; w++)
         {

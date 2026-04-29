@@ -1,10 +1,10 @@
 using System.Threading;
 
-namespace SpscPipelines;
+namespace Pipely;
 
 /// <summary>
-/// Routes <see cref="SpscPipe"/>'s parked-awaiter continuations to a thread of the
-/// implementation's choosing. Configured via <see cref="SpscPipeOptions.ContinuationDispatcher"/>;
+/// Routes <see cref="Pipe"/>'s parked-awaiter continuations to a thread of the
+/// implementation's choosing. Configured via <see cref="PipeOptions.ContinuationDispatcher"/>;
 /// the default (when the option is null) forwards to <see cref="ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/>,
 /// preserving the prior <c>RunContinuationsAsynchronously = true</c> configuration's observable behavior.
 ///
@@ -27,7 +27,7 @@ public interface IContinuationDispatcher
     /// </item>
     /// <item>
     /// The implementation MUST NOT capture or apply an <see cref="System.Threading.ExecutionContext"/>.
-    /// EC handling for SpscPipe's awaitable continuations is performed by <c>SpscAwaiter&lt;T&gt;</c>:
+    /// EC handling for Pipe's awaitable continuations is performed by <c>PipelyAwaiter&lt;T&gt;</c>:
     /// it captures the consumer's <see cref="System.Threading.ExecutionContext"/> at
     /// <see cref="System.Threading.Tasks.Sources.IValueTaskSource.OnCompleted"/> time (per the
     /// consumer's <c>FlowExecutionContext</c> flag), passes the dispatcher a work item that carries
@@ -61,7 +61,7 @@ public interface IContinuationDispatcher
 /// Default <see cref="IContinuationDispatcher"/>: forwards to
 /// <see cref="ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/> with
 /// <c>preferLocal: false</c>. Stateless singleton; used when
-/// <see cref="SpscPipeOptions.ContinuationDispatcher"/> is null.
+/// <see cref="PipeOptions.ContinuationDispatcher"/> is null.
 /// </summary>
 internal sealed class ThreadPoolContinuationDispatcher : IContinuationDispatcher
 {

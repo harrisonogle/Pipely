@@ -1,8 +1,7 @@
 using System.IO.Pipelines;
 using BenchmarkDotNet.Attributes;
-using SpscPipelines;
 
-namespace SpscPipelines.HotHandoff.Benchmarks;
+namespace Pipely.HotHandoff.Benchmarks;
 
 [MemoryDiagnoser]
 public class DispatcherThroughputBench
@@ -11,23 +10,23 @@ public class DispatcherThroughputBench
     private const int ChunkSize  = 4096;
 
     // Constructed once per benchmark run, reused across all iterations. This
-    // matches the apples-to-apples comparison shape: BCL Pipe and SpscPipe's
+    // matches the apples-to-apples comparison shape: BCL Pipe and Pipe's
     // default TP dispatcher both have zero per-iteration "dispatcher" startup
-    // cost (the BCL pipe uses TP directly; SpscPipe-TP uses the singleton
+    // cost (the BCL pipe uses TP directly; Pipe-TP uses the singleton
     // ThreadPoolContinuationDispatcher.Instance). The HotHandoff equivalent
     // must also amortize its thread-startup cost across iterations rather
     // than pay it per measurement. Per-iteration cost is now solely
     // pipe ctor + produce-and-drain on both sides.
-    private HotHandoffContinuationDispatcher? _dispatcher;
+    private Pipely.HotHandoff.HotHandoffContinuationDispatcher? _dispatcher;
 
-    [GlobalSetup(Target = nameof(SpscPipe_HotHandoff_ProduceAndDrain))]
-    public void SetupHotHandoff() => _dispatcher = new HotHandoffContinuationDispatcher();
+    [GlobalSetup(Target = nameof(Pipe_HotHandoff_ProduceAndDrain))]
+    public void SetupHotHandoff() => _dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
 
-    [GlobalCleanup(Target = nameof(SpscPipe_HotHandoff_ProduceAndDrain))]
+    [GlobalCleanup(Target = nameof(Pipe_HotHandoff_ProduceAndDrain))]
     public void CleanupHotHandoff() => _dispatcher?.Dispose();
 
     // BCL System.IO.Pipelines.Pipe — TP-driven continuations, default options
-    // (64K pause / 32K resume — same thresholds as SpscPipeOptions.Default).
+    // (64K pause / 32K resume — same thresholds as PipeOptions.Default).
     [Benchmark(Baseline = true)]
     public async Task BclPipe_ProduceAndDrain()
     {
@@ -35,23 +34,23 @@ public class DispatcherThroughputBench
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
-    // SpscPipe with the default ThreadPoolContinuationDispatcher (no override).
+    // Pipe with the default ThreadPoolContinuationDispatcher (no override).
     [Benchmark]
-    public async Task SpscPipe_TpDefault_ProduceAndDrain()
+    public async Task Pipe_TpDefault_ProduceAndDrain()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
             ContinuationDispatcher = null,
         });
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
-    // SpscPipe with the HotHandoffContinuationDispatcher (constructed once
+    // Pipe with the Pipely.HotHandoff.HotHandoffContinuationDispatcher (constructed once
     // in [GlobalSetup], reused across all iterations of this benchmark).
     [Benchmark]
-    public async Task SpscPipe_HotHandoff_ProduceAndDrain()
+    public async Task Pipe_HotHandoff_ProduceAndDrain()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
             ContinuationDispatcher = _dispatcher,
         });

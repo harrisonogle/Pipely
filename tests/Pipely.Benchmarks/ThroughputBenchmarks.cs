@@ -1,6 +1,6 @@
 using BenchmarkDotNet.Attributes;
 
-namespace SpscPipelines.Benchmarks;
+namespace Pipely.Benchmarks;
 
 [MemoryDiagnoser]
 public class ThroughputBenchmarks
@@ -16,9 +16,9 @@ public class ThroughputBenchmarks
     }
 
     [Benchmark]
-    public async Task SpscPipe_ProduceAndDrain()
+    public async Task Pipe_ProduceAndDrain()
     {
-        using var adapter = new SpscPipeAdapter();
+        using var adapter = new PipeAdapter();
         await ProduceAndDrain(adapter);
     }
 

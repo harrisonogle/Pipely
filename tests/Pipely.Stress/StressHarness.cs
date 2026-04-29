@@ -1,14 +1,12 @@
-using SpPipe = SpscPipelines.SpscPipe;
-using SpscPipelines;
 
-namespace SpscPipelines.Stress;
+namespace Pipely.Stress;
 
 internal sealed class StressHarness
 {
-    private readonly SpscPipeOptions _options;
+    private readonly Pipely.PipeOptions _options;
     private readonly TimeSpan _duration;
 
-    public StressHarness(SpscPipeOptions options, TimeSpan duration)
+    public StressHarness(Pipely.PipeOptions options, TimeSpan duration)
     {
         _options  = options;
         _duration = duration;
@@ -19,7 +17,7 @@ internal sealed class StressHarness
         var owners = new System.Collections.Concurrent.ConcurrentBag<StressOwner>();
         StressResult result;
         {
-            using var pipe = new SpPipe(_options);
+            using var pipe = new Pipely.Pipe(_options);
             var producerRng = new Random(seed);
             var consumerRng = new Random(seed ^ 0x5A5A_5A5A);
 

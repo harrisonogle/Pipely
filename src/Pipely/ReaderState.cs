@@ -1,4 +1,4 @@
-namespace SpscPipelines;
+namespace Pipely;
 
 internal struct ReaderState
 {

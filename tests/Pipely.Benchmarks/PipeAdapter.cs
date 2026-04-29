@@ -1,8 +1,6 @@
 using System.IO.Pipelines;
-using SpscPipelines;
-using SpPipe = SpscPipelines.SpscPipe;
 
-namespace SpscPipelines.Benchmarks;
+namespace Pipely.Benchmarks;
 
 internal sealed record AwaiterCounters(
     long ParkCount,
@@ -13,10 +11,10 @@ internal sealed record AwaiterCounters(
     long LostCancelResolvedCount
 );
 
-internal sealed class SpscPipeAdapter : IPipeAdapter
+internal sealed class PipeAdapter : IPipeAdapter
 {
-    private readonly SpPipe _pipe;
-    public SpscPipeAdapter(SpscPipeOptions? options = null) => _pipe = new SpPipe(options ?? SpscPipeOptions.Default);
+    private readonly Pipely.Pipe _pipe;
+    public PipeAdapter(Pipely.PipeOptions? options = null) => _pipe = new Pipely.Pipe(options ?? Pipely.PipeOptions.Default);
     public PipeReader Reader => _pipe.Reader;
     public PipeWriter Writer => _pipe.Writer;
     public void Dispose() => _pipe.Dispose();

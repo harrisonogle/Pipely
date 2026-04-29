@@ -1,13 +1,13 @@
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/SpscPipelines/SpscPipelines.csproj" />
-    <Project Path="src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj" />
+    <Project Path="src/Pipely/Pipely.csproj" />
+    <Project Path="src/Pipely.HotHandoff/Pipely.HotHandoff.csproj" />
   </Folder>
   <Folder Name="/tests/">
-    <Project Path="tests/SpscPipelines.Benchmarks/SpscPipelines.Benchmarks.csproj" />
-    <Project Path="tests/SpscPipelines.Stress/SpscPipelines.Stress.csproj" />
-    <Project Path="tests/SpscPipelines.Tests/SpscPipelines.Tests.csproj" />
-    <Project Path="tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.csproj" />
-    <Project Path="tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj" />
+    <Project Path="tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj" />
+    <Project Path="tests/Pipely.Stress/Pipely.Stress.csproj" />
+    <Project Path="tests/Pipely.Tests/Pipely.Tests.csproj" />
+    <Project Path="tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj" />
+    <Project Path="tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj" />
   </Folder>
 </Solution>

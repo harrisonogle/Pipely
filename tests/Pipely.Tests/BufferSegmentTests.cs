@@ -1,8 +1,7 @@
 using System.Buffers;
-using SpscPipelines;
 using Xunit;
 
-namespace SpscPipelines.Tests;
+namespace Pipely.Tests;
 
 public class BufferSegmentTests
 {

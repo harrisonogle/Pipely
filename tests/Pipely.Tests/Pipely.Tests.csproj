@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\SpscPipelines\SpscPipelines.csproj" />
+    <ProjectReference Include="..\..\src\Pipely\Pipely.csproj" />
   </ItemGroup>
 
 </Project>

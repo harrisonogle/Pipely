@@ -2,18 +2,17 @@ using System.Buffers;
 using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Runtime.InteropServices;
-using SpscPipelines.HotHandoff;
 
-namespace SpscPipelines.HotHandoff.Tests;
+namespace Pipely.HotHandoff.Tests;
 
 public class HotHandoffContinuationDispatcherTests
 {
-    // ---------- Layer A: dispatcher in isolation (no SpscPipe) ----------
+    // ---------- Layer A: dispatcher in isolation (no Pipe) ----------
 
     [Fact]
     public void Dispatch_InvokesCallbackOnDedicatedThread()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
         int? firstThreadId    = null;
         int? secondThreadId   = null;
         string? firstThreadName  = null;
@@ -46,15 +45,15 @@ public class HotHandoffContinuationDispatcherTests
         }
 
         Assert.NotEqual(Environment.CurrentManagedThreadId, firstThreadId);
-        Assert.Equal("SpscPipe HotHandoff", firstThreadName);
-        Assert.Equal("SpscPipe HotHandoff", secondThreadName);
+        Assert.Equal("Pipe HotHandoff", firstThreadName);
+        Assert.Equal("Pipe HotHandoff", secondThreadName);
         Assert.Equal(firstThreadId, secondThreadId);   // consistently same dedicated thread
     }
 
     [Fact]
     public void Dispatch_OverflowFallsBackToThreadPool()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
         using var firstStarted = new ManualResetEventSlim(false);
         using var firstRelease = new ManualResetEventSlim(false);
         using var secondDone   = new ManualResetEventSlim(false);
@@ -88,7 +87,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public void Dispatch_InvokesEachCallbackExactlyOnce()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
         const int totalDispatches = 10_000;
         int invocationCount = 0;
         var allDone = new CountdownEvent(totalDispatches);
@@ -111,7 +110,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public void Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
         const int totalDispatches = 5_000;
         int dispatchExceptions = 0;
 
@@ -135,7 +134,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public void ThrowingCallback_DoesNotKillDispatcherThread()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
         using var firstDone  = new ManualResetEventSlim(false);
 
         // First slot-path dispatch throws.
@@ -155,7 +154,7 @@ public class HotHandoffContinuationDispatcherTests
         // 5-second deadline (deterministic, no Thread.Sleep).
         string? observedName = null;
         var deadline = Environment.TickCount64 + 5000;
-        while (observedName != "SpscPipe HotHandoff" && Environment.TickCount64 < deadline)
+        while (observedName != "Pipe HotHandoff" && Environment.TickCount64 < deadline)
         {
             using var probeDone = new ManualResetEventSlim(false);
             dispatcher.UnsafeQueueUserWorkItem(_ =>
@@ -166,7 +165,7 @@ public class HotHandoffContinuationDispatcherTests
             probeDone.Wait(TimeSpan.FromMilliseconds(200));
         }
 
-        Assert.Equal("SpscPipe HotHandoff", observedName);
+        Assert.Equal("Pipe HotHandoff", observedName);
     }
 
     [Fact]
@@ -178,7 +177,7 @@ public class HotHandoffContinuationDispatcherTests
 
         for (int trial = 0; trial < trials; trial++)
         {
-            var dispatcher = new HotHandoffContinuationDispatcher();
+            var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
             int invocationCount = 0;
             using var done = new ManualResetEventSlim(false);
 
@@ -204,7 +203,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public async Task Dispose_BlocksUntilInFlightCallbackCompletes()
     {
-        var dispatcher = new HotHandoffContinuationDispatcher();
+        var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
         using var callbackStarted = new ManualResetEventSlim(false);
         using var callbackRelease = new ManualResetEventSlim(false);
         int callbackCompleted = 0;
@@ -235,7 +234,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public void Dispatch_AfterDispose_AlwaysRunsOnThreadPool()
     {
-        var dispatcher = new HotHandoffContinuationDispatcher();
+        var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
         dispatcher.Dispose();
 
         const int total = 100;
@@ -270,7 +269,7 @@ public class HotHandoffContinuationDispatcherTests
         // (thread waiting for itself to exit). With the escape, Dispose returns
         // immediately; the worker thread terminates naturally once the cb
         // returns to the loop.
-        var dispatcher = new HotHandoffContinuationDispatcher();
+        var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
         using var firstDone  = new ManualResetEventSlim(false);
         using var secondDone = new ManualResetEventSlim(false);
         bool secondOnTpThread = false;
@@ -303,11 +302,11 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
-        using var pipeA = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
-        using var pipeB = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var pipeA = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipeB = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
-        static async Task Roundtrip(SpscPipelines.SpscPipe pipe, int payloadBytes)
+        static async Task Roundtrip(Pipely.Pipe pipe, int payloadBytes)
         {
             var readTask = pipe.Reader.ReadAsync().AsTask();
             await Task.Run(async () =>
@@ -327,13 +326,13 @@ public class HotHandoffContinuationDispatcherTests
         await Task.WhenAll(Roundtrip(pipeA, 7), Roundtrip(pipeB, 11));
     }
 
-    // ---------- Layer B: dispatcher integrated with SpscPipe ----------
+    // ---------- Layer B: dispatcher integrated with Pipe ----------
 
     [Fact]
-    public async Task SpscPipe_WithHotHandoff_BasicReadFlush_RoundTrip()
+    public async Task Pipe_WithHotHandoff_BasicReadFlush_RoundTrip()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         var readTask = pipe.Reader.ReadAsync().AsTask();
         Assert.False(readTask.IsCompleted, "Reader should park on the empty pipe.");
@@ -352,11 +351,11 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
-    public async Task SpscPipe_WithHotHandoff_AsyncLocalFlowsToContinuation()
+    public async Task Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation()
     {
         var asyncLocal = new AsyncLocal<int>();
-        using var dispatcher = new HotHandoffContinuationDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         asyncLocal.Value = 42;
 
@@ -381,12 +380,12 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
-    public async Task SpscPipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation()
+    public async Task Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation()
     {
         var consumerLocal   = new AsyncLocal<int>();
         var dispatcherLocal = new AsyncLocal<int>();
 
-        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
 
         // Set dispatcherLocal on the worker thread by dispatching a one-shot through the slot.
         using var setupDone = new ManualResetEventSlim(false);
@@ -397,7 +396,7 @@ public class HotHandoffContinuationDispatcherTests
         }, null);
         Assert.True(setupDone.Wait(TimeSpan.FromSeconds(5)));
 
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         consumerLocal.Value = 42;
 
@@ -422,10 +421,10 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
-    public async Task SpscPipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch()
+    public async Task Pipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         const int totalCycles  = 1000;
         const int messageBytes = 8;
@@ -492,9 +491,9 @@ public class HotHandoffContinuationDispatcherTests
     /// </list>
     /// </summary>
     [Fact]
-    public async Task SpscPipe_WithHotHandoff_RepeatedIteration_PerMessageConsumer_DoesNotHang()
+    public async Task Pipe_WithHotHandoff_RepeatedIteration_PerMessageConsumer_DoesNotHang()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
         const int iterations   = 30;            // BDN's WorkloadJitting hung at op 16; 30 gives margin.
         const int messageCount = 1_000_000;     // Same as the BDN temp workload (commit c1ba6b9).
         const int chunkSize    = 256;           // Same as the BDN temp workload.
@@ -503,7 +502,7 @@ public class HotHandoffContinuationDispatcherTests
         {
             for (int iter = 0; iter < iterations; iter++)
             {
-                using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions
+                using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
                 {
                     ContinuationDispatcher = dispatcher,
                 });

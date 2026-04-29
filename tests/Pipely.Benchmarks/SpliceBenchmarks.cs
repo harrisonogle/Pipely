@@ -1,11 +1,10 @@
 using System.Buffers;
 using System.IO.Pipelines;
 using BenchmarkDotNet.Attributes;
-using SpscPipelines;
 
-namespace SpscPipelines.Benchmarks;
+namespace Pipely.Benchmarks;
 
-// Benchmarks SpscPipeWriter.Splice against GetSpan+Advance under the realistic scenario
+// Benchmarks PipeWriter.Splice against GetSpan+Advance under the realistic scenario
 // Splice was designed for: an upstream component (network RX, parser, reorder buffer, etc.)
 // hands the producer an IMemoryOwner<byte> with data already written into it. The producer
 // must publish that data into a pipe. Per iteration, every variant:
@@ -13,8 +12,8 @@ namespace SpscPipelines.Benchmarks;
 //   1. Rents a buffer from MemoryPool<byte>.Shared.
 //   2. Writes data to it (simulates the upstream fill we cannot avoid).
 //   3. Hands it off to the pipe.
-//        BCL Pipe / SpscPipe (GetSpan): GetSpan + CopyTo + Advance + Dispose source.
-//        SpscPipe (Splice): Splice(source) — ownership transferred; no CopyTo, no Dispose.
+//        BCL Pipe / Pipe (GetSpan): GetSpan + CopyTo + Advance + Dispose source.
+//        Pipe (Splice): Splice(source) — ownership transferred; no CopyTo, no Dispose.
 //
 // Consumer drains identically across variants. Backpressure disabled. TotalBytes is fixed
 // at 1 MiB per iteration so wall-clock is comparable across configs.
@@ -32,8 +31,8 @@ public class SpliceBenchmarks
     private static readonly PipeOptions BclOptions =
         new(pauseWriterThreshold: long.MaxValue, resumeWriterThreshold: long.MaxValue / 2);
 
-    private static readonly SpscPipeOptions SpscOptions =
-        new(pauseWriterThreshold: 0);   // 0 = unbounded per SpscPipeOptions contract
+    private static readonly Pipely.PipeOptions PipelyOptions =
+        new(pauseWriterThreshold: 0);   // 0 = unbounded per PipeOptions contract
 
     [Benchmark(Baseline = true)]
     public Task BclPipe_GetSpan()
@@ -43,16 +42,16 @@ public class SpliceBenchmarks
     }
 
     [Benchmark]
-    public Task SpscPipe_GetSpan()
+    public Task Pipe_GetSpan()
     {
-        var pipe = new SpscPipelines.SpscPipe(SpscOptions);
+        var pipe = new Pipely.Pipe(PipelyOptions);
         return RunGetSpan(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
     }
 
     [Benchmark]
-    public Task SpscPipe_Splice()
+    public Task Pipe_Splice()
     {
-        var pipe = new SpscPipelines.SpscPipe(SpscOptions);
+        var pipe = new Pipely.Pipe(PipelyOptions);
         return RunSplice(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
     }
 
@@ -83,7 +82,7 @@ public class SpliceBenchmarks
         await DrainAndDispose(reader, producer, completePipe);
     }
 
-    private async Task RunSplice(SpscPipeWriter writer, PipeReader reader, Action completePipe)
+    private async Task RunSplice(Pipely.PipeWriter writer, PipeReader reader, Action completePipe)
     {
         int bufferSize = BufferSize;
         int flushEvery = BuffersBeforeFlush;

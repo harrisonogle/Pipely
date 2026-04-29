@@ -19,8 +19,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\SpscPipelines\SpscPipelines.csproj" />
-    <ProjectReference Include="..\..\src\SpscPipelines.HotHandoff\SpscPipelines.HotHandoff.csproj" />
+    <ProjectReference Include="..\..\src\Pipely\Pipely.csproj" />
+    <ProjectReference Include="..\..\src\Pipely.HotHandoff\Pipely.HotHandoff.csproj" />
   </ItemGroup>
 
 </Project>

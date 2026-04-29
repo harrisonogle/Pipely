@@ -2,9 +2,8 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
-using SpscPipelines;
 
-namespace SpscPipelines.HotHandoff.Benchmarks;
+namespace Pipely.HotHandoff.Benchmarks;
 
 internal sealed record LatencyStats(
     long   Count,
@@ -22,7 +21,7 @@ internal static class DispatcherLatencyHarness
     // Consumer reads each message and records (now - timestamp). After both sides
     // finish, samples are sorted and exact percentiles are computed by index.
     //
-    // dispatcher = null → SpscPipe uses the default ThreadPoolContinuationDispatcher.
+    // dispatcher = null → Pipe uses the default ThreadPoolContinuationDispatcher.
     //
     // copyChunk = false (default): producer writes only the 8-byte timestamp;
     // remaining bytes in the rented buffer are uninitialized. This is the
@@ -33,11 +32,11 @@ internal static class DispatcherLatencyHarness
     // DispatcherThroughputBench.ProduceAndDrain's `chunk.CopyTo(memory)` pattern.
     // Use with --count 256 --size 4096 for apples-to-apples with the BDN
     // throughput row.
-    public static async Task<LatencyStats> Run(IContinuationDispatcher? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
+    public static async Task<LatencyStats> Run(Pipely.IContinuationDispatcher? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (timestamp prefix)");
 
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
             ContinuationDispatcher = dispatcher,
         });
