@@ -1,24 +1,24 @@
 using System.Buffers;
 using System.IO.Pipelines;
 using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Configs;
 using SpscPipelines;
 
 namespace SpscPipe.Benchmarks;
 
-// Compares SpscPipeWriter.Append against GetSpan+Advance on BCL Pipe and SpscPipe under two profiles:
-//   "nocopy"  — Variant A: producer generates N bytes via Span.Fill directly into target memory.
-//               No source buffer, no copy. Measures pure per-call API overhead.
-//   "copy"    — Variant B: producer simulates having received an IMemoryOwner<byte> (rent + fill).
-//               GetSpan path CopyTo's into pipe memory and disposes the source; Append transfers
-//               ownership. Measures the copy savings Append delivers in the realistic zero-copy
-//               scenario it was designed for.
+// Benchmarks SpscPipeWriter.Append against GetSpan+Advance under the realistic scenario
+// Append was designed for: an upstream component (network RX, parser, reorder buffer, etc.)
+// hands the producer an IMemoryOwner<byte> with data already written into it. The producer
+// must publish that data into a pipe. Per iteration, every variant:
 //
-// Backpressure is disabled across all variants so the benchmark measures throughput, not park/unpark
-// coordination. TotalBytes is fixed at 1 MiB per BDN iteration to keep the wall-clock unit consistent.
+//   1. Rents a buffer from MemoryPool<byte>.Shared.
+//   2. Writes data to it (simulates the upstream fill we cannot avoid).
+//   3. Hands it off to the pipe.
+//        BCL Pipe / SpscPipe (GetSpan): GetSpan + CopyTo + Advance + Dispose source.
+//        SpscPipe (Append): Append(source) — ownership transferred; no CopyTo, no Dispose.
+//
+// Consumer drains identically across variants. Backpressure disabled. TotalBytes is fixed
+// at 1 MiB per iteration so wall-clock is comparable across configs.
 [MemoryDiagnoser]
-[CategoriesColumn]
-[GroupBenchmarksBy(BenchmarkLogicalGroupRule.ByCategory)]
 public class AppendBenchmarks
 {
     private const int TotalBytes = 1 << 20;     // 1 MiB per iteration
@@ -35,55 +35,28 @@ public class AppendBenchmarks
     private static readonly SpscPipeOptions SpscOptions =
         new(pauseWriterThreshold: 0);   // 0 = unbounded per SpscPipeOptions contract
 
-    // ---------- Variant A — "nocopy" (pure API overhead) ----------
-
-    [Benchmark(Baseline = true), BenchmarkCategory("nocopy")]
-    public Task BclPipe_GetSpan_NoCopy()
+    [Benchmark(Baseline = true)]
+    public Task BclPipe_GetSpan()
     {
         var pipe = new Pipe(BclOptions);
-        return RunGetSpanNoCopy(pipe.Writer, pipe.Reader, completePipe: () => { });
+        return RunGetSpan(pipe.Writer, pipe.Reader, completePipe: () => { });
     }
 
-    [Benchmark, BenchmarkCategory("nocopy")]
-    public Task SpscPipe_GetSpan_NoCopy()
+    [Benchmark]
+    public Task SpscPipe_GetSpan()
     {
         var pipe = new SpscPipelines.SpscPipe(SpscOptions);
-        return RunGetSpanNoCopy(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
+        return RunGetSpan(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
     }
 
-    [Benchmark, BenchmarkCategory("nocopy")]
-    public Task SpscPipe_Append_NoCopy()
-    {
-        var pipe = new SpscPipelines.SpscPipe(SpscOptions);
-        return RunAppendNoCopy(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
-    }
-
-    // ---------- Variant B — "copy" (zero-copy realistic) ----------
-
-    [Benchmark(Baseline = true), BenchmarkCategory("copy")]
-    public Task BclPipe_GetSpan_Copy()
-    {
-        var pipe = new Pipe(BclOptions);
-        return RunGetSpanCopy(pipe.Writer, pipe.Reader, completePipe: () => { });
-    }
-
-    [Benchmark, BenchmarkCategory("copy")]
-    public Task SpscPipe_GetSpan_Copy()
-    {
-        var pipe = new SpscPipelines.SpscPipe(SpscOptions);
-        return RunGetSpanCopy(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
-    }
-
-    [Benchmark, BenchmarkCategory("copy")]
+    [Benchmark]
     public Task SpscPipe_Append()
     {
         var pipe = new SpscPipelines.SpscPipe(SpscOptions);
         return RunAppend(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
     }
 
-    // ---------- Producer/consumer harnesses ----------
-
-    private async Task RunGetSpanNoCopy(PipeWriter writer, PipeReader reader, Action completePipe)
+    private async Task RunGetSpan(PipeWriter writer, PipeReader reader, Action completePipe)
     {
         int bufferSize = BufferSize;
         int flushEvery = BuffersBeforeFlush;
@@ -93,59 +66,13 @@ public class AppendBenchmarks
         {
             for (int i = 0; i < totalBuffers; i++)
             {
-                var span = writer.GetSpan(bufferSize);
-                span.Slice(0, bufferSize).Fill(0x42);
-                writer.Advance(bufferSize);
-                if ((i + 1) % flushEvery == 0)
-                    await writer.FlushAsync();
-            }
-            await writer.FlushAsync();
-            await writer.CompleteAsync();
-        });
-
-        await DrainAndDispose(reader, producer, completePipe);
-    }
-
-    private async Task RunAppendNoCopy(SpscPipeWriter writer, PipeReader reader, Action completePipe)
-    {
-        int bufferSize = BufferSize;
-        int flushEvery = BuffersBeforeFlush;
-        int totalBuffers = TotalBytes / bufferSize;
-
-        var producer = Task.Run(async () =>
-        {
-            for (int i = 0; i < totalBuffers; i++)
-            {
-                var owner = MemoryPool<byte>.Shared.Rent(bufferSize);
-                owner.Memory.Span.Slice(0, bufferSize).Fill(0x42);
-                writer.Append(owner, 0, bufferSize);
-                if ((i + 1) % flushEvery == 0)
-                    await writer.FlushAsync();
-            }
-            await writer.FlushAsync();
-            await writer.CompleteAsync();
-        });
-
-        await DrainAndDispose(reader, producer, completePipe);
-    }
-
-    private async Task RunGetSpanCopy(PipeWriter writer, PipeReader reader, Action completePipe)
-    {
-        int bufferSize = BufferSize;
-        int flushEvery = BuffersBeforeFlush;
-        int totalBuffers = TotalBytes / bufferSize;
-
-        var producer = Task.Run(async () =>
-        {
-            for (int i = 0; i < totalBuffers; i++)
-            {
-                // Simulate "received an IMemoryOwner from elsewhere".
                 using var source = MemoryPool<byte>.Shared.Rent(bufferSize);
-                source.Memory.Span.Slice(0, bufferSize).Fill(0x42);
+                source.Memory.Span.Slice(0, bufferSize).Fill(0x42);   // upstream fill
 
                 var span = writer.GetSpan(bufferSize);
-                source.Memory.Span.Slice(0, bufferSize).CopyTo(span);
+                source.Memory.Span.Slice(0, bufferSize).CopyTo(span); // copy into pipe-rented memory
                 writer.Advance(bufferSize);
+
                 if ((i + 1) % flushEvery == 0)
                     await writer.FlushAsync();
             }
@@ -166,10 +93,11 @@ public class AppendBenchmarks
         {
             for (int i = 0; i < totalBuffers; i++)
             {
-                // Simulate "received an IMemoryOwner from elsewhere"; transfer ownership to pipe.
                 var source = MemoryPool<byte>.Shared.Rent(bufferSize);
-                source.Memory.Span.Slice(0, bufferSize).Fill(0x42);
-                writer.Append(source, 0, bufferSize);
+                source.Memory.Span.Slice(0, bufferSize).Fill(0x42);   // upstream fill
+
+                writer.Append(source, 0, bufferSize);                 // ownership transfer
+
                 if ((i + 1) % flushEvery == 0)
                     await writer.FlushAsync();
             }
