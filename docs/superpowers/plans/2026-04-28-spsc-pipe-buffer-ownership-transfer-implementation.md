@@ -1,26 +1,26 @@
-# SpscPipe Buffer Ownership Transfer Implementation Plan
+# Pipe Buffer Ownership Transfer Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement the `SpscPipeWriter.Append(IMemoryOwner<byte>[, int start, int length])` API per `docs/superpowers/specs/2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md`. New writer-side method takes ownership of a pre-filled buffer, splices it into the segment chain via the existing freeze/transition machinery, and disposes the foreign `IMemoryOwner` when the reader has drained past or when the pipe is disposed. Ownership transfers iff `Append` returns normally.
+**Goal:** Implement the `PipeWriter.Append(IMemoryOwner<byte>[, int start, int length])` API per `docs/superpowers/specs/2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md`. New writer-side method takes ownership of a pre-filled buffer, splices it into the segment chain via the existing freeze/transition machinery, and disposes the foreign `IMemoryOwner` when the reader has drained past or when the pipe is disposed. Ownership transfers iff `Append` returns normally.
 
-**Architecture:** A donated buffer becomes a `BufferSegment` with a new `IsDonated = true` flag, initialized via a new `AdoptFrom(IMemoryOwner<byte> owner, Memory<byte> slice, long runningIndex, object pipeOwner)` initializer. `Append` performs the same kind of tail transition as `GetMemory` does on capacity-exceeded: compute `runningIndex` from the current tail's filled count, allocate a fresh `BufferSegment`, call `AdoptFrom` with a pre-validated slice, freeze the previous tail (if any) with `Freeze(filled, donated)` to set its `Next` pointer, and update `_writingHead`/`_writingHeadBytesBuffered`/`_totalWritten`. `RecycleDrainedSegments` branches on `IsDonated` — donated → `DisposeOwned()` and discard; rented → `PushFreelist` (existing). `SpscPipeWriter` becomes public (unnested) and `SpscPipe.Writer`'s declared return type widens from `PipeWriter` to `SpscPipeWriter`. `SpscPipeReader` stays internal.
+**Architecture:** A donated buffer becomes a `BufferSegment` with a new `IsDonated = true` flag, initialized via a new `AdoptFrom(IMemoryOwner<byte> owner, Memory<byte> slice, long runningIndex, object pipeOwner)` initializer. `Append` performs the same kind of tail transition as `GetMemory` does on capacity-exceeded: compute `runningIndex` from the current tail's filled count, allocate a fresh `BufferSegment`, call `AdoptFrom` with a pre-validated slice, freeze the previous tail (if any) with `Freeze(filled, donated)` to set its `Next` pointer, and update `_writingHead`/`_writingHeadBytesBuffered`/`_totalWritten`. `RecycleDrainedSegments` branches on `IsDonated` — donated → `DisposeOwned()` and discard; rented → `PushFreelist` (existing). `PipeWriter` becomes public (unnested) and `Pipe.Writer`'s declared return type widens from `PipeWriter` to `PipeWriter`. `PipeReader` stays internal.
 
 **Tech Stack:** C# / .NET 10, xUnit 2.9.3, `System.Buffers.IMemoryOwner<byte>` / `MemoryPool<byte>`, `System.IO.Pipelines.PipeWriter`.
 
 **Reference docs (engineer should re-read before starting):**
 - `docs/superpowers/specs/2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` — this plan's spec.
-- `docs/superpowers/specs/2026-04-25-spsc-pipe-tripleBuffer-design.md` — base SpscPipe spec; this plan amends §3 (BufferSegment, recycle), §4 (hot paths), §X (public API).
-- `src/SpscPipelines/BufferSegment.cs` — modified in Task 2 (new `IsDonated` field + `AdoptFrom` method).
-- `src/SpscPipelines/SpscPipe.Writer.cs` — modified in Task 3 (unnest + visibility) and Tasks 4-8 (new `Append` overloads).
-- `src/SpscPipelines/SpscPipe.cs:58` — `Writer` property type changes in Task 3; `RecycleDrainedSegments` (line 315) branches on `IsDonated` in Task 9.
-- `tests/SpscPipe.Tests/BufferSegmentTests.cs` — additions in Task 2.
-- `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs` — new file in Tasks 4-9.
+- `docs/superpowers/specs/2026-04-25-spsc-pipe-tripleBuffer-design.md` — base Pipe spec; this plan amends §3 (BufferSegment, recycle), §4 (hot paths), §X (public API).
+- `src/Pipely/BufferSegment.cs` — modified in Task 2 (new `IsDonated` field + `AdoptFrom` method).
+- `src/Pipely/Pipe.Writer.cs` — modified in Task 3 (unnest + visibility) and Tasks 4-8 (new `Append` overloads).
+- `src/Pipely/Pipe.cs:58` — `Writer` property type changes in Task 3; `RecycleDrainedSegments` (line 315) branches on `IsDonated` in Task 9.
+- `tests/Pipe.Tests/BufferSegmentTests.cs` — additions in Task 2.
+- `tests/Pipe.Tests/PipeWriterAppendTests.cs` — new file in Tasks 4-9.
 
-**Working directory for all commands:** `/home/harrison/src/worktrees/SpscPipe/buffer-transfer/` (already a dedicated worktree on branch `buffer-transfer`).
+**Working directory for all commands:** `/home/harrison/src/worktrees/Pipe/buffer-transfer/` (already a dedicated worktree on branch `buffer-transfer`).
 
 **Pre-work invariants this plan preserves:**
-- All existing tests in `tests/SpscPipe.Tests/`, `tests/SpscPipe.Stress/`, and `tests/SpscPipelines.HotHandoff.Tests/` continue to pass without modification.
+- All existing tests in `tests/Pipe.Tests/`, `tests/Pipe.Stress/`, and `tests/Pipely.HotHandoff.Tests/` continue to pass without modification.
 - The benign-torn-read property of `Memory<T>` (Spec §3 Nit-5) is unaffected — donated segments don't trigger it; rented segments behave exactly as before.
 - The TripleBuffer-mediated SPSC contract is untouched.
 
@@ -29,22 +29,22 @@
 ## File structure
 
 ```
-src/SpscPipelines/
+src/Pipely/
 ├── BufferSegment.cs                  (modified — Task 2: + IsDonated, + AdoptFrom)
-├── SpscPipe.cs                       (modified — Task 3: Writer property type;
+├── Pipe.cs                       (modified — Task 3: Writer property type;
 │                                                  Task 9: RecycleDrainedSegments branch)
-├── SpscPipe.Writer.cs                (modified — Task 3: unnest SpscPipeWriter, public visibility;
+├── Pipe.Writer.cs                (modified — Task 3: unnest PipeWriter, public visibility;
 │                                                  Tasks 4-8: + Append overloads)
 └── (other files unchanged)
 
-tests/SpscPipe.Tests/
+tests/Pipe.Tests/
 ├── TrackingMemoryOwner.cs            (NEW — Task 1: shared test helper)
 ├── BufferSegmentTests.cs             (modified — Task 2: + AdoptFrom tests)
-├── SpscPipeWriterAppendTests.cs      (NEW — Tasks 4-9: Append behavior tests)
-├── SpscPipeAdvanceToTests.cs         (modified — Task 10: + cross-pipe donated AdvanceTo test)
+├── PipeWriterAppendTests.cs      (NEW — Tasks 4-9: Append behavior tests)
+├── PipeAdvanceToTests.cs         (modified — Task 10: + cross-pipe donated AdvanceTo test)
 └── (other files unchanged)
 
-tests/SpscPipe.Stress/
+tests/Pipe.Stress/
 └── StressHarness.cs                  (modified — Task 11: + Append injection in producer)
 
 docs/superpowers/specs/
@@ -66,7 +66,7 @@ pwd && git branch --show-current && git status --short
 
 Expected:
 ```
-/home/harrison/src/worktrees/SpscPipe/buffer-transfer
+/home/harrison/src/worktrees/Pipe/buffer-transfer
 buffer-transfer
 
 ```
@@ -85,7 +85,7 @@ Expected: file path printed (no error).
 
 Run:
 ```bash
-dotnet build SpscPipe.slnx -c Release
+dotnet build Pipe.slnx -c Release
 ```
 
 Expected: 6 projects build, 0 warnings, 0 errors.
@@ -94,7 +94,7 @@ Expected: 6 projects build, 0 warnings, 0 errors.
 
 Run:
 ```bash
-dotnet test SpscPipe.slnx -c Release --nologo
+dotnet test Pipe.slnx -c Release --nologo
 ```
 
 Expected: All tests pass. Note the test count for later comparison.
@@ -106,15 +106,15 @@ Expected: All tests pass. Note the test count for later comparison.
 **Goal:** Add a shared test helper that wraps a `byte[]` as an `IMemoryOwner<byte>` and counts `Dispose` calls. Used in Tasks 4–9 to verify the ownership-transfer contract (caller still owns on throw; pipe disposes on recycle).
 
 **Files:**
-- Create: `tests/SpscPipe.Tests/TrackingMemoryOwner.cs`
+- Create: `tests/Pipe.Tests/TrackingMemoryOwner.cs`
 
 - [ ] **Step 1: Create the helper**
 
 ```csharp
-// tests/SpscPipe.Tests/TrackingMemoryOwner.cs
+// tests/Pipe.Tests/TrackingMemoryOwner.cs
 using System.Buffers;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
 internal sealed class TrackingMemoryOwner : IMemoryOwner<byte>
 {
@@ -146,7 +146,7 @@ internal sealed class TrackingMemoryOwner : IMemoryOwner<byte>
 
 Run:
 ```bash
-dotnet build tests/SpscPipe.Tests/SpscPipe.Tests.csproj -c Release --nologo
+dotnet build tests/Pipe.Tests/Pipe.Tests.csproj -c Release --nologo
 ```
 
 Expected: build succeeds, 0 errors.
@@ -154,12 +154,12 @@ Expected: build succeeds, 0 errors.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipe.Tests/TrackingMemoryOwner.cs
+git add tests/Pipe.Tests/TrackingMemoryOwner.cs
 git commit -m "$(cat <<'EOF'
 Tests: add TrackingMemoryOwner helper for ownership-transfer assertions
 
 Wraps a byte[] as an IMemoryOwner<byte>, counting Dispose calls so
-upcoming SpscPipeWriter.Append tests can verify the ownership
+upcoming PipeWriter.Append tests can verify the ownership
 contract (caller still owns on throw; pipe disposes on recycle).
 The Memory property throws ObjectDisposedException post-Dispose to
 catch use-after-dispose bugs.
@@ -176,12 +176,12 @@ EOF
 **Goal:** Add the new `IsDonated` field and `AdoptFrom` initializer to `BufferSegment` per spec §3. Establish DEBUG asserts for the precondition `RecycleReset` is never called on donated segments.
 
 **Files:**
-- Modify: `src/SpscPipelines/BufferSegment.cs`
-- Modify: `tests/SpscPipe.Tests/BufferSegmentTests.cs`
+- Modify: `src/Pipely/BufferSegment.cs`
+- Modify: `tests/Pipe.Tests/BufferSegmentTests.cs`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append these tests to `tests/SpscPipe.Tests/BufferSegmentTests.cs` (inside the existing `BufferSegmentTests` class, before the closing `}`):
+Append these tests to `tests/Pipe.Tests/BufferSegmentTests.cs` (inside the existing `BufferSegmentTests` class, before the closing `}`):
 
 ```csharp
 [Fact]
@@ -273,14 +273,14 @@ public void Freeze_OnDonatedSegment_IsIdempotentOnEndAndMemory()
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~BufferSegmentTests" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~BufferSegmentTests" --nologo
 ```
 
 Expected: compilation error referencing `seg.IsDonated`, `seg.AdoptFrom`, or both. (The new tests reference symbols that don't exist yet.)
 
 - [ ] **Step 3: Add `IsDonated` field to BufferSegment**
 
-Edit `src/SpscPipelines/BufferSegment.cs`. Add the field declaration after the existing `OwnerToken` line:
+Edit `src/Pipely/BufferSegment.cs`. Add the field declaration after the existing `OwnerToken` line:
 
 Current (line 12):
 ```csharp
@@ -295,7 +295,7 @@ Replace with:
 
 - [ ] **Step 4: Set `IsDonated = false` in `RentFrom`**
 
-Edit `src/SpscPipelines/BufferSegment.cs`. The current `RentFrom` (lines 14-24) ends with `OwnerToken = owner;`. Add an `IsDonated = false;` line right after:
+Edit `src/Pipely/BufferSegment.cs`. The current `RentFrom` (lines 14-24) ends with `OwnerToken = owner;`. Add an `IsDonated = false;` line right after:
 
 Current end of `RentFrom`:
 ```csharp
@@ -312,7 +312,7 @@ Replace with:
 
 - [ ] **Step 5: Add `AdoptFrom` initializer**
 
-Edit `src/SpscPipelines/BufferSegment.cs`. After the existing `RentFrom` method (after the `}` that closes it, before `public void Freeze(...)`), add:
+Edit `src/Pipely/BufferSegment.cs`. After the existing `RentFrom` method (after the `}` that closes it, before `public void Freeze(...)`), add:
 
 ```csharp
     // Adopts a foreign IMemoryOwner<byte> for buffer-ownership transfer (Append).
@@ -335,7 +335,7 @@ Edit `src/SpscPipelines/BufferSegment.cs`. After the existing `RentFrom` method 
 
 - [ ] **Step 6: Add a DEBUG assert in `RecycleReset`**
 
-Edit `src/SpscPipelines/BufferSegment.cs`. The current `RecycleReset` (lines 34-42) starts with `base.RunningIndex = runningIndex;`. Add a `System.Diagnostics.Debug.Assert(...)` at the top of its body:
+Edit `src/Pipely/BufferSegment.cs`. The current `RecycleReset` (lines 34-42) starts with `base.RunningIndex = runningIndex;`. Add a `System.Diagnostics.Debug.Assert(...)` at the top of its body:
 
 Current:
 ```csharp
@@ -356,7 +356,7 @@ Replace with:
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~BufferSegmentTests" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~BufferSegmentTests" --nologo
 ```
 
 Expected: all `BufferSegmentTests` pass (existing + 5 new).
@@ -365,7 +365,7 @@ Expected: all `BufferSegmentTests` pass (existing + 5 new).
 
 Run:
 ```bash
-dotnet test SpscPipe.slnx -c Release --nologo
+dotnet test Pipe.slnx -c Release --nologo
 ```
 
 Expected: All tests pass; count = baseline + 5.
@@ -373,7 +373,7 @@ Expected: All tests pass; count = baseline + 5.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/SpscPipelines/BufferSegment.cs tests/SpscPipe.Tests/BufferSegmentTests.cs
+git add src/Pipely/BufferSegment.cs tests/Pipe.Tests/BufferSegmentTests.cs
 git commit -m "$(cat <<'EOF'
 BufferSegment: add IsDonated flag + AdoptFrom initializer
 
@@ -399,26 +399,26 @@ EOF
 
 ---
 
-## Task 3: Unnest `SpscPipeWriter`; widen `SpscPipe.Writer` return type
+## Task 3: Unnest `PipeWriter`; widen `Pipe.Writer` return type
 
-**Goal:** Make `SpscPipeWriter` a public, non-nested class so it can carry the new `Append` overloads. Change `SpscPipe.Writer`'s declared return type from `PipeWriter` to `SpscPipeWriter` — source-compatible with all existing call sites via implicit upcast (`SpscPipeWriter : PipeWriter`).
+**Goal:** Make `PipeWriter` a public, non-nested class so it can carry the new `Append` overloads. Change `Pipe.Writer`'s declared return type from `PipeWriter` to `PipeWriter` — source-compatible with all existing call sites via implicit upcast (`PipeWriter : PipeWriter`).
 
 **Files:**
-- Modify: `src/SpscPipelines/SpscPipe.Writer.cs`
-- Modify: `src/SpscPipelines/SpscPipe.cs:58`
+- Modify: `src/Pipely/Pipe.Writer.cs`
+- Modify: `src/Pipely/Pipe.cs:58`
 
 **Note on TDD here:** This is a structural refactor with compile-time correctness only. The "test" is: existing test suite still passes after the change.
 
-- [ ] **Step 1: Unnest `SpscPipeWriter` and make it public**
+- [ ] **Step 1: Unnest `PipeWriter` and make it public**
 
-Edit `src/SpscPipelines/SpscPipe.Writer.cs`. The current shape is:
+Edit `src/Pipely/Pipe.Writer.cs`. The current shape is:
 
 ```csharp
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed partial class SpscPipe
+public sealed partial class Pipe
 {
-    internal sealed class SpscPipeWriter : PipeWriter
+    internal sealed class PipeWriter : PipeWriter
     {
         ...
     }
@@ -428,19 +428,19 @@ public sealed partial class SpscPipe
 Replace the outer wrapping. The new shape is:
 
 ```csharp
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed class SpscPipeWriter : PipeWriter
+public sealed class PipeWriter : PipeWriter
 {
     ...
 }
 ```
 
 Concretely:
-- Replace `public sealed partial class SpscPipe\n{\n    internal sealed class SpscPipeWriter : PipeWriter\n    {` (lines 8-11) with `public sealed class SpscPipeWriter : PipeWriter\n{`.
-- Remove the closing `}` for the outer `SpscPipe` class (the very last `}` in the file).
+- Replace `public sealed partial class Pipe\n{\n    internal sealed class PipeWriter : PipeWriter\n    {` (lines 8-11) with `public sealed class PipeWriter : PipeWriter\n{`.
+- Remove the closing `}` for the outer `Pipe` class (the very last `}` in the file).
 - Indentation: shift the entire class body left by 4 spaces (one indent level) to match top-level placement.
-- Keep the `internal SpscPipeWriter(SpscPipe pipe) => _pipe = pipe;` constructor visibility as `internal` (only `SpscPipe` constructs it).
+- Keep the `internal PipeWriter(Pipe pipe) => _pipe = pipe;` constructor visibility as `internal` (only `Pipe` constructs it).
 
 Use this exact replacement (perform a full-file rewrite to avoid indentation drift):
 
@@ -450,16 +450,16 @@ using System.IO.Pipelines;
 using System.Runtime.ExceptionServices;
 using System.Threading;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed class SpscPipeWriter : PipeWriter
+public sealed class PipeWriter : PipeWriter
 {
-    private readonly SpscPipe _pipe;
-    internal SpscPipeWriter(SpscPipe pipe) => _pipe = pipe;
+    private readonly Pipe _pipe;
+    internal PipeWriter(Pipe pipe) => _pipe = pipe;
 
     public override Memory<byte> GetMemory(int sizeHint = 0)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
         if (sizeHint < 0) throw new ArgumentOutOfRangeException(nameof(sizeHint));
         if (sizeHint == 0) sizeHint = 1;
@@ -491,7 +491,7 @@ public sealed class SpscPipeWriter : PipeWriter
 
     public override void Advance(int bytes)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
         if (_pipe._writingHead == null) throw new InvalidOperationException("Advance without prior GetMemory.");
         if (_pipe._writingHeadBytesBuffered + bytes > _pipe._writingHead.AvailableMemory.Length)
@@ -502,7 +502,7 @@ public sealed class SpscPipeWriter : PipeWriter
 
     public override ValueTask<FlushResult> FlushAsync(CancellationToken ct = default)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
 
         // Throw-first: refresh reader state, then throw if reader-completed-with-ex.
@@ -516,8 +516,8 @@ public sealed class SpscPipeWriter : PipeWriter
         while (true)
         {
             int oldV = _pipe._flushAwaiter._state;
-            if ((oldV & SpscAwaiter<FlushResult>.CancelFlag) == 0) break;
-            int desired = oldV & ~SpscAwaiter<FlushResult>.CancelFlag;
+            if ((oldV & PipelyAwaiter<FlushResult>.CancelFlag) == 0) break;
+            int desired = oldV & ~PipelyAwaiter<FlushResult>.CancelFlag;
             if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                 return new ValueTask<FlushResult>(_pipe.BuildFlushResult(isCanceled: true));
         }
@@ -563,7 +563,7 @@ public sealed class SpscPipeWriter : PipeWriter
 
     public override void Complete(Exception? exception = null)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) return;     // double-Complete coalesces
         _pipe._writerCompleted = true;
 
@@ -585,14 +585,14 @@ public sealed class SpscPipeWriter : PipeWriter
 
     public override void CancelPendingFlush()
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
-        int oldV = Interlocked.Or(ref _pipe._flushAwaiter._state, SpscAwaiter<FlushResult>.CancelFlag);
-        if ((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Pending
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
+        int oldV = Interlocked.Or(ref _pipe._flushAwaiter._state, PipelyAwaiter<FlushResult>.CancelFlag);
+        if ((oldV & PipelyAwaiter<FlushResult>.StateMask) == PipelyAwaiter<FlushResult>.Pending
             && Interlocked.CompareExchange(
                    ref _pipe._flushAwaiter._state,
-                   SpscAwaiter<FlushResult>.Inactive,
-                   SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
-               == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
+                   PipelyAwaiter<FlushResult>.Inactive,
+                   PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag)
+               == (PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag))
         {
             Interlocked.Increment(ref _pipe._flushAwaiter._cancelPendingWonCount);
             _pipe._flushAwaiter._ctr.Dispose();
@@ -609,9 +609,9 @@ public sealed class SpscPipeWriter : PipeWriter
         while (true)
         {
             int oldV = _pipe._flushAwaiter._state;
-            System.Diagnostics.Debug.Assert((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Inactive,
+            System.Diagnostics.Debug.Assert((oldV & PipelyAwaiter<FlushResult>.StateMask) == PipelyAwaiter<FlushResult>.Inactive,
                          "SPSC violation: concurrent FlushAsync");
-            int desired = (oldV & SpscAwaiter<FlushResult>.CancelFlag) | SpscAwaiter<FlushResult>.Pending;
+            int desired = (oldV & PipelyAwaiter<FlushResult>.CancelFlag) | PipelyAwaiter<FlushResult>.Pending;
             if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
             {
                 Interlocked.Increment(ref _pipe._flushAwaiter._parkCount);
@@ -629,8 +629,8 @@ public sealed class SpscPipeWriter : PipeWriter
                 while (true)
                 {
                     int oldV = _pipe._flushAwaiter._state;
-                    if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
-                    int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                    if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) break;
+                    int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
                     if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                     {
                         Interlocked.Increment(ref _pipe._flushAwaiter._lostWakeupResolvedCount);
@@ -649,8 +649,8 @@ public sealed class SpscPipeWriter : PipeWriter
                 while (true)
                 {
                     int oldV = _pipe._flushAwaiter._state;
-                    if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
-                    int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                    if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) break;
+                    int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
                     if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                     {
                         Interlocked.Increment(ref _pipe._flushAwaiter._lostWakeupResolvedCount);
@@ -662,37 +662,37 @@ public sealed class SpscPipeWriter : PipeWriter
 
         // Lost-cancel re-check.
         int v = _pipe._flushAwaiter._state;
-        if ((v & SpscAwaiter<FlushResult>.CancelFlag) != 0
+        if ((v & PipelyAwaiter<FlushResult>.CancelFlag) != 0
             && Interlocked.CompareExchange(
                    ref _pipe._flushAwaiter._state,
-                   SpscAwaiter<FlushResult>.Inactive,
-                   SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
-               == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
+                   PipelyAwaiter<FlushResult>.Inactive,
+                   PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag)
+               == (PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag))
         {
             Interlocked.Increment(ref _pipe._flushAwaiter._lostCancelResolvedCount);
             _pipe._flushAwaiter._core.SetResult(_pipe.BuildFlushResult(isCanceled: true));
             return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
         }
 
-        _pipe._flushAwaiter._ctr = ct.UnsafeRegister(static p => ((SpscPipe)p!).OnFlushAwaiterTokenCancel(), _pipe);
-        if ((_pipe._flushAwaiter._state & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending)
+        _pipe._flushAwaiter._ctr = ct.UnsafeRegister(static p => ((Pipe)p!).OnFlushAwaiterTokenCancel(), _pipe);
+        if ((_pipe._flushAwaiter._state & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending)
             _pipe._flushAwaiter._ctr.Dispose();
         return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
     }
 }
 ```
 
-(That's the full file content. Use Write to overwrite `src/SpscPipelines/SpscPipe.Writer.cs` with this body.)
+(That's the full file content. Use Write to overwrite `src/Pipely/Pipe.Writer.cs` with this body.)
 
-- [ ] **Step 2: Widen `SpscPipe.Writer` return type**
+- [ ] **Step 2: Widen `Pipe.Writer` return type**
 
-Edit `src/SpscPipelines/SpscPipe.cs`. Line 44 declares the field; line 58 declares the property.
+Edit `src/Pipely/Pipe.cs`. Line 44 declares the field; line 58 declares the property.
 
 Current (line 44):
 ```csharp
-    private readonly SpscPipeWriter _writerInstance;
+    private readonly PipeWriter _writerInstance;
 ```
-This already references `SpscPipeWriter` directly; with the unnested type it now resolves to the top-level class — no change needed.
+This already references `PipeWriter` directly; with the unnested type it now resolves to the top-level class — no change needed.
 
 Current (line 58):
 ```csharp
@@ -701,25 +701,25 @@ Current (line 58):
 
 Replace with:
 ```csharp
-    public SpscPipeWriter Writer => _writerInstance;
+    public PipeWriter Writer => _writerInstance;
 ```
 
 - [ ] **Step 3: Build the solution**
 
 Run:
 ```bash
-dotnet build SpscPipe.slnx -c Release
+dotnet build Pipe.slnx -c Release
 ```
 
 Expected: 6 projects build, 0 warnings, 0 errors.
 
-If a build error mentions an existing call site that depended on `Writer` being typed as `PipeWriter` (e.g., a method expecting `PipeWriter` directly), the implicit upcast should resolve it. If the error is `cannot convert SpscPipeWriter to PipeWriter`, double-check that `SpscPipeWriter` extends `PipeWriter` (it does — line 1 of `SpscPipe.Writer.cs`).
+If a build error mentions an existing call site that depended on `Writer` being typed as `PipeWriter` (e.g., a method expecting `PipeWriter` directly), the implicit upcast should resolve it. If the error is `cannot convert PipeWriter to PipeWriter`, double-check that `PipeWriter` extends `PipeWriter` (it does — line 1 of `Pipe.Writer.cs`).
 
 - [ ] **Step 4: Run the full test suite**
 
 Run:
 ```bash
-dotnet test SpscPipe.slnx -c Release --nologo
+dotnet test Pipe.slnx -c Release --nologo
 ```
 
 Expected: All tests pass; count unchanged from Task 2's expected count.
@@ -727,18 +727,18 @@ Expected: All tests pass; count unchanged from Task 2's expected count.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/SpscPipelines/SpscPipe.Writer.cs src/SpscPipelines/SpscPipe.cs
+git add src/Pipely/Pipe.Writer.cs src/Pipely/Pipe.cs
 git commit -m "$(cat <<'EOF'
-SpscPipe: unnest SpscPipeWriter; widen Writer return type
+Pipe: unnest PipeWriter; widen Writer return type
 
-Makes SpscPipeWriter a public top-level class (was nested + internal
-inside SpscPipe) so the upcoming Append overloads have a public
-home. SpscPipe.Writer's declared return type widens from PipeWriter
-to SpscPipeWriter; existing call sites that bound to PipeWriter
+Makes PipeWriter a public top-level class (was nested + internal
+inside Pipe) so the upcoming Append overloads have a public
+home. Pipe.Writer's declared return type widens from PipeWriter
+to PipeWriter; existing call sites that bound to PipeWriter
 continue to compile via implicit upcast.
 
-The constructor stays internal — only SpscPipe constructs it.
-SpscPipeReader stays internal + nested per spec §6.2 (no reader-
+The constructor stays internal — only Pipe constructs it.
+PipeReader stays internal + nested per spec §6.2 (no reader-
 side surface addition motivates exposing it).
 
 No behavior change. Per spec §6 of
@@ -756,42 +756,42 @@ EOF
 **Goal:** Implement the validation layer of `Append` — null check, disposed/completed state checks, range checks. Each failure path leaves the caller still owning the buffer (no `Dispose` called by the pipe). Mid-method state is untouched.
 
 **Files:**
-- Create: `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`
-- Modify: `src/SpscPipelines/SpscPipe.Writer.cs`
+- Create: `tests/Pipe.Tests/PipeWriterAppendTests.cs`
+- Modify: `src/Pipely/Pipe.Writer.cs`
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
+Create `tests/Pipe.Tests/PipeWriterAppendTests.cs`:
 
 ```csharp
 using System.Buffers;
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
-public class SpscPipeWriterAppendTests
+public class PipeWriterAppendTests
 {
     // ---------- Argument validation: ownership stays with caller on throw ----------
 
     [Fact]
     public void Append_NullBuffer_NoArg_Throws_ArgumentNull()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         Assert.Throws<ArgumentNullException>(() => pipe.Writer.Append(null!));
     }
 
     [Fact]
     public void Append_NullBuffer_ThreeArg_Throws_ArgumentNull()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         Assert.Throws<ArgumentNullException>(() => pipe.Writer.Append(null!, 0, 0));
     }
 
     [Fact]
     public void Append_DisposedPipe_Throws_ObjectDisposed_CallerStillOwns()
     {
-        var pipe = new SpscPipelines.SpscPipe();
+        var pipe = new Pipely.Pipe();
         pipe.Dispose();
 
         var owner = new TrackingMemoryOwner(64);
@@ -802,7 +802,7 @@ public class SpscPipeWriterAppendTests
     [Fact]
     public void Append_CompletedWriter_Throws_InvalidOp_CallerStillOwns()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         pipe._writerCompleted = true;          // simulate post-Complete state (internal flag)
 
         var owner = new TrackingMemoryOwner(64);
@@ -817,7 +817,7 @@ public class SpscPipeWriterAppendTests
     [InlineData(64, 1)]    // start past end + positive length
     public void Append_RangeViolation_Throws_OutOfRange_CallerStillOwns(int start, int length)
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
         Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Append(owner, start, length));
         Assert.Equal(0, owner.DisposeCount);
@@ -826,7 +826,7 @@ public class SpscPipeWriterAppendTests
     [Fact]
     public void Append_ValidationThrows_PipeStateUntouched()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         // Establish a known state.
         pipe.Writer.GetMemory(40);
         pipe.Writer.Advance(40);
@@ -849,14 +849,14 @@ public class SpscPipeWriterAppendTests
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests" --nologo
 ```
 
 Expected: compilation error referencing `pipe.Writer.Append` — the method does not exist yet.
 
-- [ ] **Step 3: Add the validation skeleton of `Append` to `SpscPipeWriter`**
+- [ ] **Step 3: Add the validation skeleton of `Append` to `PipeWriter`**
 
-Edit `src/SpscPipelines/SpscPipe.Writer.cs`. After the existing `private ValueTask<FlushResult> ParkFlushAwaiter(...)` method (the last method in the class), before the closing `}`, add:
+Edit `src/Pipely/Pipe.Writer.cs`. After the existing `private ValueTask<FlushResult> ParkFlushAwaiter(...)` method (the last method in the class), before the closing `}`, add:
 
 ```csharp
 
@@ -874,7 +874,7 @@ Edit `src/SpscPipelines/SpscPipe.Writer.cs`. After the existing `private ValueTa
     public void Append(IMemoryOwner<byte> buffer, int start, int length)
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
 
         var mem = buffer.Memory;
@@ -892,7 +892,7 @@ Edit `src/SpscPipelines/SpscPipe.Writer.cs`. After the existing `private ValueTa
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests" --nologo
 ```
 
 Expected: All argument-validation tests pass. Tests beyond validation (like ones in upcoming tasks) are not yet present, so this filter only sees the 9 cases written in Step 1 (5 `[Fact]` methods + 1 `[Theory]` with 4 `InlineData` rows), and all should pass.
@@ -901,7 +901,7 @@ Expected: All argument-validation tests pass. Tests beyond validation (like ones
 
 Run:
 ```bash
-dotnet test SpscPipe.slnx -c Release --nologo
+dotnet test Pipe.slnx -c Release --nologo
 ```
 
 Expected: All tests pass; count = baseline + 5 (Task 2) + 9 (Task 4).
@@ -909,9 +909,9 @@ Expected: All tests pass; count = baseline + 5 (Task 2) + 9 (Task 4).
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs src/SpscPipelines/SpscPipe.Writer.cs
+git add tests/Pipe.Tests/PipeWriterAppendTests.cs src/Pipely/Pipe.Writer.cs
 git commit -m "$(cat <<'EOF'
-SpscPipeWriter.Append: argument validation layer
+PipeWriter.Append: argument validation layer
 
 Adds the two Append overloads with argument validation:
   - null buffer -> ArgumentNullException
@@ -937,12 +937,12 @@ EOF
 **Goal:** Implement the zero-length path: synchronously dispose the buffer, no chain mutation.
 
 **Files:**
-- Modify: `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`
-- Modify: `src/SpscPipelines/SpscPipe.Writer.cs`
+- Modify: `tests/Pipe.Tests/PipeWriterAppendTests.cs`
+- Modify: `src/Pipely/Pipe.Writer.cs`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs` (inside the existing class):
+Append to `tests/Pipe.Tests/PipeWriterAppendTests.cs` (inside the existing class):
 
 ```csharp
     // ---------- Zero-length: accept-and-dispose ----------
@@ -950,7 +950,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs` (inside the existi
     [Fact]
     public void Append_ZeroLength_ThreeArg_DisposesAndReturns_NoChainMutation()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
 
         long totalWrittenBefore = pipe._totalWritten;
@@ -970,7 +970,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs` (inside the existi
     {
         // Memory.Length == 0 routes through the no-arg overload to the 3-arg overload
         // with length=0; same accept-and-dispose outcome.
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(0);
 
         pipe.Writer.Append(owner);
@@ -985,14 +985,14 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs` (inside the existi
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests.Append_ZeroLength_ThreeArg_DisposesAndReturns_NoChainMutation|FullyQualifiedName~SpscPipeWriterAppendTests.Append_BufferWithMemoryLengthZero_NoArg_DisposesAndReturns" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests.Append_ZeroLength_ThreeArg_DisposesAndReturns_NoChainMutation|FullyQualifiedName~PipeWriterAppendTests.Append_BufferWithMemoryLengthZero_NoArg_DisposesAndReturns" --nologo
 ```
 
 Expected: both fail with `NotImplementedException` (the placeholder body).
 
 - [ ] **Step 3: Add the zero-length branch**
 
-Edit `src/SpscPipelines/SpscPipe.Writer.cs`. In the 3-arg `Append`, replace the `// TODO Task 5: zero-length accept-and-dispose.` comment and the `throw new NotImplementedException(...)` line with:
+Edit `src/Pipely/Pipe.Writer.cs`. In the 3-arg `Append`, replace the `// TODO Task 5: zero-length accept-and-dispose.` comment and the `throw new NotImplementedException(...)` line with:
 
 ```csharp
         // Zero-length: accept ownership, dispose synchronously, no chain mutation.
@@ -1011,7 +1011,7 @@ Edit `src/SpscPipelines/SpscPipe.Writer.cs`. In the 3-arg `Append`, replace the 
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests" --nologo
 ```
 
 Expected: All Append tests written so far (11 cases total: 9 from Task 4 + 2 from Task 5) pass.
@@ -1019,9 +1019,9 @@ Expected: All Append tests written so far (11 cases total: 9 from Task 4 + 2 fro
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs src/SpscPipelines/SpscPipe.Writer.cs
+git add tests/Pipe.Tests/PipeWriterAppendTests.cs src/Pipely/Pipe.Writer.cs
 git commit -m "$(cat <<'EOF'
-SpscPipeWriter.Append: zero-length accept-and-dispose path
+PipeWriter.Append: zero-length accept-and-dispose path
 
 A zero-length Append (either via length=0 in the 3-arg overload or
 a buffer with Memory.Length=0 via the no-arg overload) takes
@@ -1043,12 +1043,12 @@ EOF
 **Goal:** Implement the bootstrap path: when `_writingHead == null`, the donated segment becomes both `_chainHead` and `_writingHead`. Verify all relevant fields, including `RunningIndex == 0`, `OwnerToken == pipe`, `IsDonated == true`, and that the donated `Memory` matches the original slice.
 
 **Files:**
-- Modify: `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`
-- Modify: `src/SpscPipelines/SpscPipe.Writer.cs`
+- Modify: `tests/Pipe.Tests/PipeWriterAppendTests.cs`
+- Modify: `src/Pipely/Pipe.Writer.cs`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
+Append to `tests/Pipe.Tests/PipeWriterAppendTests.cs`:
 
 ```csharp
     // ---------- Bootstrap: empty pipe + Append ----------
@@ -1056,7 +1056,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public void Append_NoArg_OnEmptyPipe_BootstrapsChainHeadEqualsWritingHead()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var bytes = new byte[64];
         for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i + 1);
         var owner = new TrackingMemoryOwner(bytes);
@@ -1083,7 +1083,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public void Append_ThreeArg_OnEmptyPipe_PublishedSliceMatchesStartAndLength()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var bytes = new byte[1024];
         for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i & 0xFF);
         var owner = new TrackingMemoryOwner(bytes);
@@ -1105,14 +1105,14 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests.Append_NoArg_OnEmptyPipe|FullyQualifiedName~SpscPipeWriterAppendTests.Append_ThreeArg_OnEmptyPipe" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests.Append_NoArg_OnEmptyPipe|FullyQualifiedName~PipeWriterAppendTests.Append_ThreeArg_OnEmptyPipe" --nologo
 ```
 
 Expected: both fail with `NotImplementedException`.
 
 - [ ] **Step 3: Add the bootstrap branch**
 
-Edit `src/SpscPipelines/SpscPipe.Writer.cs`. In the 3-arg `Append`, replace:
+Edit `src/Pipely/Pipe.Writer.cs`. In the 3-arg `Append`, replace:
 
 ```csharp
         // TODO Task 6: bootstrap path.
@@ -1145,7 +1145,7 @@ with:
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests" --nologo
 ```
 
 Expected: all 13 Append cases pass (9 validation + 2 zero-length + 2 bootstrap).
@@ -1153,9 +1153,9 @@ Expected: all 13 Append cases pass (9 validation + 2 zero-length + 2 bootstrap).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs src/SpscPipelines/SpscPipe.Writer.cs
+git add tests/Pipe.Tests/PipeWriterAppendTests.cs src/Pipely/Pipe.Writer.cs
 git commit -m "$(cat <<'EOF'
-SpscPipeWriter.Append: bootstrap path (empty pipe)
+PipeWriter.Append: bootstrap path (empty pipe)
 
 When _writingHead is null at Append time, the donated segment
 becomes both _chainHead and _writingHead with RunningIndex=0.
@@ -1177,12 +1177,12 @@ EOF
 **Goal:** Implement the steady-state branch: when `_writingHead != null`, freeze the previous tail with whatever's buffered and splice the donated segment as the new tail. Cover both the "previous tail is rented" case and the "previous tail is donated" case (idempotent `Freeze` writes on `End`/`Memory`).
 
 **Files:**
-- Modify: `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`
-- Modify: `src/SpscPipelines/SpscPipe.Writer.cs`
+- Modify: `tests/Pipe.Tests/PipeWriterAppendTests.cs`
+- Modify: `src/Pipely/Pipe.Writer.cs`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
+Append to `tests/Pipe.Tests/PipeWriterAppendTests.cs`:
 
 ```csharp
     // ---------- Steady-state splice ----------
@@ -1190,7 +1190,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public void Append_AfterPartialFill_FreezesPreviousTailAndSplicesDonated()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new PipeOptions(minimumSegmentSize: 64));
         // Establish a partially-filled rented tail.
         var rentedMem = pipe.Writer.GetMemory(64);
         for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
@@ -1234,7 +1234,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
         // Spec §2.2: when the previous _writingHead is itself donated, the steady-state
         // Freeze(filled, newDonated) call writes End/base.Memory to the same values they
         // already held; only Next changes meaningfully.
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
 
         var owner1 = new TrackingMemoryOwner(30);
         var owner2 = new TrackingMemoryOwner(50);
@@ -1266,7 +1266,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public void Append_WithStartOffset_SplicesOnlyTheSelectedSlice()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var bytes = new byte[1024];
         for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i & 0xFF);
         var owner = new TrackingMemoryOwner(bytes);
@@ -1284,14 +1284,14 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests.Append_AfterPartialFill|FullyQualifiedName~SpscPipeWriterAppendTests.Append_AfterAppend|FullyQualifiedName~SpscPipeWriterAppendTests.Append_WithStartOffset" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests.Append_AfterPartialFill|FullyQualifiedName~PipeWriterAppendTests.Append_AfterAppend|FullyQualifiedName~PipeWriterAppendTests.Append_WithStartOffset" --nologo
 ```
 
 Expected: 3 failures with `NotImplementedException`.
 
 - [ ] **Step 3: Add the steady-state splice**
 
-Edit `src/SpscPipelines/SpscPipe.Writer.cs`. In the 3-arg `Append`, replace:
+Edit `src/Pipely/Pipe.Writer.cs`. In the 3-arg `Append`, replace:
 
 ```csharp
         // TODO Task 7: steady-state splice.
@@ -1321,7 +1321,7 @@ with:
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests" --nologo
 ```
 
 Expected: all 16 Append cases pass (13 from before + 3 new).
@@ -1330,7 +1330,7 @@ Expected: all 16 Append cases pass (13 from before + 3 new).
 
 Run:
 ```bash
-dotnet test SpscPipe.slnx -c Release --nologo
+dotnet test Pipe.slnx -c Release --nologo
 ```
 
 Expected: All tests pass; no regressions in existing suites.
@@ -1338,9 +1338,9 @@ Expected: All tests pass; no regressions in existing suites.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs src/SpscPipelines/SpscPipe.Writer.cs
+git add tests/Pipe.Tests/PipeWriterAppendTests.cs src/Pipely/Pipe.Writer.cs
 git commit -m "$(cat <<'EOF'
-SpscPipeWriter.Append: steady-state splice
+PipeWriter.Append: steady-state splice
 
 When _writingHead is non-null, Freeze the previous tail with the
 buffered byte count and splice the donated segment as the new tail.
@@ -1365,13 +1365,13 @@ EOF
 **Goal:** Verify that the post-Append `_writingHead` state interacts correctly with subsequent `GetMemory` (forces transition), `Advance(>0)` (throws via existing bounds check), and `FlushAsync` (publishes the donated segment as `TailSegment`). Also verify back-to-back `Append`s produce no empty rented tails.
 
 **Files:**
-- Modify: `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`
+- Modify: `tests/Pipe.Tests/PipeWriterAppendTests.cs`
 
 (No source changes — this task pins behavior that falls out of existing code.)
 
 - [ ] **Step 1: Write the tests**
 
-Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
+Append to `tests/Pipe.Tests/PipeWriterAppendTests.cs`:
 
 ```csharp
     // ---------- Post-Append interactions with the rest of the writer surface ----------
@@ -1379,7 +1379,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public void GetMemory_AfterAppend_TransitionsToFreshRentedTail()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new PipeOptions(minimumSegmentSize: 64));
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Append(owner);
         var donated = pipe._writingHead!;
@@ -1399,19 +1399,19 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public void Advance_AfterAppend_ThrowsArgumentOutOfRange()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Append(owner);
 
         // _writingHead.AvailableMemory.Length == _writingHeadBytesBuffered, so any positive
-        // Advance fails the existing bounds check at SpscPipe.Writer.cs:52.
+        // Advance fails the existing bounds check at Pipe.Writer.cs:52.
         Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Advance(1));
     }
 
     [Fact]
     public async Task FlushAsync_AfterAppend_PublishesDonatedAsTailSegment()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(50);
         pipe.Writer.Append(owner);
         var donated = pipe._writingHead!;
@@ -1430,7 +1430,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public async Task FlushAsync_AfterMixedWriteAndAppend_PublishesCorrectChain()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new PipeOptions(minimumSegmentSize: 64));
         var rentedMem = pipe.Writer.GetMemory(64);
         for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
         pipe.Writer.Advance(40);
@@ -1454,7 +1454,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
         // Spec §8: "After GetMemory + Advance(0) (zero buffered)" → previous tail is frozen
         // with End=0; donated is spliced after. The empty rented segment is harmless and
         // recycles to freelist on drain.
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new PipeOptions(minimumSegmentSize: 64));
         pipe.Writer.GetMemory(64);
         pipe.Writer.Advance(0);
         var prevTail = pipe._writingHead!;
@@ -1476,7 +1476,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     public async Task LargeAppend_DoesNotPark_SubsequentFlushAsyncParksWhenOverThreshold()
     {
         // Spec §4.4: Append doesn't gate on PauseWriterThreshold; FlushAsync does.
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(
+        using var pipe = new Pipely.Pipe(new PipeOptions(
             pauseWriterThreshold: 1024, resumeWriterThreshold: 512));
 
         var owner = new TrackingMemoryOwner(8 * 1024);   // well over the pause threshold
@@ -1501,7 +1501,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public void BackToBackAppends_NoEmptyRentedTailsBetweenDonations()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var o1 = new TrackingMemoryOwner(10);
         var o2 = new TrackingMemoryOwner(20);
         var o3 = new TrackingMemoryOwner(30);
@@ -1533,7 +1533,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests" --nologo
 ```
 
 Expected: all 23 Append cases pass (16 from before + 7 new). The 7 new tests pin behaviors that fall out of existing transition logic without source changes (with the exception of the backpressure test, which validates §4.4 — backpressure is a `FlushAsync` concern, not an `Append` concern).
@@ -1543,9 +1543,9 @@ If any of these tests fail, that means the steady-state splice from Task 7 has a
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs
+git add tests/Pipe.Tests/PipeWriterAppendTests.cs
 git commit -m "$(cat <<'EOF'
-Tests: pin SpscPipeWriter.Append interactions with GetMemory/Advance/FlushAsync
+Tests: pin PipeWriter.Append interactions with GetMemory/Advance/FlushAsync
 
 Seven tests verify post-Append behaviors that fall out of existing
 writer logic without code changes (one — the backpressure case —
@@ -1581,12 +1581,12 @@ EOF
 **Goal:** Update `RecycleDrainedSegments` to dispose the foreign `IMemoryOwner` for donated segments instead of pushing them onto the freelist. Verify with end-to-end tests that the reader-drains-past-donated path correctly fires `Dispose` exactly once on the tracked owner, the freelist count stays unchanged, and rented-segment behavior is preserved.
 
 **Files:**
-- Modify: `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`
-- Modify: `src/SpscPipelines/SpscPipe.cs:315-328`
+- Modify: `tests/Pipe.Tests/PipeWriterAppendTests.cs`
+- Modify: `src/Pipely/Pipe.cs:315-328`
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
+Append to `tests/Pipe.Tests/PipeWriterAppendTests.cs`:
 
 ```csharp
     // ---------- Recycle path: donated -> DisposeOwned + drop; rented -> freelist (unchanged) ----------
@@ -1594,7 +1594,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public async Task ReaderDrainsPastDonated_DisposesOwner_FreelistCountUnchanged()
     {
-        using var pipe = new SpscPipelines.SpscPipe();
+        using var pipe = new Pipely.Pipe();
         var donatedOwner = new TrackingMemoryOwner(30);
         pipe.Writer.Append(donatedOwner);
         // Force a subsequent rented tail so the donated segment becomes a non-tail chain segment.
@@ -1622,7 +1622,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     public async Task RecyclePath_RentedSegmentStillFreelisted_RegressionGuard()
     {
         // Existing rented-segment recycle behavior must be preserved.
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new PipeOptions(minimumSegmentSize: 64));
         // Two rented segments in chain.
         pipe.Writer.GetMemory(64); pipe.Writer.Advance(64);
         pipe.Writer.GetMemory(64); pipe.Writer.Advance(50);
@@ -1639,7 +1639,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public async Task DisposePipe_WithMixedChain_DisposesAllOwners()
     {
-        var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        var pipe = new Pipely.Pipe(new PipeOptions(minimumSegmentSize: 64));
 
         var donated1 = new TrackingMemoryOwner(20);
         var donated2 = new TrackingMemoryOwner(30);
@@ -1659,7 +1659,7 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
     [Fact]
     public async Task ReadResultBufferContent_IncludesDonatedBytes_InCorrectPosition()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipely.Pipe(new PipeOptions(minimumSegmentSize: 64));
 
         // Rented [0..3] = 0x01,0x02,0x03,0x04
         var rentedMem = pipe.Writer.GetMemory(64);
@@ -1685,20 +1685,20 @@ Append to `tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs`:
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests.ReaderDrainsPastDonated|FullyQualifiedName~SpscPipeWriterAppendTests.DisposePipe_WithMixedChain|FullyQualifiedName~SpscPipeWriterAppendTests.RecyclePath_RentedSegmentStillFreelisted|FullyQualifiedName~SpscPipeWriterAppendTests.ReadResultBufferContent" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests.ReaderDrainsPastDonated|FullyQualifiedName~PipeWriterAppendTests.DisposePipe_WithMixedChain|FullyQualifiedName~PipeWriterAppendTests.RecyclePath_RentedSegmentStillFreelisted|FullyQualifiedName~PipeWriterAppendTests.ReadResultBufferContent" --nologo
 ```
 
 Expected:
 - `ReadResultBufferContent_IncludesDonatedBytes_InCorrectPosition` — passes (no recycle behavior involved; just the read path).
 - `RecyclePath_RentedSegmentStillFreelisted_RegressionGuard` — passes (existing behavior, no donated involvement).
 - `ReaderDrainsPastDonated_DisposesOwner_FreelistCountUnchanged` — fails. The current `RecycleDrainedSegments` calls `PushFreelist` for every drained segment, including donated ones. Donated segments don't have `_memoryOwner.Dispose()` called.
-- `DisposePipe_WithMixedChain_DisposesAllOwners` — passes (the existing `SpscPipe.Dispose` walk calls `DisposeOwned()` on every chain segment regardless of `IsDonated`).
+- `DisposePipe_WithMixedChain_DisposesAllOwners` — passes (the existing `Pipe.Dispose` walk calls `DisposeOwned()` on every chain segment regardless of `IsDonated`).
 
-If `ReaderDrainsPastDonated_DisposesOwner_FreelistCountUnchanged` doesn't fail at this step, double-check that `PushFreelist` isn't already disposing — it shouldn't be (look at `SpscPipe.cs:127` for the cap-overflow case and `SpscPipe.cs:133-136` for the normal push case; the latter does NOT dispose).
+If `ReaderDrainsPastDonated_DisposesOwner_FreelistCountUnchanged` doesn't fail at this step, double-check that `PushFreelist` isn't already disposing — it shouldn't be (look at `Pipe.cs:127` for the cap-overflow case and `Pipe.cs:133-136` for the normal push case; the latter does NOT dispose).
 
 - [ ] **Step 3: Add the `IsDonated` branch to `RecycleDrainedSegments`**
 
-Edit `src/SpscPipelines/SpscPipe.cs`. The current `RecycleDrainedSegments` (lines 315-328) ends with a single `PushFreelist(recycled);` call. Replace the loop body to branch on `IsDonated`.
+Edit `src/Pipely/Pipe.cs`. The current `RecycleDrainedSegments` (lines 315-328) ends with a single `PushFreelist(recycled);` call. Replace the loop body to branch on `IsDonated`.
 
 Current:
 ```csharp
@@ -1744,7 +1744,7 @@ Replace with:
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeWriterAppendTests" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeWriterAppendTests" --nologo
 ```
 
 Expected: all 27 Append cases pass (23 from before + 4 new).
@@ -1753,7 +1753,7 @@ Expected: all 27 Append cases pass (23 from before + 4 new).
 
 Run:
 ```bash
-dotnet test SpscPipe.slnx -c Release --nologo
+dotnet test Pipe.slnx -c Release --nologo
 ```
 
 Expected: All tests pass; count = baseline + 5 (Task 2) + 27 (Tasks 4-9) = baseline + 32.
@@ -1761,9 +1761,9 @@ Expected: All tests pass; count = baseline + 5 (Task 2) + 27 (Tasks 4-9) = basel
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tests/SpscPipe.Tests/SpscPipeWriterAppendTests.cs src/SpscPipelines/SpscPipe.cs
+git add tests/Pipe.Tests/PipeWriterAppendTests.cs src/Pipely/Pipe.cs
 git commit -m "$(cat <<'EOF'
-SpscPipe: RecycleDrainedSegments branches on IsDonated
+Pipe: RecycleDrainedSegments branches on IsDonated
 
 Donated segments take the dispose-and-drop path: the foreign
 IMemoryOwner is released via DisposeOwned and the BufferSegment
@@ -1773,13 +1773,13 @@ continue through PushFreelist exactly as before.
 The walk predicate (_chainHead != _writingHead && _chainHead !=
 readerHead) is unchanged; IsDonated only affects what happens to a
 segment after the predicate has decided to advance past it.
-SpscPipe.Dispose's chain walk already calls DisposeOwned uniformly,
+Pipe.Dispose's chain walk already calls DisposeOwned uniformly,
 so the mixed-chain dispose case requires no further changes there.
 
 Tests verify: reader-drains-past-donated triggers exactly one
 Dispose on the tracking owner without growing the freelist;
 rented-segment recycle behavior preserved (regression guard);
-mixed-chain SpscPipe.Dispose disposes every owner exactly once;
+mixed-chain Pipe.Dispose disposes every owner exactly once;
 ReadResult.Buffer correctly stitches rented and donated bytes.
 
 Per spec §5 of
@@ -1794,24 +1794,24 @@ EOF
 
 ## Task 10: Cross-pipe `AdvanceTo` of donated segment (TDD)
 
-**Goal:** Add a regression test that verifies the existing R4-7 pipe-identity check at `SpscPipe.Reader.cs:113` continues to fire for cross-pipe `SequencePosition`s, even when the position points inside a donated segment of a different pipe. This is a behavior-pinning test; no source change required.
+**Goal:** Add a regression test that verifies the existing R4-7 pipe-identity check at `Pipe.Reader.cs:113` continues to fire for cross-pipe `SequencePosition`s, even when the position points inside a donated segment of a different pipe. This is a behavior-pinning test; no source change required.
 
 **Files:**
-- Modify: `tests/SpscPipe.Tests/SpscPipeAdvanceToTests.cs`
+- Modify: `tests/Pipe.Tests/PipeAdvanceToTests.cs`
 
 - [ ] **Step 1: Write the test**
 
-Append to `tests/SpscPipe.Tests/SpscPipeAdvanceToTests.cs` (inside the existing class, before the closing `}`):
+Append to `tests/Pipe.Tests/PipeAdvanceToTests.cs` (inside the existing class, before the closing `}`):
 
 ```csharp
     [Fact]
     public async Task AdvanceTo_DonatedSegmentFromDifferentPipe_Throws()
     {
-        // R4-7 pipe-identity check (SpscPipe.Reader.cs:113) must fire even when the
+        // R4-7 pipe-identity check (Pipe.Reader.cs:113) must fire even when the
         // SequencePosition points inside a donated segment of pipe1 — donated segments
         // set OwnerToken = pipe1, so a cross-pipe AdvanceTo to pipe2 must reject.
-        using var pipe1 = new SpscPipelines.SpscPipe();
-        using var pipe2 = new SpscPipelines.SpscPipe();
+        using var pipe1 = new Pipely.Pipe();
+        using var pipe2 = new Pipely.Pipe();
 
         var donatedOwner = new TrackingMemoryOwner(20);
         pipe1.Writer.Append(donatedOwner);
@@ -1830,10 +1830,10 @@ Append to `tests/SpscPipe.Tests/SpscPipeAdvanceToTests.cs` (inside the existing 
 
 Run:
 ```bash
-dotnet test tests/SpscPipe.Tests/SpscPipe.Tests.csproj --filter "FullyQualifiedName~SpscPipeAdvanceToTests.AdvanceTo_DonatedSegmentFromDifferentPipe_Throws" --nologo
+dotnet test tests/Pipe.Tests/Pipe.Tests.csproj --filter "FullyQualifiedName~PipeAdvanceToTests.AdvanceTo_DonatedSegmentFromDifferentPipe_Throws" --nologo
 ```
 
-Expected: passes immediately. The R4-7 check at `SpscPipe.Reader.cs:113` already does
+Expected: passes immediately. The R4-7 check at `Pipe.Reader.cs:113` already does
 `!ReferenceEquals(consumedSeg.OwnerToken, _pipe)` — since `AdoptFrom` sets `OwnerToken = pipe1`, the cross-pipe call throws.
 
 If this test fails, that's a real bug — `AdoptFrom` isn't setting `OwnerToken` correctly. Re-check Task 2's `AdoptFrom` implementation against the spec §3 BufferSegment definition.
@@ -1841,12 +1841,12 @@ If this test fails, that's a real bug — `AdoptFrom` isn't setting `OwnerToken`
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipe.Tests/SpscPipeAdvanceToTests.cs
+git add tests/Pipe.Tests/PipeAdvanceToTests.cs
 git commit -m "$(cat <<'EOF'
 Tests: AdvanceTo cross-pipe check fires for donated segments
 
 Pins the spec §7 invariant that R4-7 pipe-identity rejection at
-SpscPipe.Reader.cs:113 works for donated segments identically to
+Pipe.Reader.cs:113 works for donated segments identically to
 rented ones — AdoptFrom sets OwnerToken = pipe, so a cross-pipe
 SequencePosition is detected and InvalidOperationException is
 thrown.
@@ -1860,23 +1860,23 @@ EOF
 
 ## Task 11: Stress test addition — Append injection in producer
 
-**Goal:** Extend `tests/SpscPipe.Stress/StressHarness.cs` to occasionally use `Append` instead of `GetMemory`+`Advance`. Track per-owner `Dispose` counts to verify no leaks (under-dispose) or double-disposes at end of run.
+**Goal:** Extend `tests/Pipe.Stress/StressHarness.cs` to occasionally use `Append` instead of `GetMemory`+`Advance`. Track per-owner `Dispose` counts to verify no leaks (under-dispose) or double-disposes at end of run.
 
 **Files:**
-- Modify: `tests/SpscPipe.Stress/StressHarness.cs`
+- Modify: `tests/Pipe.Stress/StressHarness.cs`
 
 - [ ] **Step 1: Read the existing producer loop**
 
 Run:
 ```bash
-sed -n '20,80p' tests/SpscPipe.Stress/StressHarness.cs
+sed -n '20,80p' tests/Pipe.Stress/StressHarness.cs
 ```
 
 Expected output: shows the producer task (`var producer = Task.Run(async () => { ... })`) starting around line 27, with the `while (produced < totalBytes ...)` loop.
 
 - [ ] **Step 2: Add a tracking owner type and Append branch**
 
-Edit `tests/SpscPipe.Stress/StressHarness.cs`. Add a private nested class at the bottom of `StressHarness` (just before its closing `}`):
+Edit `tests/Pipe.Stress/StressHarness.cs`. Add a private nested class at the bottom of `StressHarness` (just before its closing `}`):
 
 ```csharp
     // Tracks IMemoryOwner.Dispose calls so the harness can verify zero-leak / no-double-dispose
@@ -1894,7 +1894,7 @@ Edit `tests/SpscPipe.Stress/StressHarness.cs`. Add a private nested class at the
 
 You'll also need to add `using System.Buffers;` at the top of the file if not already present:
 ```bash
-grep -n "using System.Buffers" tests/SpscPipe.Stress/StressHarness.cs
+grep -n "using System.Buffers" tests/Pipe.Stress/StressHarness.cs
 ```
 
 If the grep returns nothing, add `using System.Buffers;` to the top of the file (after any existing `using ... = ...` aliases).
@@ -1955,7 +1955,7 @@ Replace with:
 
 After `await Task.WhenAll(producer, consumer);` (or wherever both tasks have joined and the pipe is about to be disposed), add a leak/double-dispose check. First locate the block by:
 ```bash
-grep -n "WhenAll\|StressResult\|return new" tests/SpscPipe.Stress/StressHarness.cs
+grep -n "WhenAll\|StressResult\|return new" tests/Pipe.Stress/StressHarness.cs
 ```
 
 Just before `pipe.Dispose()` (or at the equivalent point if the existing harness disposes implicitly via `using`), add:
@@ -1994,7 +1994,7 @@ If `RunOnce` already returns `StressResult` directly (no intermediate variable),
 
 Run:
 ```bash
-dotnet build tests/SpscPipe.Stress/SpscPipe.Stress.csproj -c Release --nologo
+dotnet build tests/Pipe.Stress/Pipe.Stress.csproj -c Release --nologo
 ```
 
 Expected: build succeeds, 0 errors, 0 warnings.
@@ -2003,13 +2003,13 @@ Expected: build succeeds, 0 errors, 0 warnings.
 
 The stress harness is run via `Program.cs`. Determine its entry point and a short-duration invocation:
 ```bash
-grep -nE "RunOnce|TimeSpan|Main\(" tests/SpscPipe.Stress/Program.cs | head -10
+grep -nE "RunOnce|TimeSpan|Main\(" tests/Pipe.Stress/Program.cs | head -10
 ```
 
 Then run a short stress pass (default duration if Program.cs supports it; otherwise edit Program.cs to invoke `RunOnce` once with `totalBytes = 1 << 22` (4 MiB) and assert the harness completes without throwing):
 
 ```bash
-dotnet run --project tests/SpscPipe.Stress -c Release -- --bytes=4194304 --seed=42
+dotnet run --project tests/Pipe.Stress -c Release -- --bytes=4194304 --seed=42
 ```
 
 (If the CLI doesn't accept `--bytes` / `--seed`, fall back to running the program with whatever defaults it has and just confirm it exits 0.)
@@ -2019,7 +2019,7 @@ Expected: run completes with exit code 0 and no exceptions. If the leak/double-d
 - [ ] **Step 7: Commit**
 
 ```bash
-git add tests/SpscPipe.Stress/StressHarness.cs
+git add tests/Pipe.Stress/StressHarness.cs
 git commit -m "$(cat <<'EOF'
 Stress: inject Append into producer; verify zero-leak owner accounting
 
@@ -2067,7 +2067,7 @@ Find the §3 Ownership table at line ~172. The current table:
 Insert a new row after the `IMemoryOwner<byte> per segment` row:
 
 ```
-| `IMemoryOwner<byte>` (donated, post-2026-04-28-Append) | Writer (adopted from caller via `Append`) | None directly; reader sees buffer via `BufferSegment.Memory`. Released on recycle (`DisposeOwned`) or `SpscPipe.Dispose`. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` |
+| `IMemoryOwner<byte>` (donated, post-2026-04-28-Append) | Writer (adopted from caller via `Append`) | None directly; reader sees buffer via `BufferSegment.Memory`. Released on recycle (`DisposeOwned`) or `Pipe.Dispose`. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` |
 ```
 
 - [ ] **Step 2: Add `IsDonated` field reference to `BufferSegment` definition note**
@@ -2075,7 +2075,7 @@ Insert a new row after the `IMemoryOwner<byte> per segment` row:
 Find the `BufferSegment` definition code block at line ~183. After the closing `}` of the code block (around line 230), before the existing "Note on `Next` semantics" paragraph, add:
 
 ```markdown
-**Buffer-ownership transfer (post-2026-04-28).** `BufferSegment` gained an `IsDonated : bool` field and an `AdoptFrom(IMemoryOwner<byte>, Memory<byte>, long, object)` initializer to support `SpscPipeWriter.Append`'s buffer-ownership-transfer path. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §3 for the full definition. The recycle path (this section) branches on `IsDonated`: rented → `PushFreelist` (existing); donated → `DisposeOwned()` and discard.
+**Buffer-ownership transfer (post-2026-04-28).** `BufferSegment` gained an `IsDonated : bool` field and an `AdoptFrom(IMemoryOwner<byte>, Memory<byte>, long, object)` initializer to support `PipeWriter.Append`'s buffer-ownership-transfer path. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §3 for the full definition. The recycle path (this section) branches on `IsDonated`: rented → `PushFreelist` (existing); donated → `DisposeOwned()` and discard.
 ```
 
 - [ ] **Step 3: Update Recycling-path pseudocode**
@@ -2148,7 +2148,7 @@ Find Section 4's list of methods. The first method header is `### Writer: GetMem
 
 ```
 
-- [ ] **Step 7: Add SpscPipeWriter visibility note to Public API section**
+- [ ] **Step 7: Add PipeWriter visibility note to Public API section**
 
 Find the public API section. Run:
 ```bash
@@ -2158,7 +2158,7 @@ grep -nE "^## Section [0-9]+|public PipeWriter Writer" docs/superpowers/specs/20
 Locate the section containing the `public PipeWriter Writer` declaration (likely §X or similar). After that declaration, add:
 
 ```markdown
-**Visibility revision (post-2026-04-28).** `SpscPipeWriter` is now `public` (was `internal`) and is no longer nested inside `SpscPipe`. `SpscPipe.Writer`'s declared return type widens to `SpscPipeWriter`. Source-compatible with existing `PipeWriter w = pipe.Writer;` callers via implicit upcast. `SpscPipeReader` stays `internal` — no reader-side surface addition motivates exposing it. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §6.
+**Visibility revision (post-2026-04-28).** `PipeWriter` is now `public` (was `internal`) and is no longer nested inside `Pipe`. `Pipe.Writer`'s declared return type widens to `PipeWriter`. Source-compatible with existing `PipeWriter w = pipe.Writer;` callers via implicit upcast. `PipeReader` stays `internal` — no reader-side surface addition motivates exposing it. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §6.
 ```
 
 - [ ] **Step 8: Skim the spec for any other places that need updates**
@@ -2184,7 +2184,7 @@ Expected: an even number (every code fence is paired). If it's odd, an edit acci
 ```bash
 git add docs/superpowers/specs/2026-04-25-spsc-pipe-tripleBuffer-design.md
 git commit -m "$(cat <<'EOF'
-SpscPipe spec §3 / §4 / §X: add buffer-ownership-transfer cross-refs
+Pipe spec §3 / §4 / §X: add buffer-ownership-transfer cross-refs
 
 Inline amendments to the base spec for the post-2026-04-28 Append
 feature: ownership table gains a donated-IMemoryOwner row;
@@ -2193,7 +2193,7 @@ AdoptFrom initializer; recycle pseudocode branches on IsDonated;
 MemoryPool/sizing notes flag donated segments as bypassing the
 pool/MinimumSegmentSize; Memory<T> torn-read note documents donated
 immunity; Section 4 gains a forward-reference to the new Append
-subsection; public-API section notes SpscPipeWriter visibility
+subsection; public-API section notes PipeWriter visibility
 change.
 
 The full design lives in
@@ -2218,7 +2218,7 @@ EOF
 
 Run:
 ```bash
-dotnet clean SpscPipe.slnx -c Release && dotnet build SpscPipe.slnx -c Release --nologo
+dotnet clean Pipe.slnx -c Release && dotnet build Pipe.slnx -c Release --nologo
 ```
 
 Expected: 6 projects build, 0 warnings, 0 errors.
@@ -2227,7 +2227,7 @@ Expected: 6 projects build, 0 warnings, 0 errors.
 
 Run:
 ```bash
-dotnet test SpscPipe.slnx -c Release --nologo
+dotnet test Pipe.slnx -c Release --nologo
 ```
 
 Expected: All tests pass. Tally (each `[Theory]` `InlineData` row is a separate xUnit test case):
@@ -2246,7 +2246,7 @@ Expected: All tests pass. Tally (each `[Theory]` `InlineData` row is a separate 
 
 Run:
 ```bash
-dotnet run --project tests/SpscPipe.Stress -c Release
+dotnet run --project tests/Pipe.Stress -c Release
 ```
 
 Expected: exit 0 with no exceptions. The harness's owner-accounting check (Task 11 Step 4) confirms every donated `IMemoryOwner` was disposed exactly once.
@@ -2261,16 +2261,16 @@ git log --oneline ^main HEAD
 Expected output: a sequence of focused commits, each tied to one task in this plan, in order:
 
 ```
-<sha> SpscPipe spec §3 / §4 / §X: add buffer-ownership-transfer cross-refs
+<sha> Pipe spec §3 / §4 / §X: add buffer-ownership-transfer cross-refs
 <sha> Stress: inject Append into producer; verify zero-leak owner accounting
 <sha> Tests: AdvanceTo cross-pipe check fires for donated segments
-<sha> SpscPipe: RecycleDrainedSegments branches on IsDonated
-<sha> Tests: pin SpscPipeWriter.Append interactions with GetMemory/Advance/FlushAsync
-<sha> SpscPipeWriter.Append: steady-state splice
-<sha> SpscPipeWriter.Append: bootstrap path (empty pipe)
-<sha> SpscPipeWriter.Append: zero-length accept-and-dispose path
-<sha> SpscPipeWriter.Append: argument validation layer
-<sha> SpscPipe: unnest SpscPipeWriter; widen Writer return type
+<sha> Pipe: RecycleDrainedSegments branches on IsDonated
+<sha> Tests: pin PipeWriter.Append interactions with GetMemory/Advance/FlushAsync
+<sha> PipeWriter.Append: steady-state splice
+<sha> PipeWriter.Append: bootstrap path (empty pipe)
+<sha> PipeWriter.Append: zero-length accept-and-dispose path
+<sha> PipeWriter.Append: argument validation layer
+<sha> Pipe: unnest PipeWriter; widen Writer return type
 <sha> BufferSegment: add IsDonated flag + AdoptFrom initializer
 <sha> Tests: add TrackingMemoryOwner helper for ownership-transfer assertions
 ```
@@ -2278,8 +2278,8 @@ Expected output: a sequence of focused commits, each tied to one task in this pl
 - [ ] **Step 5: Hand off**
 
 Implementation is complete. Optional follow-ups worth offering to the user but explicitly out-of-scope of this plan (per spec §11):
-- Helper extension `Append(this SpscPipeWriter, byte[])` that wraps a byte array as an ad-hoc `IMemoryOwner` and Appends it.
-- Diagnostic counters (e.g., `_donatedAppendCount`) on `SpscPipe` for observability.
+- Helper extension `Append(this PipeWriter, byte[])` that wraps a byte array as an ad-hoc `IMemoryOwner` and Appends it.
+- Diagnostic counters (e.g., `_donatedAppendCount`) on `Pipe` for observability.
 - `BufferSegment` shell pooling for donations (low priority; donations are rare relative to byte volume).
 
 ---

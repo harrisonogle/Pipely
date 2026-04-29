@@ -22,15 +22,15 @@
 
 ### Components
 
-- **`SpscPipe`** — owns:
+- **`Pipe`** — owns:
   - `_writerTb : TripleBuffer<WriterState>` — written by writer thread, read by reader thread.
   - `_readerTb : TripleBuffer<ReaderState>` — written by reader thread, read by writer thread.
-  - `_readAwaiter : SpscAwaiter<ReadResult>` — woken by writer; awaited by reader. Carries Pattern-2 stash.
-  - `_flushAwaiter : SpscAwaiter<FlushResult>` — woken by reader; awaited by writer. No stash (FlushResult has no buffer).
-  - `_options : SpscPipeOptions` — see Section 6.
-- **`SpscPipe.Writer : PipeWriter`** — single producer thread. Owns the segment chain (`_chainHead` → `_writingHead`), a private `BufferSegment` freelist, the `MemoryPool<byte>` reference, and writer-local cursors.
-- **`SpscPipe.Reader : PipeReader`** — single consumer thread. Owns reader-local cursors and the most recently acquired `WriterState`.
-- **`SpscAwaiter<T>`** — wraps `ManualResetValueTaskSourceCore<T>` (configured with `RunContinuationsAsynchronously = false`) with a single packed `int` state field plus a `ParkStash` and a source-side EC-capture stash (`_realContinuation` / `_realState` / `_capturedEC`). Detail in Section 5.
+  - `_readAwaiter : PipelyAwaiter<ReadResult>` — woken by writer; awaited by reader. Carries Pattern-2 stash.
+  - `_flushAwaiter : PipelyAwaiter<FlushResult>` — woken by reader; awaited by writer. No stash (FlushResult has no buffer).
+  - `_options : PipeOptions` — see Section 6.
+- **`Pipe.Writer : PipeWriter`** — single producer thread. Owns the segment chain (`_chainHead` → `_writingHead`), a private `BufferSegment` freelist, the `MemoryPool<byte>` reference, and writer-local cursors.
+- **`Pipe.Reader : PipeReader`** — single consumer thread. Owns reader-local cursors and the most recently acquired `WriterState`.
+- **`PipelyAwaiter<T>`** — wraps `ManualResetValueTaskSourceCore<T>` (configured with `RunContinuationsAsynchronously = false`) with a single packed `int` state field plus a `ParkStash` and a source-side EC-capture stash (`_realContinuation` / `_realState` / `_capturedEC`). Detail in Section 5.
 - **`IContinuationDispatcher`** (public interface, §6) — pluggable thread-routing primitive for awaiter continuations. Default = `ThreadPoolContinuationDispatcher` (forwards to `ThreadPool.UnsafeQueueUserWorkItem`). User-supplied implementations let callers escape TP wake-gap latency for high-frequency workloads.
 
 ### Local cursors (private to each side)
@@ -62,7 +62,7 @@
 - All `Writer` calls (`GetMemory`, `GetSpan`, `Advance`, `FlushAsync`, `Complete`) on a single producer thread.
 - All `Reader` calls (`ReadAsync`, `TryRead`, `AdvanceTo`, `Complete`) on a single consumer thread.
 - `CancelPendingRead` / `CancelPendingFlush` are explicitly thread-safe (callable from any thread).
-- The two threads communicate exclusively via the two `TripleBuffer`s and the two `SpscAwaiter` state machines. No locks. No shared mutable structures outside those two primitives.
+- The two threads communicate exclusively via the two `TripleBuffer`s and the two `PipelyAwaiter` state machines. No locks. No shared mutable structures outside those two primitives.
 - `WriteAsync`/`CompleteAsync`/`AsStream` and other `PipeReader`/`PipeWriter` extension methods inherit BCL's default implementations on top of the methods above.
 
 ### TripleBuffer contract (consolidated; relied on by §1–§6)
@@ -174,7 +174,7 @@ Steps 2–4 are unordered; only the position of *all of them* before step 6 matt
 | Linked list (`Next` pointers) | Writer | Reader walks but never mutates |
 | `BufferSegment` objects | Writer (allocated via freelist) | Reader holds references via `_readHead`, `_readTail`, and acquired `WriterState`s |
 | `IMemoryOwner<byte>` per segment | Writer (rents from `_options.Pool`) | None directly; reader sees buffer via `BufferSegment.Memory` |
-| `IMemoryOwner<byte>` (donated, post-2026-04-28-Append) | Writer (adopted from caller via `Append`) | None directly; reader sees buffer via `BufferSegment.Memory`. Released on recycle (`DisposeOwned`) or `SpscPipe.Dispose`. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` |
+| `IMemoryOwner<byte>` (donated, post-2026-04-28-Append) | Writer (adopted from caller via `Append`) | None directly; reader sees buffer via `BufferSegment.Memory`. Released on recycle (`DisposeOwned`) or `Pipe.Dispose`. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` |
 | Freelist of recyclable segments | Writer-private | None |
 | `_chainHead` / `_writingHead` | Writer-private | None |
 | `_readHead` / `_readTail` cursors | Reader-private | None |
@@ -230,7 +230,7 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
 }
 ```
 
-**Buffer-ownership transfer (post-2026-04-28).** `BufferSegment` gained an `IsDonated : bool` field and an `AdoptFrom(IMemoryOwner<byte>, Memory<byte>, long, object)` initializer to support `SpscPipeWriter.Append`'s buffer-ownership-transfer path. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §3 for the full definition. The recycle path (this section) branches on `IsDonated`: rented → `PushFreelist` (existing); donated → `DisposeOwned()` and discard.
+**Buffer-ownership transfer (post-2026-04-28).** `BufferSegment` gained an `IsDonated : bool` field and an `AdoptFrom(IMemoryOwner<byte>, Memory<byte>, long, object)` initializer to support `PipeWriter.Append`'s buffer-ownership-transfer path. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §3 for the full definition. The recycle path (this section) branches on `IsDonated`: rented → `PushFreelist` (existing); donated → `DisposeOwned()` and discard.
 
 **Note on `Next` semantics.** `BufferSegment.Next` is overloaded to serve both the live chain (when the segment is in `_chainHead..._writingHead`) and the writer-private freelist (when sitting on the freelist). Its semantics are well-defined only conditional on which list the segment is currently in. Recycling clears `Next` (`RecycleReset`); freelist push sets `Next` to the freelist's previous head; allocation pop reads it; `Freeze` sets `Next` to the new tail.
 
@@ -332,7 +332,7 @@ Edge cases:
 
 ### Lifecycle: cleanup on Dispose
 
-`SpscPipe.Dispose()` walks the chain and the freelist, calling `BufferSegment.DisposeOwned()` on each to release `IMemoryOwner` rentals. Idempotent: a `_disposed` flag at the top of `Dispose` short-circuits subsequent calls. Also disposes leftover awaiter `_ctr` registrations (R4-1: closes a CTR-rooting leak when a token-cancelled awaiter is never followed by another park to clean up — `SpscPipe` is otherwise rooted by the `CancellationTokenSource`'s callback list for the lifetime of the CTS).
+`Pipe.Dispose()` walks the chain and the freelist, calling `BufferSegment.DisposeOwned()` on each to release `IMemoryOwner` rentals. Idempotent: a `_disposed` flag at the top of `Dispose` short-circuits subsequent calls. Also disposes leftover awaiter `_ctr` registrations (R4-1: closes a CTR-rooting leak when a token-cancelled awaiter is never followed by another park to clean up — `Pipe` is otherwise rooted by the `CancellationTokenSource`'s callback list for the lifetime of the CTS).
 
 ```csharp
 public void Dispose()
@@ -348,7 +348,7 @@ public void Dispose()
 
 **Precondition:** no operation is currently in flight on either side, **and no `ReadResult.Buffer` references are still held by the user**. The buffer references segments whose `IMemoryOwner` will be released; accessing them after `Dispose` is use-after-free. After `Dispose`, the pipe is unusable: every public method's entry guard checks `_disposed` first (after the `_writerCompleted`/`_readerCompleted` check is the wrong order — `_disposed` should be first). Calls after `Dispose` throw `ObjectDisposedException`. Implementations should add this guard to every public method shown in Section 4 (omitted from the pseudocode samples for brevity, but load-bearing for the contract).
 
-`SpscPipe` implements `IDisposable`; `BCL.Pipe` does not. This is a documented divergence (justified because we don't expose `Reset` and segments need explicit memory release).
+`Pipe` implements `IDisposable`; `BCL.Pipe` does not. This is a documented divergence (justified because we don't expose `Reset` and segments need explicit memory release).
 
 ### Key takeaways for Section 3
 
@@ -439,8 +439,8 @@ ValueTask<FlushResult> FlushAsync(CancellationToken ct)
     while (true)
     {
         int oldV = _flushAwaiter._state;
-        if ((oldV & SpscAwaiter.CancelFlag) == 0) break;
-        int desired = oldV & ~SpscAwaiter.CancelFlag;
+        if ((oldV & PipelyAwaiter.CancelFlag) == 0) break;
+        int desired = oldV & ~PipelyAwaiter.CancelFlag;
         if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
             return new ValueTask<FlushResult>(BuildFlushResult(isCanceled: true));
     }
@@ -518,8 +518,8 @@ ValueTask<ReadResult> ReadAsync(CancellationToken ct)
     while (true)
     {
         int oldV = _readAwaiter._state;
-        if ((oldV & SpscAwaiter.CancelFlag) == 0) break;
-        int desired = oldV & ~SpscAwaiter.CancelFlag;
+        if ((oldV & PipelyAwaiter.CancelFlag) == 0) break;
+        int desired = oldV & ~PipelyAwaiter.CancelFlag;
         if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
             return new ValueTask<ReadResult>(BuildReadResult(isCanceled: true));
     }
@@ -572,8 +572,8 @@ bool TryRead(out ReadResult result)
     while (true)
     {
         int oldV = _readAwaiter._state;
-        if ((oldV & SpscAwaiter.CancelFlag) == 0) break;
-        int desired = oldV & ~SpscAwaiter.CancelFlag;
+        if ((oldV & PipelyAwaiter.CancelFlag) == 0) break;
+        int desired = oldV & ~PipelyAwaiter.CancelFlag;
         if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
         {
             result = BuildReadResult(isCanceled: true);
@@ -710,14 +710,14 @@ ReadResult BuildReadResult(bool isCanceled)
 ### Awaiter shape (single packed `int` + Pattern 2 stash)
 
 ```csharp
-internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
+internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
 {
     public ManualResetValueTaskSourceCore<T> _core;
     public int _state;                          // packed: bit 0 = state, bit 1 = cancel flag
     public CancellationTokenRegistration _ctr;
     public CancellationToken _token;            // cached for OCE construction; set at park, read by token callback
 
-    // Stash for Pattern 2. Used by SpscAwaiter<ReadResult>; ignored by SpscAwaiter<FlushResult>
+    // Stash for Pattern 2. Used by PipelyAwaiter<ReadResult>; ignored by PipelyAwaiter<FlushResult>
     // (FlushResult has no buffer; ~24 bytes wasted per pipe — implementation may split the type
     // into two non-generic awaiter classes if the savings matter).
     // Set by reader at park time, read by signaler/canceler after CASing out of Pending.
@@ -726,7 +726,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     public BufferSegment? _stashTail;       // R2-5: extended for cancel-while-parked buffer reconstruction
     public int            _stashTailIdx;
 
-    // Source-side EC-capture stash. Set by SpscAwaiter.OnCompleted on the consumer's thread
+    // Source-side EC-capture stash. Set by PipelyAwaiter.OnCompleted on the consumer's thread
     // BEFORE delegating to _core.OnCompleted (visible by the time s_dispatch reads them, in
     // both the OnCompleted-fires-first and SetResult-fires-first races; see §4 publication
     // ordering in the source-side EC-capture spec). Read by s_invokeWithEc on the dispatcher's
@@ -747,7 +747,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
     public const int StateMask  = 0b01;
     public const int CancelFlag = 0b10;
 
-    public SpscAwaiter(IContinuationDispatcher dispatcher) => _dispatcher = dispatcher;
+    public PipelyAwaiter(IContinuationDispatcher dispatcher) => _dispatcher = dispatcher;
 
     public short Version => _core.Version;
     public T GetResult(short token) => _core.GetResult(token);
@@ -756,23 +756,23 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
 }
 ```
 
-Two states (`Inactive` / `Pending`) suffice; "how was this completed" lives in `_core`'s status. Every `_state` mutation is `Interlocked.CompareExchange` or `Interlocked.Or`. (Note: `public` fields with leading underscore is unusual for C# — implementation may make them `internal` with `InternalsVisibleTo` to `SpscPipe`, or merge the classes; cosmetic.)
+Two states (`Inactive` / `Pending`) suffice; "how was this completed" lives in `_core`'s status. Every `_state` mutation is `Interlocked.CompareExchange` or `Interlocked.Or`. (Note: `public` fields with leading underscore is unusual for C# — implementation may make them `internal` with `InternalsVisibleTo` to `Pipe`, or merge the classes; cosmetic.)
 
 **Field-access discipline.** `_state` is the only field touched by all four actors (owner / signaler / canceler / token callback). Other fields:
 - `_token` is written by the owner before CAS Inactive→Pending; read by the token callback after CAS Pending→Inactive succeeds. Synchronization rides on `_state`'s CAS. Field reuse across cycles is safe because `CancellationTokenRegistration.Dispose()` blocks on in-flight callbacks, so the prior cycle's callback completes before the next cycle's `_token = ct` write.
 - `_ctr` is written by the owner *after* CAS Inactive→Pending. **Important: the CAS does NOT release-publish `_ctr`** — there is no synchronizes-with edge between the owner's `_ctr = …` write and a signaler/canceler that wins CAS Pending→Inactive between the owner's CAS and the owner's `_ctr` write. Safety rests on two distinct properties: (a) `CancellationTokenRegistration` is a small struct and `Dispose()` is **idempotent and tolerant of default/torn input** — disposing a default or partially-published value at worst no-ops; (b) the owner's R5 re-check (`if (_state != Pending) _ctr.Dispose()`) ensures the owner disposes the by-then-fully-written value if a signaler/canceler beat it to the CAS. This guarantees at-least-once Dispose. The R5b (start-of-next-park dispose) handles the orthogonal token-callback-wins case where the callback won the CAS but didn't dispose. Future maintainers must not "optimize away" the R5 re-check on the assumption that `_state` publishes `_ctr` — it doesn't.
 - Stash fields (`_stashHead`, `_stashHeadIdx`, `_stashTail`, `_stashTailIdx`) are written by the owner *before* CAS Inactive→Pending; read by the signaler or canceler after CAS Pending→Inactive succeeds. The CAS's release/acquire ordering does cover these. Stash fields are not cleared after read; they retain references to BufferSegments until the next park overwrites them (one-cycle pin, parallel to TripleBuffer slot retention; benign).
-- Source-side EC stash fields (`_realContinuation`, `_realState`, `_capturedEC`) are written by `SpscAwaiter.OnCompleted` on the **consumer's thread** before delegating to `_core.OnCompleted`. They are read by `s_invokeWithEc` on the **dispatcher's chosen thread** (after `s_dispatch` queued the work item via `IContinuationDispatcher.UnsafeQueueUserWorkItem`). Visibility chain: `OnCompleted`'s `Volatile.Write` ⟹ `_core.OnCompleted`'s register/queue ⟹ (in the OnCompleted-fires-first race) `_core.SetResult`/`SetException` invoking `s_dispatch` inline ⟹ dispatcher's `UnsafeQueueUserWorkItem` happens-before to dequeued `s_invokeWithEc`; or (in the SetResult-fires-first race) `MRVTSC` queues `s_dispatch` to TP, TP dequeue HB to dispatcher's queue, dispatcher's HB to `s_invokeWithEc`. Either path makes the writes visible to the reads. `s_invokeWithEc` clears the fields after reading (hygiene — releases references to delivered `ReadResult`/exception/EC between park cycles).
+- Source-side EC stash fields (`_realContinuation`, `_realState`, `_capturedEC`) are written by `PipelyAwaiter.OnCompleted` on the **consumer's thread** before delegating to `_core.OnCompleted`. They are read by `s_invokeWithEc` on the **dispatcher's chosen thread** (after `s_dispatch` queued the work item via `IContinuationDispatcher.UnsafeQueueUserWorkItem`). Visibility chain: `OnCompleted`'s `Volatile.Write` ⟹ `_core.OnCompleted`'s register/queue ⟹ (in the OnCompleted-fires-first race) `_core.SetResult`/`SetException` invoking `s_dispatch` inline ⟹ dispatcher's `UnsafeQueueUserWorkItem` happens-before to dequeued `s_invokeWithEc`; or (in the SetResult-fires-first race) `MRVTSC` queues `s_dispatch` to TP, TP dequeue HB to dispatcher's queue, dispatcher's HB to `s_invokeWithEc`. Either path makes the writes visible to the reads. `s_invokeWithEc` clears the fields after reading (hygiene — releases references to delivered `ReadResult`/exception/EC between park cycles).
 
 **On Pattern 2 (stash-and-construct).** The signaler runs on the writer thread (for the read awaiter); constructing a `ReadResult` requires reader-private cursors per I3. To avoid Pattern 1's thread-affinity constraint, the reader stashes its full cursor (head + tail) at park time. The signaler combines the stash with `_lastPublishedWriterState` (writer-private, freshest just before signaling) to construct the `ReadResult` and hand it off via the stash-and-dispatch sequence (see `### Continuation dispatch` below; per R10). The canceler-while-parked path uses the same stash to construct a buffer reflecting **park-time** contents — bytes the writer publishes between the reader's park and the cancel-from-third-thread are *not* in the cancel result; they surface on the next `ReadAsync` (documented top-level divergence from BCL, which constructs from current committed state). The stash is also not refreshed by `ParkReadAwaiter`'s lost-wakeup integrate; refreshing it would introduce a torn-stash window for a concurrent canceler.
 
 ### Continuation dispatch
 
-`_core.RunContinuationsAsynchronously` is set to `false` **once at construction** (not per-`Reset` — `ManualResetValueTaskSourceCore<T>.Reset` does not reset this flag). With RCA = false, `_core.SetResult` / `_core.SetException` invokes the registered continuation **inline on whatever thread calls it**. SpscPipe never calls `_core.SetResult` / `_core.SetException` directly from a signaler / canceler / token-callback / park re-check; instead, every signal-path site that decides "the parked awaiter is being released" hands off through the configured `IContinuationDispatcher`. This dispatcher hop replaces MRVTSC's internal TP queueing (which RCA = true would otherwise perform). The default dispatcher forwards to `ThreadPool.UnsafeQueueUserWorkItem`, preserving the prior RCA = true configuration's observable behavior: no inline execution on the signaler thread, no unbounded stack depth, no reentrancy hazard under bursty workloads. A custom dispatcher can route the callback to a user-controlled thread (see §6 `IContinuationDispatcher`).
+`_core.RunContinuationsAsynchronously` is set to `false` **once at construction** (not per-`Reset` — `ManualResetValueTaskSourceCore<T>.Reset` does not reset this flag). With RCA = false, `_core.SetResult` / `_core.SetException` invokes the registered continuation **inline on whatever thread calls it**. Pipe never calls `_core.SetResult` / `_core.SetException` directly from a signaler / canceler / token-callback / park re-check; instead, every signal-path site that decides "the parked awaiter is being released" hands off through the configured `IContinuationDispatcher`. This dispatcher hop replaces MRVTSC's internal TP queueing (which RCA = true would otherwise perform). The default dispatcher forwards to `ThreadPool.UnsafeQueueUserWorkItem`, preserving the prior RCA = true configuration's observable behavior: no inline execution on the signaler thread, no unbounded stack depth, no reentrancy hazard under bursty workloads. A custom dispatcher can route the callback to a user-controlled thread (see §6 `IContinuationDispatcher`).
 
 The protocol is:
 
-1. **Consumer's `await` reaches `OnCompleted`.** `SpscAwaiter.OnCompleted` runs on the consumer's thread, captures `ExecutionContext` (gated by `FlowExecutionContext`), writes `_realContinuation` / `_realState` / `_capturedEC` via `Volatile.Write`, and forwards `(s_dispatch, this, token, flags & ~suppressed)` to `_core.OnCompleted` — where `suppressed = FlowExecutionContext | UseSchedulingContext`.
+1. **Consumer's `await` reaches `OnCompleted`.** `PipelyAwaiter.OnCompleted` runs on the consumer's thread, captures `ExecutionContext` (gated by `FlowExecutionContext`), writes `_realContinuation` / `_realState` / `_capturedEC` via `Volatile.Write`, and forwards `(s_dispatch, this, token, flags & ~suppressed)` to `_core.OnCompleted` — where `suppressed = FlowExecutionContext | UseSchedulingContext`.
 2. **Producer signals.** Some actor (signaler / canceler / token callback / park re-check) wins CAS Pending→Inactive and calls `_xxxAwaiter._core.SetResult(value)` or `_core.SetException(ex)` directly on the producer's thread (no stashing).
 3. **MRVTSC dispatches.** `_core.RunContinuationsAsynchronously = false`, so `_core.SetResult` / `_core.SetException` invokes the registered `s_dispatch` callback inline on the producer's thread.
 4. **`s_dispatch` routes through the dispatcher.** It reads `awaiter._dispatcher` (set at construction) and calls `dispatcher.UnsafeQueueUserWorkItem(s_invokeWithEc, awaiter)`. The dispatcher hands the work item to its chosen thread.
@@ -780,7 +780,7 @@ The protocol is:
 
 In the **`SetResult`-fires-first race** — producer signals before consumer has called `OnCompleted` — `MRVTSC` records the result, finds `_continuation` null, and queues `s_dispatch` to the ThreadPool when `OnCompleted` is later called. The TP-dispatched `s_dispatch` then performs steps 4-5 above. Correctness rests on publication ordering in `OnCompleted`: `_realContinuation` / `_realState` / `_capturedEC` are written via `Volatile.Write` BEFORE `_core.OnCompleted`, so the TP-dispatched `s_dispatch` reads them post-publication.
 
-The two static delegates (per `SpscAwaiter<T>`'s type parameter) are:
+The two static delegates (per `PipelyAwaiter<T>`'s type parameter) are:
 
 - `s_dispatch` — registered with `_core.OnCompleted`; routes through the dispatcher.
 - `s_invokeWithEc` — registered with the dispatcher; applies EC and invokes the real continuation.
@@ -791,7 +791,7 @@ Lost-wakeup re-check paths inside `ParkReadAwaiter` / `ParkFlushAwaiter` that **
 
 **Allocation cost.** Zero allocations per dispatch: `s_dispatch` and `s_invokeWithEc` are allocated once at type-init; `_realContinuation` / `_realState` / `_capturedEC` are direct field writes on the existing awaiter object; the dispatcher receives `(Action<object?>, object?)` with `state = awaiter`. The `ExecutionContext.Run` invocation in `s_invokeWithEc` uses worker-thread-only scratch fields (`_runCb` / `_runState`) plus the static `s_runContinuation` `ContextCallback`, so no per-dispatch closure or tuple is allocated. Per-dispatch overhead vs. the prior wiring: one extra virtual call into the dispatcher (~1-2 ns); should be invisible in throughput benchmarks.
 
-**Source-side EC capture / apply discipline (I16).** ExecutionContext capture for await continuations occurs in `SpscAwaiter.OnCompleted` on the **consumer's** thread, gated by `FlowExecutionContext`. The capture is stored on the awaiter (`_capturedEC`) and applied in `s_invokeWithEc` via `ExecutionContext.Run` on the dispatcher's chosen thread. `IContinuationDispatcher` implementations MUST NOT capture or apply an ExecutionContext themselves; their role is purely to route the callback to a thread. Implementations using `ThreadPool.UnsafeQueueUserWorkItem` satisfy this trivially; implementations using `ThreadPool.QueueUserWorkItem` or `Task.Run` capture EC redundantly (wasteful, but does not break the consumer's EC because `s_invokeWithEc` applies the source-side captured EC anyway). The contract is convention rather than statically enforced; tests should include an EC-leak guard against a "buggy" dispatcher that captures EC.
+**Source-side EC capture / apply discipline (I16).** ExecutionContext capture for await continuations occurs in `PipelyAwaiter.OnCompleted` on the **consumer's** thread, gated by `FlowExecutionContext`. The capture is stored on the awaiter (`_capturedEC`) and applied in `s_invokeWithEc` via `ExecutionContext.Run` on the dispatcher's chosen thread. `IContinuationDispatcher` implementations MUST NOT capture or apply an ExecutionContext themselves; their role is purely to route the callback to a thread. Implementations using `ThreadPool.UnsafeQueueUserWorkItem` satisfy this trivially; implementations using `ThreadPool.QueueUserWorkItem` or `Task.Run` capture EC redundantly (wasteful, but does not break the consumer's EC because `s_invokeWithEc` applies the source-side captured EC anyway). The contract is convention rather than statically enforced; tests should include an EC-leak guard against a "buggy" dispatcher that captures EC.
 
 **SynchronizationContext / TaskScheduler interaction.** See §3.3 of the source-side EC-capture spec for the public contract — both SC and TaskScheduler captured by the consumer's await are stripped from the flags forwarded to `_core.OnCompleted`, so the dispatcher's chosen thread is always honored.
 
@@ -881,7 +881,7 @@ ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
     }
 
     // 4. Register token; clean up CTR if someone completed during register (R5).
-    _readAwaiter._ctr = ct.UnsafeRegister(static p => ((SpscPipe)p!).OnReadAwaiterTokenCancel(), this);
+    _readAwaiter._ctr = ct.UnsafeRegister(static p => ((Pipe)p!).OnReadAwaiterTokenCancel(), this);
     if ((_readAwaiter._state & StateMask) != Pending)
         _readAwaiter._ctr.Dispose();
     return new ValueTask<ReadResult>(_readAwaiter, _readAwaiter.Version);
@@ -1021,7 +1021,7 @@ ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
     }
 
     // 4. Register token.
-    _flushAwaiter._ctr = ct.UnsafeRegister(static p => ((SpscPipe)p!).OnFlushAwaiterTokenCancel(), this);
+    _flushAwaiter._ctr = ct.UnsafeRegister(static p => ((Pipe)p!).OnFlushAwaiterTokenCancel(), this);
     if ((_flushAwaiter._state & StateMask) != Pending)
         _flushAwaiter._ctr.Dispose();
     return new ValueTask<FlushResult>(_flushAwaiter, _flushAwaiter.Version);
@@ -1036,7 +1036,7 @@ ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
 void SignalFlushIfBackpressureRelieved()
 {
     // Fast path: no parked writer.
-    if ((_flushAwaiter._state & SpscAwaiter.StateMask) != SpscAwaiter.Pending) return;
+    if ((_flushAwaiter._state & PipelyAwaiter.StateMask) != PipelyAwaiter.Pending) return;
 
     // Refresh writer state to compute unconsumed accurately.
     if (_writerTb.TryAcquire())
@@ -1053,8 +1053,8 @@ void SignalFlushIfBackpressureRelieved()
     while (true)
     {
         int oldV = _flushAwaiter._state;
-        if ((oldV & SpscAwaiter.StateMask) != SpscAwaiter.Pending) return;
-        int desired = oldV & ~SpscAwaiter.StateMask;
+        if ((oldV & PipelyAwaiter.StateMask) != PipelyAwaiter.Pending) return;
+        int desired = oldV & ~PipelyAwaiter.StateMask;
         if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
         {
             _flushAwaiter._ctr.Dispose();
@@ -1070,8 +1070,8 @@ void SignalFlushAwaiterIfPending()
     while (true)
     {
         int oldV = _flushAwaiter._state;
-        if ((oldV & SpscAwaiter.StateMask) != SpscAwaiter.Pending) return;
-        int desired = oldV & ~SpscAwaiter.StateMask;
+        if ((oldV & PipelyAwaiter.StateMask) != PipelyAwaiter.Pending) return;
+        int desired = oldV & ~PipelyAwaiter.StateMask;
         if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
         {
             _flushAwaiter._ctr.Dispose();
@@ -1101,8 +1101,8 @@ void OnFlushAwaiterTokenCancel()
     while (true)
     {
         int oldV = _flushAwaiter._state;
-        if ((oldV & SpscAwaiter.StateMask) != SpscAwaiter.Pending) return;
-        int desired = oldV & ~SpscAwaiter.StateMask;
+        if ((oldV & PipelyAwaiter.StateMask) != PipelyAwaiter.Pending) return;
+        int desired = oldV & ~PipelyAwaiter.StateMask;
         if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
         {
             // Shorthand: stash OCE + dispatch via IContinuationDispatcher.
@@ -1263,10 +1263,10 @@ Without step 5's re-check, the reader would be parked indefinitely.
 
 Per the brainstorm decision (compatible BCL subset), no `Reset` is exposed. The lifecycle surface is `Complete(ex?)` per side, plus `Dispose()` for memory release. The completion-exception model follows BCL strictly (Option A from the M4 review).
 
-### `SpscPipeOptions` (S9)
+### `PipeOptions` (S9)
 
 ```csharp
-public sealed class SpscPipeOptions
+public sealed class PipeOptions
 {
     public MemoryPool<byte> Pool { get; }                       // default: MemoryPool<byte>.Shared
     public int MinimumSegmentSize { get; }                      // default: 4096
@@ -1276,7 +1276,7 @@ public sealed class SpscPipeOptions
     public IContinuationDispatcher? ContinuationDispatcher { get; init; }
         // default: null → uses ThreadPoolContinuationDispatcher.Instance (TP, identical to BCL behavior)
 
-    public SpscPipeOptions(
+    public PipeOptions(
         MemoryPool<byte>? pool = null,
         int minimumSegmentSize = 4096,
         long pauseWriterThreshold = 65536,
@@ -1297,13 +1297,13 @@ public sealed class SpscPipeOptions
         MaxFreelistSegments   = maxFreelistSegments;
     }
 
-    public static SpscPipeOptions Default { get; } = new();
+    public static PipeOptions Default { get; } = new();
 }
 
-public sealed class SpscPipe : IDisposable
+public sealed class Pipe : IDisposable
 {
-    public SpscPipe() : this(SpscPipeOptions.Default) { }
-    public SpscPipe(SpscPipeOptions options) { _options = options; /* ... */ }
+    public Pipe() : this(PipeOptions.Default) { }
+    public Pipe(PipeOptions options) { _options = options; /* ... */ }
 
     public PipeReader Reader { get; }
     public PipeWriter Writer { get; }
@@ -1314,14 +1314,14 @@ public sealed class SpscPipe : IDisposable
 
 `PauseWriterThreshold = 0` means unbounded (writer never parks). Validation matches BCL's `PipeOptions` shape; defaults match BCL's defaults. `MaxFreelistSegments` is our addition (N4). `ContinuationDispatcher` is `init`-only (per-pipe, immutable after construction); leaving it null preserves the prior RCA = true configuration's observable behavior — every awaited continuation runs on a ThreadPool worker.
 
-**Visibility revision (post-2026-04-28).** `SpscPipeWriter` is now `public` (was `internal`) and is no longer nested inside `SpscPipe`. `SpscPipe.Writer`'s declared return type widens to `SpscPipeWriter`. Source-compatible with existing `PipeWriter w = pipe.Writer;` callers via implicit upcast. `SpscPipeReader` stays `internal` — no reader-side surface addition motivates exposing it. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §6.
+**Visibility revision (post-2026-04-28).** `PipeWriter` is now `public` (was `internal`) and is no longer nested inside `Pipe`. `Pipe.Writer`'s declared return type widens to `PipeWriter`. Source-compatible with existing `PipeWriter w = pipe.Writer;` callers via implicit upcast. `PipeReader` stays `internal` — no reader-side surface addition motivates exposing it. See `2026-04-28-spsc-pipe-buffer-ownership-transfer-design.md` §6.
 
 ### `IContinuationDispatcher`
 
-`SpscPipe` parks awaiters when the wake condition is unmet (no published data for `ReadAsync`, backpressure unrelieved for `FlushAsync`). When a producer subsequently signals the parked side, the *continuation* registered on that awaiter must run somewhere. By default that "somewhere" is the .NET ThreadPool, via `ThreadPool.UnsafeQueueUserWorkItem`. The pluggable `IContinuationDispatcher` interface lets a user supply a different routing — most commonly, a hot-handoff to a dedicated busy-spinning thread on a pinned core, escaping the TP wake-gap latency (~390-500 ns at P50, multi-µs at P99) for high-frequency single-stream workloads.
+`Pipe` parks awaiters when the wake condition is unmet (no published data for `ReadAsync`, backpressure unrelieved for `FlushAsync`). When a producer subsequently signals the parked side, the *continuation* registered on that awaiter must run somewhere. By default that "somewhere" is the .NET ThreadPool, via `ThreadPool.UnsafeQueueUserWorkItem`. The pluggable `IContinuationDispatcher` interface lets a user supply a different routing — most commonly, a hot-handoff to a dedicated busy-spinning thread on a pinned core, escaping the TP wake-gap latency (~390-500 ns at P50, multi-µs at P99) for high-frequency single-stream workloads.
 
 ```csharp
-namespace SpscPipelines;
+namespace Pipely;
 
 public interface IContinuationDispatcher
 {
@@ -1331,7 +1331,7 @@ public interface IContinuationDispatcher
     ///
     /// 1. The callback MUST be invoked exactly once.
     /// 2. The implementation MUST NOT capture or apply an ExecutionContext.
-    ///    SpscPipe captures EC in SpscAwaiter.OnCompleted (source-side) and applies it
+    ///    Pipe captures EC in PipelyAwaiter.OnCompleted (source-side) and applies it
     ///    in s_invokeWithEc via ExecutionContext.Run on the dispatcher's chosen thread.
     ///    Adding EC manipulation in the dispatcher is redundant (wasteful) but does not
     ///    break correctness because s_invokeWithEc applies the source-side captured EC
@@ -1361,17 +1361,17 @@ internal sealed class ThreadPoolContinuationDispatcher : IContinuationDispatcher
 }
 ```
 
-When `SpscPipeOptions.ContinuationDispatcher` is `null`, the pipe uses `ThreadPoolContinuationDispatcher.Instance`. See §5 "Continuation dispatch" and invariant I16 for the stash-and-dispatch protocol and EC discipline.
+When `PipeOptions.ContinuationDispatcher` is `null`, the pipe uses `ThreadPoolContinuationDispatcher.Instance`. See §5 "Continuation dispatch" and invariant I16 for the stash-and-dispatch protocol and EC discipline.
 
-**Why `Action<object?>` and `UnsafeQueueUserWorkItem`-shaped naming.** The signature exactly matches `ThreadPool.UnsafeQueueUserWorkItem`'s, so the canonical implementation is a one-line forwarder and the EC-non-capture contract is explicit in the method name (mirroring the BCL primitive that has the matching semantics). An alternative `IThreadPoolWorkItem`-style struct API would avoid an `Action<object?>` allocation, but SpscAwaiter<T>'s static delegates (`s_dispatch`, `s_invokeWithEc`, `s_runContinuation`) are allocated once at type-init, so there is no per-dispatch delegate alloc to optimize away.
+**Why `Action<object?>` and `UnsafeQueueUserWorkItem`-shaped naming.** The signature exactly matches `ThreadPool.UnsafeQueueUserWorkItem`'s, so the canonical implementation is a one-line forwarder and the EC-non-capture contract is explicit in the method name (mirroring the BCL primitive that has the matching semantics). An alternative `IThreadPoolWorkItem`-style struct API would avoid an `Action<object?>` allocation, but PipelyAwaiter<T>'s static delegates (`s_dispatch`, `s_invokeWithEc`, `s_runContinuation`) are allocated once at type-init, so there is no per-dispatch delegate alloc to optimize away.
 
 ### Scheduler bypass
 
-`SpscPipe`'s `Reader.ReadAsync` and `Writer.FlushAsync` continuations do **not** honor the consumer's captured `SynchronizationContext` or `TaskScheduler`. The continuation runs on the thread chosen by the configured `IContinuationDispatcher` (default: the .NET `ThreadPool` via `ThreadPoolContinuationDispatcher`). This is independent of the consumer's `ConfigureAwait(true|false)` choice — both produce identical observable behavior. The implementation enforces this by stripping `ValueTaskSourceOnCompletedFlags.UseSchedulingContext` from the flags forwarded to `_core.OnCompleted` in `SpscAwaiter<T>.OnCompleted` (see the source-side EC-capture spec, §2.2 and §3.3).
+`Pipe`'s `Reader.ReadAsync` and `Writer.FlushAsync` continuations do **not** honor the consumer's captured `SynchronizationContext` or `TaskScheduler`. The continuation runs on the thread chosen by the configured `IContinuationDispatcher` (default: the .NET `ThreadPool` via `ThreadPoolContinuationDispatcher`). This is independent of the consumer's `ConfigureAwait(true|false)` choice — both produce identical observable behavior. The implementation enforces this by stripping `ValueTaskSourceOnCompletedFlags.UseSchedulingContext` from the flags forwarded to `_core.OnCompleted` in `PipelyAwaiter<T>.OnCompleted` (see the source-side EC-capture spec, §2.2 and §3.3).
 
 Consumers requiring continuation on a specific scheduler should either: (a) post explicitly via `SynchronizationContext.Post` / `TaskScheduler.FromCurrentSynchronizationContext().StartNew` after the `await`, or (b) wrap the awaitable in a `Task.Run` to capture context boundaries.
 
-This is a deliberate contract choice, not an implementation accident. `SpscPipe` is a high-throughput primitive aimed at server-side workloads where consumer-side scheduler capture is not the desired routing.
+This is a deliberate contract choice, not an implementation accident. `Pipe` is a high-throughput primitive aimed at server-side workloads where consumer-side scheduler capture is not the desired routing.
 
 ### Completion overview
 
@@ -1465,14 +1465,14 @@ If a sticky `CancelPending*` is consumed on a post-`Writer.Complete(null)` read,
 - **`Dispose` on a never-used pipe.** Safe; the chain and freelist are empty.
 - **`AdvanceTo` argument validation (R8).** Monotonicity + upper bound against `_lastAcquiredWriterState.TotalWritten`. No buffer-specific validation (documented BCL divergence; catches silent-hang failure mode).
 - **`AdvanceTo` on `default(SequencePosition)`.** Treated as a no-op (with publish), per N6 — handles the "AdvanceTo after empty `IsCompleted=true` ReadResult" case without NPE.
-- **`AdvanceTo` with a `SequencePosition` from a different `SpscPipe` instance.** The upper-bound check (`examined ≤ TotalWritten`) catches obvious cases but does not detect cross-pipe references in general. Implementation should consider adding a per-segment back-reference to the owning `SpscPipe` (or a pipe-identity tag) so `AdvanceTo` can throw `InvalidOperationException` rather than silently corrupting another pipe's state. Treated as a defense-in-depth opportunity for the implementation plan, not a spec-level requirement.
+- **`AdvanceTo` with a `SequencePosition` from a different `Pipe` instance.** The upper-bound check (`examined ≤ TotalWritten`) catches obvious cases but does not detect cross-pipe references in general. Implementation should consider adding a per-segment back-reference to the owning `Pipe` (or a pipe-identity tag) so `AdvanceTo` can throw `InvalidOperationException` rather than silently corrupting another pipe's state. Treated as a defense-in-depth opportunity for the implementation plan, not a spec-level requirement.
 - **`Reader.Complete` while a `ReadResult.Buffer` is outstanding.** The writer's next `FlushAsync` sweeps the entire chain (because `Reader.Complete` publishes `HeadSegment = null, IsCompleted = true`). Segments returned to the freelist may be re-rented and overwritten. Outstanding `ReadResult.Buffer` references must therefore not be accessed after `Reader.Complete` returns (parallel to the `Dispose` precondition). The implementation's public XML doc on `Reader.Complete` should state this explicitly.
 - **`CancelPendingRead` + token cancellation interaction.** If both fire concurrently, they race on the CAS out of `Pending`. The winner's path is delivered (canceled result vs. OCE throw). The loser's intent is preserved as the sticky cancel flag (if canceler lost) — surfaces on next call.
 - **`RunningIndex` overflow.** `RunningIndex` is `long`; overflow at ~9 EB. Out of scope.
 
 ### Cleanup / Dispose
 
-`SpscPipe.Dispose()` walks the chain and freelist, disposing each `BufferSegment`'s `IMemoryOwner`. Precondition: no operation is currently in flight on either side, and no `ReadResult.Buffer` references are still held by the user (use-after-free risk on segment memory). After `Dispose`, the pipe is unusable.
+`Pipe.Dispose()` walks the chain and freelist, disposing each `BufferSegment`'s `IMemoryOwner`. Precondition: no operation is currently in flight on either side, and no `ReadResult.Buffer` references are still held by the user (use-after-free risk on segment memory). After `Dispose`, the pipe is unusable.
 
 ### Key takeaways for Section 6
 
@@ -1482,7 +1482,7 @@ If a sticky `CancelPending*` is consumed on a post-`Writer.Complete(null)` read,
 - `IsCanceled` and `IsCompleted` flags are independent in `ReadResult` for `Writer.Complete(null)` cases; for `Writer.Complete(ex)` the throw fires first and cancel is dropped.
 - Five documented divergences from BCL (see top-level takeaways): no `Reset`; `IDisposable` added; `AdvanceTo` no buffer-specific upper-bound check; cancel-from-third-thread `IsCompleted=false` lag; cancel-while-parked stash-time buffer.
 - `Dispose()` releases segment + freelist memory; precondition is no in-flight ops AND no outstanding buffer refs.
-- `SpscPipeOptions.ContinuationDispatcher` is `init`-only and defaults to null (TP). User-supplied dispatchers must obey the five-item contract on `IContinuationDispatcher.UnsafeQueueUserWorkItem`; primary use case is hot-handoff to a dedicated thread for sub-µs continuation latency.
+- `PipeOptions.ContinuationDispatcher` is `init`-only and defaults to null (TP). User-supplied dispatchers must obey the five-item contract on `IContinuationDispatcher.UnsafeQueueUserWorkItem`; primary use case is hot-handoff to a dedicated thread for sub-µs continuation latency.
 
 ## Section 7 — Verifiability
 
@@ -1512,7 +1512,7 @@ The design's correctness rests on a small number of state machines and invariant
 - Cancel-while-parked buffer contents match BCL `Pipe.CancelPendingRead`.
 - Backpressure operators: pause `>=`, resume `<` (verified against BCL source 2026-04-25).
 
-**Performance goals.** This design exists because BCL's `Pipe` is too slow under SPSC scheduling — its central `lock` serializes producer and consumer. The implementation must demonstrate, on a benchmark harness (`IPipeAdapter` + `Spsc`/`Bcl` adapters; **to be (re)built as a prior implementation step** — the prior iteration's harness was removed in the Restart):
+**Performance goals.** This design exists because BCL's `Pipe` is too slow under SPSC scheduling — its central `lock` serializes producer and consumer. The implementation must demonstrate, on a benchmark harness (`IPipeAdapter` + `Pipely`/`Bcl` adapters; **to be (re)built as a prior implementation step** — the prior iteration's harness was removed in the Restart):
 
 - Materially higher throughput (bytes/sec) than BCL Pipe under steady-state SPSC workloads.
 - Comparable or better p50 latency; materially better tail (p99/p99.9) due to no lock contention.
@@ -1547,15 +1547,15 @@ Whether to actually pursue TLA+ verification is an implementation-plan decision;
 | **I12** | `CancelPending*` calls coalesce: any number of calls between two Inactive→Pending→Inactive cycles deliver at most one `IsCanceled = true` result. |
 | **I13** | After `Writer.Complete(_)`, the writer publishes nothing further (R6). The published `WriterState` is sticky with `IsCompleted=true` and `CompletionException` set if the completion was faulted. |
 | **I14** | After `Reader.Complete(_)`, the reader publishes nothing further. The published `ReaderState` has `HeadSegment = null` (allowing full chain recycle), `IsCompleted = true`, and `CompletionException` set if faulted. |
-| **I15** | `SpscPipe.Dispose()` precondition: no operation is currently in flight on either side, and no `ReadResult.Buffer` references are still held by the user. Violation is undefined behavior. |
-| **I16** | **Source-side EC capture / apply discipline.** ExecutionContext capture for await continuations occurs in `SpscAwaiter.OnCompleted` on the consumer's thread, gated by `FlowExecutionContext`. The capture is stored on the awaiter (`_capturedEC`) and applied in `s_invokeWithEc` via `ExecutionContext.Run` on the dispatcher's chosen thread. `IContinuationDispatcher` implementations MUST NOT capture or apply an ExecutionContext themselves; their role is purely to route the callback to a thread. Implementations using `ThreadPool.UnsafeQueueUserWorkItem` satisfy this trivially; implementations using `ThreadPool.QueueUserWorkItem` or `Task.Run` capture EC redundantly (wasteful, but does not break the consumer's EC because `s_invokeWithEc` applies the source-side captured EC anyway). |
+| **I15** | `Pipe.Dispose()` precondition: no operation is currently in flight on either side, and no `ReadResult.Buffer` references are still held by the user. Violation is undefined behavior. |
+| **I16** | **Source-side EC capture / apply discipline.** ExecutionContext capture for await continuations occurs in `PipelyAwaiter.OnCompleted` on the consumer's thread, gated by `FlowExecutionContext`. The capture is stored on the awaiter (`_capturedEC`) and applied in `s_invokeWithEc` via `ExecutionContext.Run` on the dispatcher's chosen thread. `IContinuationDispatcher` implementations MUST NOT capture or apply an ExecutionContext themselves; their role is purely to route the callback to a thread. Implementations using `ThreadPool.UnsafeQueueUserWorkItem` satisfy this trivially; implementations using `ThreadPool.QueueUserWorkItem` or `Task.Run` capture EC redundantly (wasteful, but does not break the consumer's EC because `s_invokeWithEc` applies the source-side captured EC anyway). |
 
 ## Consolidated rules
 
 | # | Rule |
 |---|---|
 | **R1** | Publish before signal. In any code path that both publishes a state and signals the other side's awaiter, publish first, signal second. |
-| **R2** | All `_state` mutations on `SpscAwaiter` use `Interlocked.CompareExchange` or `Interlocked.Or`. No plain or `Volatile` writes. |
+| **R2** | All `_state` mutations on `PipelyAwaiter` use `Interlocked.CompareExchange` or `Interlocked.Or`. No plain or `Volatile` writes. |
 | **R3** | Transitions out of `Pending` (signaler / canceler / token) atomically clear the state bits. The flag bit is preserved on signaler/token paths, cleared on the canceler-delivered-via-state path. The actor that wins the CAS calls the appropriate `_core.Set*`. |
 | **R4** | After CASing `Inactive → Pending`, the owner re-checks (a) the writer-completion exception (reader side) or reader-completion exception (writer side), then (b) the data state / wake condition, then (c) the cancel flag. Each re-check attempts a CAS out of `Pending` if its condition holds. **Throw-first ordering** matches the sync-entry precedence (R9). |
 | **R5** | After registering a `CancellationTokenRegistration` on `_ctr`, the registering actor must re-check `_state` and dispose `_ctr` if the awaiter is no longer in `Pending`. CTR disposal is idempotent. The owner additionally disposes `_ctr` at the start of the next `Park*Awaiter` call to clean up the token-callback-wins case (callback consumes its own registration but doesn't dispose). |

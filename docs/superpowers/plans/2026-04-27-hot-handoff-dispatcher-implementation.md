@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement `HotHandoffContinuationDispatcher` — a custom `IContinuationDispatcher` that routes `SpscPipe`'s parked-awaiter continuations to a dedicated busy-spinning thread, with `ThreadPool` overflow — in a separate project, with full test coverage and a benchmark project that measures it against the default TP dispatcher.
+**Goal:** Implement `HotHandoffContinuationDispatcher` — a custom `IContinuationDispatcher` that routes `Pipe`'s parked-awaiter continuations to a dedicated busy-spinning thread, with `ThreadPool` overflow — in a separate project, with full test coverage and a benchmark project that measures it against the default TP dispatcher.
 
 **Architecture:** Single packed `int _state` with two bit flags (`Busy=1`, `ShutdownRequested=2`). All cross-thread synchronization through `Interlocked.{CompareExchange, Or, And, Exchange}` on this one word. One slot (`_pending` callback + `_pendingState` payload). One dedicated worker thread. Dispose via `Or` + `Join`. See `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` for the full spec, including the four-races correctness argument.
 
@@ -11,29 +11,29 @@
 **Reference docs (engineer should re-read before starting):**
 - `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` — spec (architecture, invariants, correctness argument).
 - `docs/IContinuationDispatcher.md` — public-surface description and contract items.
-- `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs` — existing dispatcher tests at the SpscPipe level (useful patterns for AsyncLocal flow tests in tasks 14-16).
-- `src/SpscPipelines/IContinuationDispatcher.cs` — the interface this implementation realizes.
-- `src/SpscPipelines/SpscPipeOptions.cs` — the `ContinuationDispatcher` option that pipes use to plug us in.
+- `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs` — existing dispatcher tests at the Pipe level (useful patterns for AsyncLocal flow tests in tasks 14-16).
+- `src/Pipely/IContinuationDispatcher.cs` — the interface this implementation realizes.
+- `src/Pipely/PipeOptions.cs` — the `ContinuationDispatcher` option that pipes use to plug us in.
 
-**Working directory for all commands:** `/home/harrison/src/worktrees/SpscPipe/hot-handoff/`
+**Working directory for all commands:** `/home/harrison/src/worktrees/Pipe/hot-handoff/`
 
 ---
 
-## Task 1: Create the SpscPipelines.HotHandoff project skeleton
+## Task 1: Create the Pipely.HotHandoff project skeleton
 
 **Files:**
-- Create: `src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj`
-- Create: `src/SpscPipelines.HotHandoff/HotHandoffContinuationDispatcher.cs` (stub — full impl comes in Task 5)
+- Create: `src/Pipely.HotHandoff/Pipely.HotHandoff.csproj`
+- Create: `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs` (stub — full impl comes in Task 5)
 
 - [ ] **Step 1: Create the directory**
 
 ```bash
-mkdir -p src/SpscPipelines.HotHandoff
+mkdir -p src/Pipely.HotHandoff
 ```
 
 - [ ] **Step 2: Create the csproj**
 
-Write `src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj`:
+Write `src/Pipely.HotHandoff/Pipely.HotHandoff.csproj`:
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
@@ -46,7 +46,7 @@ Write `src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj`:
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\SpscPipelines\SpscPipelines.csproj" />
+    <ProjectReference Include="..\Pipely\Pipely.csproj" />
   </ItemGroup>
 
 </Project>
@@ -54,12 +54,12 @@ Write `src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj`:
 
 - [ ] **Step 3: Create a stub for the type so the project compiles**
 
-Write `src/SpscPipelines.HotHandoff/HotHandoffContinuationDispatcher.cs`:
+Write `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs`:
 
 ```csharp
-using SpscPipelines;
+using Pipely;
 
-namespace SpscPipelines.HotHandoff;
+namespace Pipely.HotHandoff;
 
 public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, IDisposable
 {
@@ -72,15 +72,15 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
 
 - [ ] **Step 4: Verify project compiles**
 
-Run: `dotnet build src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj`
+Run: `dotnet build src/Pipely.HotHandoff/Pipely.HotHandoff.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/SpscPipelines.HotHandoff
+git add src/Pipely.HotHandoff
 git commit -m "$(cat <<'EOF'
-HotHandoff: scaffold SpscPipelines.HotHandoff project
+HotHandoff: scaffold Pipely.HotHandoff project
 
 Empty project + stub HotHandoffContinuationDispatcher type. Real
 implementation lands in the next-task TDD step driven by test A.1.
@@ -92,21 +92,21 @@ EOF
 
 ---
 
-## Task 2: Create the SpscPipelines.HotHandoff.Tests project skeleton
+## Task 2: Create the Pipely.HotHandoff.Tests project skeleton
 
 **Files:**
-- Create: `tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.csproj`
-- Create: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs` (empty test class)
+- Create: `tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj`
+- Create: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs` (empty test class)
 
 - [ ] **Step 1: Create the directory**
 
 ```bash
-mkdir -p tests/SpscPipelines.HotHandoff.Tests
+mkdir -p tests/Pipely.HotHandoff.Tests
 ```
 
 - [ ] **Step 2: Create the csproj**
 
-Write `tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.csproj`:
+Write `tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj`:
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
@@ -130,8 +130,8 @@ Write `tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.cspro
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\SpscPipelines\SpscPipelines.csproj" />
-    <ProjectReference Include="..\..\src\SpscPipelines.HotHandoff\SpscPipelines.HotHandoff.csproj" />
+    <ProjectReference Include="..\..\src\Pipely\Pipely.csproj" />
+    <ProjectReference Include="..\..\src\Pipely.HotHandoff\Pipely.HotHandoff.csproj" />
   </ItemGroup>
 
 </Project>
@@ -139,12 +139,12 @@ Write `tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.cspro
 
 - [ ] **Step 3: Create the empty test class**
 
-Write `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`:
+Write `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`:
 
 ```csharp
-using SpscPipelines.HotHandoff;
+using Pipely.HotHandoff;
 
-namespace SpscPipelines.HotHandoff.Tests;
+namespace Pipely.HotHandoff.Tests;
 
 public class HotHandoffContinuationDispatcherTests
 {
@@ -154,15 +154,15 @@ public class HotHandoffContinuationDispatcherTests
 
 - [ ] **Step 4: Verify the test project compiles**
 
-Run: `dotnet build tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.csproj`
+Run: `dotnet build tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests
+git add tests/Pipely.HotHandoff.Tests
 git commit -m "$(cat <<'EOF'
-HotHandoff: scaffold SpscPipelines.HotHandoff.Tests project
+HotHandoff: scaffold Pipely.HotHandoff.Tests project
 
 xUnit-based test project; empty test class. Tests added per-task in
 subsequent steps following the spec's required test surface (§7).
@@ -177,63 +177,63 @@ EOF
 ## Task 3: Add both new projects to the solution
 
 **Files:**
-- Modify: `SpscPipe.slnx`
+- Modify: `Pipe.slnx`
 
 - [ ] **Step 1: Read the current slnx**
 
-Run: `cat SpscPipe.slnx`
+Run: `cat Pipe.slnx`
 Expected output:
 
 ```xml
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/SpscPipelines/SpscPipelines.csproj" />
+    <Project Path="src/Pipely/Pipely.csproj" />
   </Folder>
   <Folder Name="/tests/">
-    <Project Path="tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj" />
-    <Project Path="tests/SpscPipe.Stress/SpscPipe.Stress.csproj" />
-    <Project Path="tests/SpscPipe.Tests/SpscPipe.Tests.csproj" />
+    <Project Path="tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj" />
+    <Project Path="tests/Pipe.Stress/Pipe.Stress.csproj" />
+    <Project Path="tests/Pipe.Tests/Pipe.Tests.csproj" />
   </Folder>
 </Solution>
 ```
 
-- [ ] **Step 2: Edit `SpscPipe.slnx` to add both projects**
+- [ ] **Step 2: Edit `Pipe.slnx` to add both projects**
 
 Replace its contents with:
 
 ```xml
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/SpscPipelines/SpscPipelines.csproj" />
-    <Project Path="src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj" />
+    <Project Path="src/Pipely/Pipely.csproj" />
+    <Project Path="src/Pipely.HotHandoff/Pipely.HotHandoff.csproj" />
   </Folder>
   <Folder Name="/tests/">
-    <Project Path="tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj" />
-    <Project Path="tests/SpscPipe.Stress/SpscPipe.Stress.csproj" />
-    <Project Path="tests/SpscPipe.Tests/SpscPipe.Tests.csproj" />
-    <Project Path="tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.csproj" />
+    <Project Path="tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj" />
+    <Project Path="tests/Pipe.Stress/Pipe.Stress.csproj" />
+    <Project Path="tests/Pipe.Tests/Pipe.Tests.csproj" />
+    <Project Path="tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj" />
   </Folder>
 </Solution>
 ```
 
 - [ ] **Step 3: Build the whole solution**
 
-Run: `dotnet build SpscPipe.slnx`
+Run: `dotnet build Pipe.slnx`
 Expected: all 5 projects build (the original 4 + the new 2 visible to the solution; the new Tests project depends on the new HotHandoff project, so both must compile clean).
 
 - [ ] **Step 4: Run all tests, verify the new test project is discovered**
 
-Run: `dotnet test SpscPipe.slnx --nologo`
-Expected: all existing tests pass; the new `SpscPipelines.HotHandoff.Tests` project shows "0 tests run" (no tests yet).
+Run: `dotnet test Pipe.slnx --nologo`
+Expected: all existing tests pass; the new `Pipely.HotHandoff.Tests` project shows "0 tests run" (no tests yet).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add SpscPipe.slnx
+git add Pipe.slnx
 git commit -m "$(cat <<'EOF'
-HotHandoff: add new projects to SpscPipe.slnx
+HotHandoff: add new projects to Pipe.slnx
 
-Solution now references SpscPipelines.HotHandoff and its test project.
+Solution now references Pipely.HotHandoff and its test project.
 dotnet build and dotnet test both green.
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
@@ -248,8 +248,8 @@ EOF
 This is the architecture-establishing task. Write test A.1 (callback runs on dedicated thread), watch it fail, then implement the full state machine per `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` §3 in one go.
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
-- Modify: `src/SpscPipelines.HotHandoff/HotHandoffContinuationDispatcher.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -274,27 +274,27 @@ public void Dispatch_InvokesCallbackOnDedicatedThread()
     Assert.True(done.Wait(TimeSpan.FromSeconds(5)),
         "Callback was not invoked within 5 seconds.");
     Assert.NotEqual(Environment.CurrentManagedThreadId, observedThreadId);
-    Assert.Equal("SpscPipe HotHandoff", observedThreadName);
+    Assert.Equal("Pipe HotHandoff", observedThreadName);
 }
 ```
 
 - [ ] **Step 2: Run the test — expect it to throw `NotImplementedException`**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "Dispatch_InvokesCallbackOnDedicatedThread"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_InvokesCallbackOnDedicatedThread"`
 Expected: test fails — `UnsafeQueueUserWorkItem` throws `NotImplementedException`.
 
 - [ ] **Step 3: Implement the full state machine per spec §3**
 
-Replace the contents of `src/SpscPipelines.HotHandoff/HotHandoffContinuationDispatcher.cs` with:
+Replace the contents of `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs` with:
 
 ```csharp
-using SpscPipelines;
+using Pipely;
 
-namespace SpscPipelines.HotHandoff;
+namespace Pipely.HotHandoff;
 
 /// <summary>
 /// <see cref="IContinuationDispatcher"/> implementation that routes the first hop of
-/// each SpscPipe continuation to a dedicated busy-spinning thread, with ThreadPool
+/// each Pipe continuation to a dedicated busy-spinning thread, with ThreadPool
 /// overflow when the dedicated thread is already invoking another continuation.
 ///
 /// <para>
@@ -332,7 +332,7 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
         _thread = new Thread(Loop)
         {
             IsBackground = true,
-            Name = "SpscPipe HotHandoff",
+            Name = "Pipe HotHandoff",
         };
         _thread.Start();
     }
@@ -388,14 +388,14 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
 
 - [ ] **Step 4: Run the test — expect it to pass**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "Dispatch_InvokesCallbackOnDedicatedThread"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_InvokesCallbackOnDedicatedThread"`
 Expected: 1 test passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/SpscPipelines.HotHandoff/HotHandoffContinuationDispatcher.cs \
-        tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs \
+        tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff: implement state-machine + first dispatched-thread test
 
@@ -418,7 +418,7 @@ EOF
 ## Task 5: Test A.2 — overflow falls back to ThreadPool
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -462,7 +462,7 @@ public void Dispatch_OverflowFallsBackToThreadPool()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "Dispatch_OverflowFallsBackToThreadPool"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_OverflowFallsBackToThreadPool"`
 Expected: PASS — the implementation from Task 4 already covers this.
 
 If the test fails, debug: a CAS-loss in `UnsafeQueueUserWorkItem` should fall through to `ThreadPool.UnsafeQueueUserWorkItem(...)`. Re-read `HotHandoffContinuationDispatcher.UnsafeQueueUserWorkItem`.
@@ -470,7 +470,7 @@ If the test fails, debug: a CAS-loss in `UnsafeQueueUserWorkItem` should fall th
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: A.2 — overflow falls back to ThreadPool
 
@@ -487,7 +487,7 @@ EOF
 ## Task 6: Test A.3 — exactly-once invocation under stress
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -522,13 +522,13 @@ Note: `Volatile.Read` on the assert is only used in the *test* — it's the conv
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "Dispatch_InvokesEachCallbackExactlyOnce"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_InvokesEachCallbackExactlyOnce"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: A.3 — every callback invoked exactly once under stress
 
@@ -545,7 +545,7 @@ EOF
 ## Task 7: Test A.4 — UnsafeQueueUserWorkItem never throws
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -583,13 +583,13 @@ public void Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: A.4 — UnsafeQueueUserWorkItem never throws
 
@@ -607,7 +607,7 @@ EOF
 ## Task 8: Test A.5 — throwing callback doesn't kill the dispatcher thread
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -645,19 +645,19 @@ public void ThrowingCallback_DoesNotKillDispatcherThread()
 
     Assert.True(secondDone.Wait(TimeSpan.FromSeconds(5)),
         "Second callback after throwing first never ran — dispatcher thread may have died.");
-    Assert.Equal("SpscPipe HotHandoff", secondThreadName);
+    Assert.Equal("Pipe HotHandoff", secondThreadName);
 }
 ```
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "ThrowingCallback_DoesNotKillDispatcherThread"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "ThrowingCallback_DoesNotKillDispatcherThread"`
 Expected: PASS — the `try { cb(st); } catch { }` in `Loop` swallows the exception (contract item #5).
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: A.5 — throwing callback doesn't kill dispatcher thread
 
@@ -675,7 +675,7 @@ EOF
 ## Task 9: Test A.6 — Dispatch races Dispose, callback still invoked exactly once
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -717,7 +717,7 @@ public void Dispatch_RacingDispose_InvokesCallbackExactlyOnce()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "Dispatch_RacingDispose_InvokesCallbackExactlyOnce"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_RacingDispose_InvokesCallbackExactlyOnce"`
 Expected: PASS — pins the spec's Race 1, 2, 4 closure.
 
 If this test fails intermittently, that is a critical correctness bug. Debug starting from `HotHandoffContinuationDispatcher.UnsafeQueueUserWorkItem` and `Loop` — the four-races argument is in spec §5.
@@ -725,7 +725,7 @@ If this test fails intermittently, that is a critical correctness bug. Debug sta
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: A.6 — Dispatch racing Dispose invokes callback exactly once
 
@@ -743,7 +743,7 @@ EOF
 ## Task 10: Test A.7 — Dispose blocks until in-flight callback completes
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -785,13 +785,13 @@ public void Dispose_BlocksUntilInFlightCallbackCompletes()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "Dispose_BlocksUntilInFlightCallbackCompletes"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispose_BlocksUntilInFlightCallbackCompletes"`
 Expected: PASS — `Thread.Join` in Dispose waits for Loop to exit, which only happens after the callback finishes and the Loop terminalizes.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: A.7 — Dispose blocks until in-flight callback completes
 
@@ -809,7 +809,7 @@ EOF
 ## Task 11: Test A.8 — Dispatch after Dispose always goes to ThreadPool
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -847,13 +847,13 @@ public void Dispatch_AfterDispose_AlwaysRunsOnThreadPool()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "Dispatch_AfterDispose_AlwaysRunsOnThreadPool"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_AfterDispose_AlwaysRunsOnThreadPool"`
 Expected: PASS — after Dispose, `_state` is 2 (ShutdownRequested + Vacant), so every Dispatcher CAS expecting 0 fails and falls through to TP.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: A.8 — Dispatch after Dispose runs on ThreadPool
 
@@ -868,10 +868,10 @@ EOF
 
 ---
 
-## Task 12: Test A.9 — one dispatcher serves multiple SpscPipes correctly
+## Task 12: Test A.9 — one dispatcher serves multiple Pipes correctly
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -882,10 +882,10 @@ Append to `HotHandoffContinuationDispatcherTests`:
 public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
 {
     using var dispatcher = new HotHandoffContinuationDispatcher();
-    using var pipeA = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
-    using var pipeB = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+    using var pipeA = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
+    using var pipeB = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
-    static async Task Roundtrip(SpscPipelines.SpscPipe pipe, int payloadBytes)
+    static async Task Roundtrip(Pipely.Pipe pipe, int payloadBytes)
     {
         var readTask = pipe.Reader.ReadAsync().AsTask();
         await Task.Run(async () =>
@@ -908,17 +908,17 @@ public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters"`
 Expected: PASS — the dispatcher's CAS on `_state` is per-instance, not per-pipe; concurrent producers from different pipes contest the same slot, with overflow to TP.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: A.9 — one dispatcher serves multiple pipes correctly
 
-Two SpscPipes share one HotHandoffContinuationDispatcher; concurrent
+Two Pipes share one HotHandoffContinuationDispatcher; concurrent
 ReadAsync/FlushAsync round-trips on both pipes complete. Pins contract
 item #3 (thread-safety across pipes).
 
@@ -929,10 +929,10 @@ EOF
 
 ---
 
-## Task 13: Test B.1 — SpscPipe round-trip via the dispatcher
+## Task 13: Test B.1 — Pipe round-trip via the dispatcher
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -940,10 +940,10 @@ Append to `HotHandoffContinuationDispatcherTests`:
 
 ```csharp
 [Fact]
-public async Task SpscPipe_WithHotHandoff_BasicReadFlush_RoundTrip()
+public async Task Pipe_WithHotHandoff_BasicReadFlush_RoundTrip()
 {
     using var dispatcher = new HotHandoffContinuationDispatcher();
-    using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+    using var pipe = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
     var readTask = pipe.Reader.ReadAsync().AsTask();
     Assert.False(readTask.IsCompleted, "Reader should park on the empty pipe.");
@@ -964,19 +964,19 @@ public async Task SpscPipe_WithHotHandoff_BasicReadFlush_RoundTrip()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "SpscPipe_WithHotHandoff_BasicReadFlush_RoundTrip"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Pipe_WithHotHandoff_BasicReadFlush_RoundTrip"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: B.1 — SpscPipe golden-path round-trip via dispatcher
+HotHandoff tests: B.1 — Pipe golden-path round-trip via dispatcher
 
 Reader parks on empty pipe; Writer flushes; Read completes through the
 hot-handoff dispatcher. Validates the dispatcher integrates cleanly
-with SpscPipeOptions.ContinuationDispatcher.
+with PipeOptions.ContinuationDispatcher.
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
@@ -988,7 +988,7 @@ EOF
 ## Task 14: Test B.2 — consumer's AsyncLocal flows to continuation
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -996,11 +996,11 @@ Append to `HotHandoffContinuationDispatcherTests`:
 
 ```csharp
 [Fact]
-public async Task SpscPipe_WithHotHandoff_AsyncLocalFlowsToContinuation()
+public async Task Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation()
 {
     var asyncLocal = new AsyncLocal<int>();
     using var dispatcher = new HotHandoffContinuationDispatcher();
-    using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+    using var pipe = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
     asyncLocal.Value = 42;
 
@@ -1027,13 +1027,13 @@ public async Task SpscPipe_WithHotHandoff_AsyncLocalFlowsToContinuation()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "SpscPipe_WithHotHandoff_AsyncLocalFlowsToContinuation"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: B.2 — consumer's AsyncLocal flows to the continuation
 
@@ -1052,17 +1052,17 @@ EOF
 ## Task 15: Test B.3 — dispatcher thread's AsyncLocal does NOT leak into continuation
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-The test pattern follows the existing `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs::CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation` test. We replicate it through `HotHandoffContinuationDispatcher` directly. Because that dispatcher's worker thread does not expose a "set this AsyncLocal on the worker thread" hook, we use a one-shot dispatch to set the AsyncLocal *on* the worker thread before the parked-await scenario runs.
+The test pattern follows the existing `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs::CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation` test. We replicate it through `HotHandoffContinuationDispatcher` directly. Because that dispatcher's worker thread does not expose a "set this AsyncLocal on the worker thread" hook, we use a one-shot dispatch to set the AsyncLocal *on* the worker thread before the parked-await scenario runs.
 
 Append to `HotHandoffContinuationDispatcherTests`:
 
 ```csharp
 [Fact]
-public async Task SpscPipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation()
+public async Task Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation()
 {
     var consumerLocal   = new AsyncLocal<int>();
     var dispatcherLocal = new AsyncLocal<int>();
@@ -1078,7 +1078,7 @@ public async Task SpscPipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObserved
     }, null);
     Assert.True(setupDone.Wait(TimeSpan.FromSeconds(5)));
 
-    using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+    using var pipe = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
     consumerLocal.Value = 42;
 
@@ -1105,13 +1105,13 @@ public async Task SpscPipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObserved
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "SpscPipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: B.3 — dispatcher's AsyncLocal does not leak into continuation
 
@@ -1130,7 +1130,7 @@ EOF
 ## Task 16: Test B.4 — rapid park/resume cycles, no version mismatch
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
 
 - [ ] **Step 1: Add the test**
 
@@ -1138,10 +1138,10 @@ Append to `HotHandoffContinuationDispatcherTests`:
 
 ```csharp
 [Fact]
-public async Task SpscPipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch()
+public async Task Pipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch()
 {
     using var dispatcher = new HotHandoffContinuationDispatcher();
-    using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions { ContinuationDispatcher = dispatcher });
+    using var pipe = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
     const int totalCycles  = 1000;
     const int messageBytes = 8;
@@ -1178,13 +1178,13 @@ public async Task SpscPipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatc
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/SpscPipelines.HotHandoff.Tests --nologo --filter "SpscPipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch"`
+Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Pipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch"`
 Expected: PASS — completes within timeout, no exception thrown.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff tests: B.4 — rapid park/resume cycles, no version mismatch
 
@@ -1206,7 +1206,7 @@ Sanity check: every test we wrote passes, plus all existing tests still pass.
 
 - [ ] **Step 1: Run all tests across the whole solution**
 
-Run: `dotnet test SpscPipe.slnx --nologo`
+Run: `dotnet test Pipe.slnx --nologo`
 Expected: every test in every project passes. The new project should report 13 tests passed (A.1-A.9 + B.1-B.4 = 9 + 4 = 13).
 
 - [ ] **Step 2: If anything fails, debug**
@@ -1230,25 +1230,25 @@ Each failing test maps to a contract item or invariant from spec §4 / §5. Use 
 ## Task 18: Create the benchmark project skeleton
 
 **Files:**
-- Create: `tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj`
-- Create: `tests/SpscPipelines.HotHandoff.Benchmarks/Program.cs` (stub)
+- Create: `tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
+- Create: `tests/Pipely.HotHandoff.Benchmarks/Program.cs` (stub)
 
 - [ ] **Step 1: Create the directory**
 
 ```bash
-mkdir -p tests/SpscPipelines.HotHandoff.Benchmarks
+mkdir -p tests/Pipely.HotHandoff.Benchmarks
 ```
 
 - [ ] **Step 2: Create the csproj**
 
-Write `tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj`:
+Write `tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`:
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\SpscPipelines\SpscPipelines.csproj" />
-    <ProjectReference Include="..\..\src\SpscPipelines.HotHandoff\SpscPipelines.HotHandoff.csproj" />
+    <ProjectReference Include="..\..\src\Pipely\Pipely.csproj" />
+    <ProjectReference Include="..\..\src\Pipely.HotHandoff\Pipely.HotHandoff.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -1271,27 +1271,27 @@ Write `tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchm
 
 - [ ] **Step 3: Create a placeholder Program.cs**
 
-Write `tests/SpscPipelines.HotHandoff.Benchmarks/Program.cs`:
+Write `tests/Pipely.HotHandoff.Benchmarks/Program.cs`:
 
 ```csharp
 // CLI dispatch added in a later task. Sub-commands:
 //   latency    — DispatcherLatencyHarness.Run
 //   throughput — BenchmarkSwitcher → DispatcherThroughputBench
-Console.WriteLine("SpscPipelines.HotHandoff.Benchmarks — pass `latency` or `throughput`.");
+Console.WriteLine("Pipely.HotHandoff.Benchmarks — pass `latency` or `throughput`.");
 return 0;
 ```
 
 - [ ] **Step 4: Verify it compiles**
 
-Run: `dotnet build tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj`
+Run: `dotnet build tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Benchmarks
+git add tests/Pipely.HotHandoff.Benchmarks
 git commit -m "$(cat <<'EOF'
-HotHandoff: scaffold SpscPipelines.HotHandoff.Benchmarks project
+HotHandoff: scaffold Pipely.HotHandoff.Benchmarks project
 
 BDN + System.CommandLine, Server+Concurrent GC, Exe output. Latency
 harness and throughput benchmark added in subsequent tasks.
@@ -1306,39 +1306,39 @@ EOF
 ## Task 19: Add the benchmark project to the solution
 
 **Files:**
-- Modify: `SpscPipe.slnx`
+- Modify: `Pipe.slnx`
 
-- [ ] **Step 1: Edit `SpscPipe.slnx`**
+- [ ] **Step 1: Edit `Pipe.slnx`**
 
 Add the benchmark project under the `/tests/` folder. The full file should be:
 
 ```xml
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/SpscPipelines/SpscPipelines.csproj" />
-    <Project Path="src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj" />
+    <Project Path="src/Pipely/Pipely.csproj" />
+    <Project Path="src/Pipely.HotHandoff/Pipely.HotHandoff.csproj" />
   </Folder>
   <Folder Name="/tests/">
-    <Project Path="tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj" />
-    <Project Path="tests/SpscPipe.Stress/SpscPipe.Stress.csproj" />
-    <Project Path="tests/SpscPipe.Tests/SpscPipe.Tests.csproj" />
-    <Project Path="tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.csproj" />
-    <Project Path="tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj" />
+    <Project Path="tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj" />
+    <Project Path="tests/Pipe.Stress/Pipe.Stress.csproj" />
+    <Project Path="tests/Pipe.Tests/Pipe.Tests.csproj" />
+    <Project Path="tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj" />
+    <Project Path="tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj" />
   </Folder>
 </Solution>
 ```
 
 - [ ] **Step 2: Build the solution**
 
-Run: `dotnet build SpscPipe.slnx`
+Run: `dotnet build Pipe.slnx`
 Expected: all projects build.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add SpscPipe.slnx
+git add Pipe.slnx
 git commit -m "$(cat <<'EOF'
-HotHandoff: add benchmarks project to SpscPipe.slnx
+HotHandoff: add benchmarks project to Pipe.slnx
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
@@ -1350,21 +1350,21 @@ EOF
 ## Task 20: Implement the dispatcher latency harness
 
 **Files:**
-- Create: `tests/SpscPipelines.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs`
+- Create: `tests/Pipely.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs`
 
-The harness measures producer→consumer message latency under sustained throughput, parameterized by an optional `IContinuationDispatcher`. Mirrors the percentile-by-sort approach of `tests/SpscPipe.Benchmarks/LatencyHarness.cs` but is leaner — no wake-gap traces, no TP correlation, no awaiter counters. Just message latency for the dispatcher comparison.
+The harness measures producer→consumer message latency under sustained throughput, parameterized by an optional `IContinuationDispatcher`. Mirrors the percentile-by-sort approach of `tests/Pipe.Benchmarks/LatencyHarness.cs` but is leaner — no wake-gap traces, no TP correlation, no awaiter counters. Just message latency for the dispatcher comparison.
 
 - [ ] **Step 1: Write the harness**
 
-Write `tests/SpscPipelines.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs`:
+Write `tests/Pipely.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs`:
 
 ```csharp
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
-using SpscPipelines;
+using Pipely;
 
-namespace SpscPipelines.HotHandoff.Benchmarks;
+namespace Pipely.HotHandoff.Benchmarks;
 
 internal sealed record LatencyStats(
     long Count,
@@ -1382,12 +1382,12 @@ internal static class DispatcherLatencyHarness
     // Consumer reads each message and records (now - timestamp). After both sides
     // finish, samples are sorted and exact percentiles are computed by index.
     //
-    // dispatcher = null → SpscPipe uses the default ThreadPoolContinuationDispatcher.
+    // dispatcher = null → Pipe uses the default ThreadPoolContinuationDispatcher.
     public static async Task<LatencyStats> Run(IContinuationDispatcher? dispatcher, int messageCount, int messageBytes)
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (timestamp prefix)");
 
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions
+        using var pipe = new Pipely.Pipe(new PipeOptions
         {
             ContinuationDispatcher = dispatcher,
         });
@@ -1494,19 +1494,19 @@ internal static class DispatcherLatencyHarness
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `dotnet build tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj`
+Run: `dotnet build tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs
+git add tests/Pipely.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff bench: implement DispatcherLatencyHarness
 
 Producer→consumer message-latency harness, parameterized by an optional
 IContinuationDispatcher. Records exact percentiles by sort-and-index.
-Same shape as tests/SpscPipe.Benchmarks/LatencyHarness.cs, leaner
+Same shape as tests/Pipe.Benchmarks/LatencyHarness.cs, leaner
 (focused on the dispatcher comparison axis only).
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
@@ -1519,17 +1519,17 @@ EOF
 ## Task 21: Implement the dispatcher throughput benchmark
 
 **Files:**
-- Create: `tests/SpscPipelines.HotHandoff.Benchmarks/DispatcherThroughputBench.cs`
+- Create: `tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs`
 
 - [ ] **Step 1: Write the BDN benchmark class**
 
-Write `tests/SpscPipelines.HotHandoff.Benchmarks/DispatcherThroughputBench.cs`:
+Write `tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs`:
 
 ```csharp
 using BenchmarkDotNet.Attributes;
-using SpscPipelines;
+using Pipely;
 
-namespace SpscPipelines.HotHandoff.Benchmarks;
+namespace Pipely.HotHandoff.Benchmarks;
 
 [MemoryDiagnoser]
 public class DispatcherThroughputBench
@@ -1540,7 +1540,7 @@ public class DispatcherThroughputBench
     [Benchmark(Baseline = true)]
     public async Task TpDefault_ProduceAndDrain()
     {
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions
+        using var pipe = new Pipely.Pipe(new PipeOptions
         {
             ContinuationDispatcher = null,
         });
@@ -1551,14 +1551,14 @@ public class DispatcherThroughputBench
     public async Task HotHandoff_ProduceAndDrain()
     {
         using var dispatcher = new HotHandoffContinuationDispatcher();
-        using var pipe = new SpscPipelines.SpscPipe(new SpscPipeOptions
+        using var pipe = new Pipely.Pipe(new PipeOptions
         {
             ContinuationDispatcher = dispatcher,
         });
         await ProduceAndDrain(pipe);
     }
 
-    private static async Task ProduceAndDrain(SpscPipelines.SpscPipe pipe)
+    private static async Task ProduceAndDrain(Pipely.Pipe pipe)
     {
         var producer = Task.Run(async () =>
         {
@@ -1593,19 +1593,19 @@ public class DispatcherThroughputBench
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `dotnet build tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj`
+Run: `dotnet build tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Benchmarks/DispatcherThroughputBench.cs
+git add tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff bench: implement DispatcherThroughputBench
 
 BDN + MemoryDiagnoser; two configurations (tp-default baseline vs
 hot-handoff). 1 MiB ProduceAndDrain at 4 KiB chunks — same workload
-as tests/SpscPipe.Benchmarks/ThroughputBenchmarks.cs.
+as tests/Pipe.Benchmarks/ThroughputBenchmarks.cs.
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
@@ -1617,18 +1617,18 @@ EOF
 ## Task 22: Wire the Program.cs CLI
 
 **Files:**
-- Modify: `tests/SpscPipelines.HotHandoff.Benchmarks/Program.cs`
+- Modify: `tests/Pipely.HotHandoff.Benchmarks/Program.cs`
 
-Pattern matches `tests/SpscPipe.Benchmarks/Program.cs`: when `args[0] == "latency"`, run our latency harness with System.CommandLine-parsed options; otherwise pass all args to BDN's `BenchmarkSwitcher` (which handles `--filter`, `--job`, etc., for the throughput benchmark).
+Pattern matches `tests/Pipe.Benchmarks/Program.cs`: when `args[0] == "latency"`, run our latency harness with System.CommandLine-parsed options; otherwise pass all args to BDN's `BenchmarkSwitcher` (which handles `--filter`, `--job`, etc., for the throughput benchmark).
 
 - [ ] **Step 1: Replace Program.cs**
 
-Write `tests/SpscPipelines.HotHandoff.Benchmarks/Program.cs`:
+Write `tests/Pipely.HotHandoff.Benchmarks/Program.cs`:
 
 ```csharp
 using BenchmarkDotNet.Running;
-using SpscPipelines.HotHandoff;
-using SpscPipelines.HotHandoff.Benchmarks;
+using Pipely.HotHandoff;
+using Pipely.HotHandoff.Benchmarks;
 using System.CommandLine;
 
 // Anything that isn't the latency sub-command (including no args, or BDN args
@@ -1677,7 +1677,7 @@ latencyCommand.SetAction(async parseResult =>
     return 0;
 });
 
-var rootCommand = new RootCommand("SpscPipelines.HotHandoff benchmark harness")
+var rootCommand = new RootCommand("Pipely.HotHandoff benchmark harness")
 {
     latencyCommand,
 };
@@ -1714,13 +1714,13 @@ static async Task RunLatency(int count, int size, int trials, int warmup)
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `dotnet build tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj`
+Run: `dotnet build tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Benchmarks/Program.cs
+git add tests/Pipely.HotHandoff.Benchmarks/Program.cs
 git commit -m "$(cat <<'EOF'
 HotHandoff bench: wire Program.cs CLI (latency + throughput sub-commands)
 
@@ -1740,12 +1740,12 @@ A quick run to confirm both sub-commands launch and produce output. We are not c
 
 - [ ] **Step 1: Smoke-test the latency sub-command (Debug, small count)**
 
-Run: `dotnet run --project tests/SpscPipelines.HotHandoff.Benchmarks -- latency --count 1000 --trials 1 --warmup 0`
+Run: `dotnet run --project tests/Pipely.HotHandoff.Benchmarks -- latency --count 1000 --trials 1 --warmup 0`
 Expected: prints a "=== Trial 1/1 ===" header followed by a "Message latency (ns)" comparison table with `tp-default`, `hot-handoff`, and a Ratio column. No exceptions.
 
 - [ ] **Step 2: Smoke-test the throughput benchmark (Release)**
 
-Run: `dotnet run --project tests/SpscPipelines.HotHandoff.Benchmarks -c Release -- --filter '*'`
+Run: `dotnet run --project tests/Pipely.HotHandoff.Benchmarks -c Release -- --filter '*'`
 Expected: BDN prints its job header and begins running both `TpDefault_ProduceAndDrain` and `HotHandoff_ProduceAndDrain`. You can Ctrl+C after seeing both benchmarks appear in BDN's "Found benchmarks" / running output — this step only verifies that the binary launches, BDN discovers the two benchmarks, and they begin executing without error. A full BDN run is part of the post-implementation measurement loop.
 
 BDN refuses to run Debug builds; the `-c Release` flag is required.
@@ -1757,20 +1757,20 @@ BDN refuses to run Debug builds; the `-c Release` flag is required.
 ## Task 24: Write the RESULTS.md scaffold
 
 **Files:**
-- Create: `tests/SpscPipelines.HotHandoff.Benchmarks/RESULTS.md`
+- Create: `tests/Pipely.HotHandoff.Benchmarks/RESULTS.md`
 
 This file documents the methodology, the comparison context, and the design-completion criterion from spec §8.3. Measurement rows are blank — they are filled in as the benchmark loop runs (see post-implementation steps below).
 
 - [ ] **Step 1: Write the scaffold**
 
-Write `tests/SpscPipelines.HotHandoff.Benchmarks/RESULTS.md`:
+Write `tests/Pipely.HotHandoff.Benchmarks/RESULTS.md`:
 
 ```markdown
 # HotHandoff Dispatcher Benchmark Results
 
-**Compared:** `tp-default` (no `ContinuationDispatcher` set; SpscPipe uses
+**Compared:** `tp-default` (no `ContinuationDispatcher` set; Pipe uses
 `ThreadPoolContinuationDispatcher.Instance`) vs `hot-handoff`
-(`SpscPipelines.HotHandoff.HotHandoffContinuationDispatcher`).
+(`Pipely.HotHandoff.HotHandoffContinuationDispatcher`).
 
 **Spec reference:** `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` §8.
 
@@ -1789,8 +1789,8 @@ measurement that drove it.
 
 ## Methodology
 
-- Latency: `dotnet run -c Release --project tests/SpscPipelines.HotHandoff.Benchmarks -- latency --count 100000 --size 256 --trials 3 --warmup 1`
-- Throughput: `dotnet run -c Release --project tests/SpscPipelines.HotHandoff.Benchmarks -- --filter '*'`
+- Latency: `dotnet run -c Release --project tests/Pipely.HotHandoff.Benchmarks -- latency --count 100000 --size 256 --trials 3 --warmup 1`
+- Throughput: `dotnet run -c Release --project tests/Pipely.HotHandoff.Benchmarks -- --filter '*'`
 - Three latency trials per recorded run; warmup trial not recorded.
 - Hardware/build details captured at the top of each results section.
 - The hot-handoff worker thread sits at ~100% on its core during the busy-spin
@@ -1845,7 +1845,7 @@ not finalized until either:
 - [ ] **Step 2: Commit**
 
 ```bash
-git add tests/SpscPipelines.HotHandoff.Benchmarks/RESULTS.md
+git add tests/Pipely.HotHandoff.Benchmarks/RESULTS.md
 git commit -m "$(cat <<'EOF'
 HotHandoff bench: scaffold RESULTS.md
 
@@ -1865,12 +1865,12 @@ EOF
 
 - [ ] **Step 1: Build the entire solution clean**
 
-Run: `dotnet build SpscPipe.slnx --nologo -warnaserror`
+Run: `dotnet build Pipe.slnx --nologo -warnaserror`
 Expected: 0 errors, 0 warnings, all projects build.
 
 - [ ] **Step 2: Run all tests**
 
-Run: `dotnet test SpscPipe.slnx --nologo`
+Run: `dotnet test Pipe.slnx --nologo`
 Expected: all existing tests pass; the new project reports 13 tests passed.
 
 - [ ] **Step 3: No commit needed** — this is a final smoke-check.

@@ -1,17 +1,17 @@
-# `SpscAwaiter` Source-Side EC Capture — Design
+# `PipelyAwaiter` Source-Side EC Capture — Design
 
 **Date:** 2026-04-28
 **Status:** Spec (pre-implementation). Supersedes the partial measure in commit `020d770` (which captured `ExecutionContext` at the dispatcher's construction time and wrapped every `cb` invocation in `ExecutionContext.Run`); reverted in `cea6d49` to clear the slate for this design.
 
 ## Top-level key takeaways
 
-- Move `ExecutionContext` capture and continuation routing from the consumer-side flag-honoring path (current `ManualResetValueTaskSourceCore<T>` behavior) to the source-side `SpscAwaiter<T>`, following the pattern established by OpenTcp's `DispatchedValueTaskSource<T>`.
+- Move `ExecutionContext` capture and continuation routing from the consumer-side flag-honoring path (current `ManualResetValueTaskSourceCore<T>` behavior) to the source-side `PipelyAwaiter<T>`, following the pattern established by OpenTcp's `DispatchedValueTaskSource<T>`.
 - Fixes two distinct manifestations of "dispatcher ambient state leak" with one mechanism:
   - **Mechanism A** — consumer-side `SynchronizationContext` / `TaskScheduler` capture by `await pipe.Reader.ReadAsync()` silently overrides the dispatcher's chosen routing; in BDN's harness this manifested as a deadlock + 3.5× perf regression that `ConfigureAwait(false)` masked.
   - **Mechanism B** — when the consumer's awaiter has no captured `ExecutionContext` (e.g., `FlowExecutionContext` was suppressed at the consumer's `OnCompleted` time), `MRVTSC.SetResult` skips its `RunInternal` and invokes the continuation under whatever EC the calling thread has — which on a long-lived dispatcher worker thread is the EC drifted by prior continuations' AsyncLocal mutations. Worst-case consequence: cross-tenant `AsyncLocal<T>` leak in a request path.
-- `IContinuationDispatcher` contract item #2 ("MUST NOT capture EC") stays literally true. EC handling moves entirely into `SpscAwaiter`. The dispatcher is genuinely a thread router that takes `(Action<object?>, object?)` work items and delivers them. Existing dispatcher implementations (`HotHandoffContinuationDispatcher`, `ThreadPoolContinuationDispatcher`) require **no source changes**.
+- `IContinuationDispatcher` contract item #2 ("MUST NOT capture EC") stays literally true. EC handling moves entirely into `PipelyAwaiter`. The dispatcher is genuinely a thread router that takes `(Action<object?>, object?)` work items and delivers them. Existing dispatcher implementations (`HotHandoffContinuationDispatcher`, `ThreadPoolContinuationDispatcher`) require **no source changes**.
 - The packed-`int` state machine, `ParkStash`, the four-races correctness argument, R5/R5b CAS protocols, version/token invariants, the cycle-protocol — all unchanged.
-- Net effect on `SpscPipe.cs` / `SpscPipe.Reader.cs` / `SpscPipe.Writer.cs`: signal sites *simplify*. The four `s_dispatch*` static delegates and the `DispatchVia` helper are deleted. Signal sites call `_core.SetResult(...)` / `_core.SetException(...)` directly on the producer thread. The dispatcher hop is encapsulated inside `SpscAwaiter`'s `OnCompleted` + `s_dispatch` flow rather than spread across signal sites.
+- Net effect on `Pipe.cs` / `Pipe.Reader.cs` / `Pipe.Writer.cs`: signal sites *simplify*. The four `s_dispatch*` static delegates and the `DispatchVia` helper are deleted. Signal sites call `_core.SetResult(...)` / `_core.SetException(...)` directly on the producer thread. The dispatcher hop is encapsulated inside `PipelyAwaiter`'s `OnCompleted` + `s_dispatch` flow rather than spread across signal sites.
 
 ## Section 1 — Background and motivation
 
@@ -21,7 +21,7 @@ A multi-day investigation in the `hot-handoff` branch surfaced two distinct corr
 
 **Mechanism B (cross-tenant AsyncLocal leak).** The dispatcher contract relies on `MRVTSC.RunInternal` to apply the consumer's captured EC to the continuation. `RunInternal` only fires when `MRVTSC._executionContext != null` — i.e., when the consumer's `OnCompleted` was called with `FlowExecutionContext` set. When suppressed (which the standard library permits), `MRVTSC.SetResult` invokes the continuation directly under the calling thread's current EC. On a long-lived dispatcher worker thread, that EC accumulates `AsyncLocal<T>` mutations across cb invocations whenever `MRVTSC` doesn't apply a captured EC of its own. A future continuation under that drifted EC inherits whatever pollution prior continuations left behind. Concretely: continuation A in iteration N sets `currentTenant.Value = "tenant-A"`; iteration N+1's continuation arrives with no captured EC, runs under the worker's drifted EC, observes `currentTenant.Value == "tenant-A"`. Silent data corruption / authorization leak in any code that uses `AsyncLocal` for request scoping.
 
-Neither gap is fixable from inside an `IContinuationDispatcher` implementation. Both are mediated by `MRVTSC`'s flag-honoring behavior, which sits between the source and the dispatcher. The fix has to live at the source layer: `SpscAwaiter`.
+Neither gap is fixable from inside an `IContinuationDispatcher` implementation. Both are mediated by `MRVTSC`'s flag-honoring behavior, which sits between the source and the dispatcher. The fix has to live at the source layer: `PipelyAwaiter`.
 
 OpenTcp's `DispatchedValueTaskSource<T>` (a parallel project, design referenced in the conversation that produced this spec) demonstrates the correct pattern: capture `ExecutionContext` ourselves at `OnCompleted` time, strip both `FlowExecutionContext` and `UseSchedulingContext` from the flags forwarded to `MRVTSC`, and route the continuation invocation (with attached EC) through the dispatcher ourselves. This subsumes both mechanisms: the dispatcher genuinely controls routing (no scheduler override), and per-await EC propagates correctly regardless of `FlowExecutionContext`.
 
@@ -29,7 +29,7 @@ A previous partial measure (commit `020d770`) captured EC at the dispatcher's *c
 
 ## Section 2 — Architecture changes
 
-### Section 2.1 — `SpscAwaiter<T>` field changes
+### Section 2.1 — `PipelyAwaiter<T>` field changes
 
 **Added:**
 - `private Action<object?>? _realContinuation` — the user's continuation captured at `OnCompleted` time, written before delegating to `_core.OnCompleted` so the storage is visible by the time `s_dispatch` reads it (including in the SetResult-fires-first race; see §4 publication ordering).
@@ -40,11 +40,11 @@ A previous partial measure (commit `020d770`) captured EC at the dispatcher's *c
 - `internal T? _dispatchResult` — superseded. Signal sites now call `_core.SetResult(value)` directly on the producer thread; no need to stash the result for a deferred `SetResult` call.
 - `internal Exception? _dispatchException` — superseded. Same reason.
 
-The diagnostic counters (`_parkCount`, `_signalWonCount`, etc., used by `tests/SpscPipe.Benchmarks/SpscPipeAdapter.cs`) are unaffected and remain. The packed-`int` state field, `ParkStash`, and all cycle-protocol fields are unaffected.
+The diagnostic counters (`_parkCount`, `_signalWonCount`, etc., used by `tests/Pipe.Benchmarks/PipeAdapter.cs`) are unaffected and remain. The packed-`int` state field, `ParkStash`, and all cycle-protocol fields are unaffected.
 
-### Section 2.2 — `SpscAwaiter<T>.OnCompleted` override
+### Section 2.2 — `PipelyAwaiter<T>.OnCompleted` override
 
-`SpscAwaiter` currently passes `OnCompleted` through to `_core.OnCompleted` unchanged. Replace with:
+`PipelyAwaiter` currently passes `OnCompleted` through to `_core.OnCompleted` unchanged. Replace with:
 
 ```csharp
 public void OnCompleted(
@@ -78,7 +78,7 @@ public void OnCompleted(
 
 ### Section 2.3 — Two new static delegates
 
-Replacing the four `s_dispatchReadSetResult` / `s_dispatchReadSetException` / `s_dispatchFlushSetResult` / `s_dispatchFlushSetException` delegates currently in `SpscPipe.cs`:
+Replacing the four `s_dispatchReadSetResult` / `s_dispatchReadSetException` / `s_dispatchFlushSetResult` / `s_dispatchFlushSetException` delegates currently in `Pipe.cs`:
 
 ```csharp
 // Registered with _core via OnCompleted. Invoked inline by MRVTSC.SetResult
@@ -88,7 +88,7 @@ Replacing the four `s_dispatchReadSetResult` / `s_dispatchReadSetException` / `s
 // item through the dispatcher.
 private static readonly Action<object?> s_dispatch = static state =>
 {
-    var awaiter = (SpscAwaiter<T>)state!;
+    var awaiter = (PipelyAwaiter<T>)state!;
     var dispatcher = awaiter.GetDispatcher();
     dispatcher.UnsafeQueueUserWorkItem(s_invokeWithEc, awaiter);
 };
@@ -99,7 +99,7 @@ private static readonly Action<object?> s_dispatch = static state =>
 // and invokes the continuation.
 private static readonly Action<object?> s_invokeWithEc = static state =>
 {
-    var awaiter = (SpscAwaiter<T>)state!;
+    var awaiter = (PipelyAwaiter<T>)state!;
     var cont = awaiter._realContinuation;
     var st   = awaiter._realState;
     var ec   = awaiter._capturedEC;
@@ -117,7 +117,7 @@ The `ExecutionContext.Run` arm needs to invoke `cont(st)` under the captured EC.
 
 ### Section 2.4 — Signal-site simplification
 
-In `SpscPipe.cs` / `SpscPipe.Reader.cs` / `SpscPipe.Writer.cs`, the existing pattern at every signal site:
+In `Pipe.cs` / `Pipe.Reader.cs` / `Pipe.Writer.cs`, the existing pattern at every signal site:
 
 ```csharp
 _readAwaiter._dispatchResult = readResult;
@@ -133,23 +133,23 @@ _readAwaiter._core.SetResult(readResult);
 The `DispatchVia` helper, the four `s_dispatch*` delegates, and the `_dispatchResult` / `_dispatchException` field references are deleted. The producer thread calls `SetResult` (or `SetException`) directly; `MRVTSC.SetResult` invokes the registered `s_dispatch` callback inline (because `RunContinuationsAsynchronously = false`); `s_dispatch` packages the work item and hands it to the dispatcher; the dispatcher's chosen thread invokes `s_invokeWithEc`.
 
 The signal sites in scope (per the existing dispatcher implementation plan):
-- `SpscPipe.SignalReadAwaiterIfPending` — `SetResult` (data) and `SetException` (writer-completion-exception).
-- `SpscPipe.SignalFlushIfBackpressureRelieved` → `DeliverFlushResult` — `SetResult` / `SetException`.
-- `SpscPipe.SignalFlushAwaiterIfPending` → `DeliverFlushResult`.
-- `SpscPipe.OnReadAwaiterTokenCancel` — `SetException` with `OperationCanceledException`.
-- `SpscPipe.OnFlushAwaiterTokenCancel` — `SetException` with `OperationCanceledException`.
-- `SpscPipe.Reader.CancelPendingRead` — `SetResult` (canceled `ReadResult`).
-- `SpscPipe.Reader.ParkReadAwaiter` lost-wakeup throw path — `SetException`.
-- `SpscPipe.Reader.ParkReadAwaiter` lost-cancel path — `SetResult` (canceled).
-- `SpscPipe.Writer.CancelPendingFlush` — `SetResult` (canceled `FlushResult`).
-- `SpscPipe.Writer.ParkFlushAwaiter` lost-wakeup throw path — `SetException`.
-- `SpscPipe.Writer.ParkFlushAwaiter` lost-cancel path — `SetResult` (canceled).
+- `Pipe.SignalReadAwaiterIfPending` — `SetResult` (data) and `SetException` (writer-completion-exception).
+- `Pipe.SignalFlushIfBackpressureRelieved` → `DeliverFlushResult` — `SetResult` / `SetException`.
+- `Pipe.SignalFlushAwaiterIfPending` → `DeliverFlushResult`.
+- `Pipe.OnReadAwaiterTokenCancel` — `SetException` with `OperationCanceledException`.
+- `Pipe.OnFlushAwaiterTokenCancel` — `SetException` with `OperationCanceledException`.
+- `Pipe.Reader.CancelPendingRead` — `SetResult` (canceled `ReadResult`).
+- `Pipe.Reader.ParkReadAwaiter` lost-wakeup throw path — `SetException`.
+- `Pipe.Reader.ParkReadAwaiter` lost-cancel path — `SetResult` (canceled).
+- `Pipe.Writer.CancelPendingFlush` — `SetResult` (canceled `FlushResult`).
+- `Pipe.Writer.ParkFlushAwaiter` lost-wakeup throw path — `SetException`.
+- `Pipe.Writer.ParkFlushAwaiter` lost-cancel path — `SetResult` (canceled).
 
 Every site that currently performs `_dispatchResult/_dispatchException` stash + `DispatchVia` call becomes a direct `_core.SetResult/SetException` call.
 
 ### Section 2.5 — `RunContinuationsAsynchronously = false` is still load-bearing
 
-The dispatcher-level routing relies on `s_dispatch` being invoked **inline** by `SetResult` (so we get a synchronous opportunity to package the work item and hand it to the dispatcher). With `RunContinuationsAsynchronously = true`, `MRVTSC` would queue `s_dispatch` to the ThreadPool itself before invoking it — adding a redundant TP hop and breaking the dispatcher's thread-routing guarantee. The `SpscAwaiter` constructor's `_core.RunContinuationsAsynchronously = false` setting is unchanged.
+The dispatcher-level routing relies on `s_dispatch` being invoked **inline** by `SetResult` (so we get a synchronous opportunity to package the work item and hand it to the dispatcher). With `RunContinuationsAsynchronously = true`, `MRVTSC` would queue `s_dispatch` to the ThreadPool itself before invoking it — adding a redundant TP hop and breaking the dispatcher's thread-routing guarantee. The `PipelyAwaiter` constructor's `_core.RunContinuationsAsynchronously = false` setting is unchanged.
 
 Note: `RunContinuationsAsynchronously = false` controls only the `OnCompleted`-fires-first race (the dominant production path). For the `SetResult`-fires-first race, `MRVTSC` unconditionally queues the registered callback to the ThreadPool regardless of the flag — see §4.
 
@@ -159,25 +159,25 @@ Note: `RunContinuationsAsynchronously = false` controls only the `OnCompleted`-f
 
 **Current text** (in `docs/IContinuationDispatcher.md`):
 
-> The implementation MUST NOT capture or apply an `ExecutionContext`. SpscPipe relies on `ManualResetValueTaskSourceCore<T>`'s internal EC restoration (using the consumer-captured EC from `OnCompleted` time) to scope the continuation correctly. Adding EC manipulation in the dispatcher will leak the *producer's* EC into the continuation in the rare case where the consumer's `await` suppressed `FlowExecutionContext`.
+> The implementation MUST NOT capture or apply an `ExecutionContext`. Pipe relies on `ManualResetValueTaskSourceCore<T>`'s internal EC restoration (using the consumer-captured EC from `OnCompleted` time) to scope the continuation correctly. Adding EC manipulation in the dispatcher will leak the *producer's* EC into the continuation in the rare case where the consumer's `await` suppressed `FlowExecutionContext`.
 
 **Revised text:**
 
-> The implementation MUST NOT capture or apply an `ExecutionContext`. EC handling for `SpscPipe`'s awaitable continuations is performed by `SpscAwaiter<T>`: it captures the consumer's `ExecutionContext` at `OnCompleted` time (per the consumer's `FlowExecutionContext` flag), passes the dispatcher a work item that carries the captured EC alongside the continuation, and applies the EC via `ExecutionContext.Run` at invoke time. The dispatcher is purely a thread router. Adding EC manipulation in the dispatcher would interfere with the source-side capture/apply protocol and is forbidden.
+> The implementation MUST NOT capture or apply an `ExecutionContext`. EC handling for `Pipe`'s awaitable continuations is performed by `PipelyAwaiter<T>`: it captures the consumer's `ExecutionContext` at `OnCompleted` time (per the consumer's `FlowExecutionContext` flag), passes the dispatcher a work item that carries the captured EC alongside the continuation, and applies the EC via `ExecutionContext.Run` at invoke time. The dispatcher is purely a thread router. Adding EC manipulation in the dispatcher would interfere with the source-side capture/apply protocol and is forbidden.
 
 ### Section 3.2 — `IContinuationDispatcher.md` "EC contract" section
 
 The current section explains how `MRVTSC.RunInternal` handles EC. Update to explain the new flow (source-side capture, dispatcher-side application) and remove the now-obsolete discussion of `MRVTSC`'s internal EC flow.
 
-The EC isolation guarantee SpscPipe gives the consumer is now: "regardless of the `IContinuationDispatcher` configured, your `await pipe.Reader.ReadAsync()` continuation runs under the `ExecutionContext` your code had at the `await` — same as standard `Task.Run` / `await` semantics — provided `FlowExecutionContext` was set at `OnCompleted` (the default). This guarantee is robust against worker-thread-EC drift in dispatchers with long-lived worker threads (e.g., `HotHandoffContinuationDispatcher`)."
+The EC isolation guarantee Pipe gives the consumer is now: "regardless of the `IContinuationDispatcher` configured, your `await pipe.Reader.ReadAsync()` continuation runs under the `ExecutionContext` your code had at the `await` — same as standard `Task.Run` / `await` semantics — provided `FlowExecutionContext` was set at `OnCompleted` (the default). This guarantee is robust against worker-thread-EC drift in dispatchers with long-lived worker threads (e.g., `HotHandoffContinuationDispatcher`)."
 
-### Section 3.3 — `SpscPipe` public contract — scheduler / TaskScheduler
+### Section 3.3 — `Pipe` public contract — scheduler / TaskScheduler
 
 A new clause documenting the scheduler bypass:
 
-> `SpscPipe`'s `Reader.ReadAsync` and `Writer.FlushAsync` continuations do **not** honor the consumer's captured `SynchronizationContext` or `TaskScheduler`. The continuation runs on the thread chosen by the configured `IContinuationDispatcher` (default: the .NET `ThreadPool` via `ThreadPoolContinuationDispatcher`). This is independent of the consumer's `ConfigureAwait(true|false)` choice. Consumers requiring continuation on a specific scheduler should either: (a) post explicitly via `SynchronizationContext.Post` / `TaskScheduler.FromCurrentSynchronizationContext().StartNew` after the `await`, or (b) wrap the awaitable in a `Task.Run` to capture context boundaries.
+> `Pipe`'s `Reader.ReadAsync` and `Writer.FlushAsync` continuations do **not** honor the consumer's captured `SynchronizationContext` or `TaskScheduler`. The continuation runs on the thread chosen by the configured `IContinuationDispatcher` (default: the .NET `ThreadPool` via `ThreadPoolContinuationDispatcher`). This is independent of the consumer's `ConfigureAwait(true|false)` choice. Consumers requiring continuation on a specific scheduler should either: (a) post explicitly via `SynchronizationContext.Post` / `TaskScheduler.FromCurrentSynchronizationContext().StartNew` after the `await`, or (b) wrap the awaitable in a `Task.Run` to capture context boundaries.
 
-This is a deliberate contract choice, not an implementation accident. `SpscPipe` is a high-throughput primitive aimed at server-side workloads where consumer-side scheduler capture is not the desired routing. The explicit contract clause prevents surprise.
+This is a deliberate contract choice, not an implementation accident. `Pipe` is a high-throughput primitive aimed at server-side workloads where consumer-side scheduler capture is not the desired routing. The explicit contract clause prevents surprise.
 
 The spec for `IContinuationDispatcher` (`docs/IContinuationDispatcher.md`) should cross-reference this clause.
 
@@ -198,7 +198,7 @@ Cost: one extra TP hop in this rare race (versus the dominant path's inline invo
 ## Section 5 — Allocation discipline
 
 The OpenTcp pattern as designed is allocation-free per dispatch:
-- The work item is the `SpscAwaiter<T>` instance itself, passed as `object?` state. Reused per cycle (one awaiter per direction per pipe).
+- The work item is the `PipelyAwaiter<T>` instance itself, passed as `object?` state. Reused per cycle (one awaiter per direction per pipe).
 - Field writes/clears (`_realContinuation`, `_realState`, `_capturedEC`) are direct.
 - The two static delegates (`s_dispatch`, `s_invokeWithEc`) are allocated once at type-init.
 
@@ -214,10 +214,10 @@ Tests pin observable behavior, not internal sequencing. Categorized by what they
 
 **EC propagation correctness:**
 
-- C.1 — Per-await `ExecutionContext` is propagated to the continuation. Set `AsyncLocal<int>` to 42 before `await pipe.Reader.ReadAsync()`; assert `AsyncLocal<int>.Value == 42` in the continuation. (Mirrors existing `SpscPipe_WithHotHandoff_AsyncLocalFlowsToContinuation`; the new wiring must preserve this.)
+- C.1 — Per-await `ExecutionContext` is propagated to the continuation. Set `AsyncLocal<int>` to 42 before `await pipe.Reader.ReadAsync()`; assert `AsyncLocal<int>.Value == 42` in the continuation. (Mirrors existing `Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation`; the new wiring must preserve this.)
 - C.2 — Cross-cycle isolation: cycle 1's `AsyncLocal<int>` mutation does NOT leak to cycle 2's continuation. Set `AsyncLocal<int>` to 42 → first `await` → continuation mutates to 999 → second `await` (different cycle) → assert `AsyncLocal<int>.Value == 42` (or whatever the consumer's then-current value is; not 999).
 - C.3 — `FlowExecutionContext` suppression: surround the `await` in an `ExecutionContext.SuppressFlow()` block. Continuation runs (no `ExecutionContext.Run` because `_capturedEC == null`); no AsyncLocal pollution from prior cb leaks in. (This is the Mechanism B regression test.)
-- C.4 — Worker-thread `AsyncLocal` not observed in continuation: existing `SpscPipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation` test pattern, must still pass under the new wiring.
+- C.4 — Worker-thread `AsyncLocal` not observed in continuation: existing `Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation` test pattern, must still pass under the new wiring.
 
 **Scheduler bypass:**
 
@@ -241,10 +241,10 @@ Tests pin observable behavior, not internal sequencing. Categorized by what they
 ## Section 8 — Spec references
 
 - `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` — existing dispatcher spec. §5 (four-races correctness) unaffected; §6 (EC contract) needs the revision sketched in §3.4 above.
-- `docs/superpowers/specs/2026-04-25-spsc-pipe-tripleBuffer-design.md` — `SpscPipe` design. §5 (awaiter state machine) needs the `_dispatchResult`/`_dispatchException` field references replaced with the new `_realContinuation`/`_realState`/`_capturedEC` triple. §6 (`IContinuationDispatcher` public contract) gets the §3.3 scheduler-bypass clause added.
+- `docs/superpowers/specs/2026-04-25-spsc-pipe-tripleBuffer-design.md` — `Pipe` design. §5 (awaiter state machine) needs the `_dispatchResult`/`_dispatchException` field references replaced with the new `_realContinuation`/`_realState`/`_capturedEC` triple. §6 (`IContinuationDispatcher` public contract) gets the §3.3 scheduler-bypass clause added.
 - `docs/IContinuationDispatcher.md` — public-facing dispatcher contract. Item #2 and "EC contract" section revised per §3.1 / §3.2.
-- OpenTcp's `DispatchedValueTaskSource<T>` — design pattern source. The `internal sealed`-with-explicit-contract argument from that design's commentary applies here: `SpscAwaiter` is internal to `SpscPipelines`; the public-facing `await pipe.Reader.ReadAsync()` is what consumers see, and the new public contract clause (§3.3) defines its semantics.
+- OpenTcp's `DispatchedValueTaskSource<T>` — design pattern source. The `internal sealed`-with-explicit-contract argument from that design's commentary applies here: `PipelyAwaiter` is internal to `Pipely`; the public-facing `await pipe.Reader.ReadAsync()` is what consumers see, and the new public contract clause (§3.3) defines its semantics.
 
 ## Section 9 — Implementation note
 
-A separate implementation plan (`docs/superpowers/plans/2026-04-28-spsc-awaiter-source-side-ec-capture-implementation.md`) will translate this design into a TDD-disciplined task list with file-by-file changes, test method names, and per-task commits. The implementation work touches `SpscAwaiter.cs`, `SpscPipe.cs`, `SpscPipe.Reader.cs`, `SpscPipe.Writer.cs`, the existing dispatcher and pipe specs, the `IContinuationDispatcher.md` contract doc, and the test files. Estimated scope: ~80 lines of source changes (mostly *deletions* — the four `s_dispatch*` delegates and `DispatchVia` go away), ~150 lines of new tests, ~50 lines of spec/contract doc updates.
+A separate implementation plan (`docs/superpowers/plans/2026-04-28-spsc-awaiter-source-side-ec-capture-implementation.md`) will translate this design into a TDD-disciplined task list with file-by-file changes, test method names, and per-task commits. The implementation work touches `PipelyAwaiter.cs`, `Pipe.cs`, `Pipe.Reader.cs`, `Pipe.Writer.cs`, the existing dispatcher and pipe specs, the `IContinuationDispatcher.md` contract doc, and the test files. Estimated scope: ~80 lines of source changes (mostly *deletions* — the four `s_dispatch*` delegates and `DispatchVia` go away), ~150 lines of new tests, ~50 lines of spec/contract doc updates.

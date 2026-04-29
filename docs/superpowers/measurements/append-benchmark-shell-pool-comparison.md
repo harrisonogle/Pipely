@@ -10,14 +10,14 @@
 
 Per spec §5.1: per-`Append` `BufferSegment` allocation contributed ~9% wall-clock at the smallest buffer size and ~4× the BCL allocation rate across all sizes. Pooling shells across donations should:
 
-1. Reduce `SpscPipe_Append` allocated bytes/op by ~3× (only the donor's `IMemoryOwner` rental remains as per-call allocation).
+1. Reduce `Pipe_Append` allocated bytes/op by ~3× (only the donor's `IMemoryOwner` rental remains as per-call allocation).
 2. Shave ~9% wall-clock at the smallest buffer / tightest flush.
-3. Not regress `SpscPipe_Append` at larger buffer sizes (alloc cost was already a small fraction).
-4. Not regress `BclPipe_GetSpan` or `SpscPipe_GetSpan` (those paths were untouched).
+3. Not regress `Pipe_Append` at larger buffer sizes (alloc cost was already a small fraction).
+4. Not regress `BclPipe_GetSpan` or `Pipe_GetSpan` (those paths were untouched).
 
 ## Result
 
-### `SpscPipe_Append` — wall-clock
+### `Pipe_Append` — wall-clock
 
 | BufferSize | BBF | Before | After | Δ | % change |
 |---:|---:|---:|---:|---:|---:|
@@ -32,7 +32,7 @@ Per spec §5.1: per-`Append` `BufferSegment` allocation contributed ~9% wall-clo
 
 The wall-clock savings are concentrated at small buffer sizes — exactly where the per-`Append` shell-allocation cost was a meaningful fraction of total work. At `BufferSize=256` (which produces 4096 chunks per 1-MiB iteration), shell pooling shaves ~10%, matching the hypothesis (1).
 
-### `SpscPipe_Append` — allocated bytes per op
+### `Pipe_Append` — allocated bytes per op
 
 | BufferSize | BBF | Before | After | Δ Allocated | Alloc Ratio (Before → After) |
 |---:|---:|---:|---:|---:|:---:|
@@ -49,9 +49,9 @@ Allocation rate drops 25–75% across all configs. The Alloc Ratio vs BCL collap
 
 The residual allocation (1.14×–2.25× BCL) is per-call cost we cannot eliminate via shell pooling: the donor's `IMemoryOwner` rental from `MemoryPool<byte>.Shared` (which itself uses `ArrayPool<byte>` internally — already pooled but with some bookkeeping per Rent), plus the producer/consumer Task state machines.
 
-### Regression check — `BclPipe_GetSpan` and `SpscPipe_GetSpan`
+### Regression check — `BclPipe_GetSpan` and `Pipe_GetSpan`
 
-| BufferSize | BBF | BCL Before | BCL After | Δ | SpscGS Before | SpscGS After | Δ |
+| BufferSize | BBF | BCL Before | BCL After | Δ | PipelyGS Before | PipelyGS After | Δ |
 |---:|---:|---:|---:|---:|---:|---:|---:|
 | 256 | 1 | 619.63 µs | 626.30 µs | +1.08% | 725.08 µs | 735.45 µs | +1.43% |
 | 256 | 16 | 280.56 µs | 279.68 µs | −0.31% | 207.35 µs | 199.71 µs | −3.68% |
@@ -79,4 +79,4 @@ The `BufferSize=256/BBF=1` config remains the only one where Append is meaningfu
 
 ## Recommendation
 
-Land the change. The crossover for "should I use Append?" guidance moves from "≥ 4 KiB" to **"≥ 1 KiB if flushing every 16 buffers, ≥ 4 KiB if flushing every buffer"**. Worth updating the doc comment on `SpscPipeWriter.Append` (currently absent — flagged as out-of-scope minor in the original spec review).
+Land the change. The crossover for "should I use Append?" guidance moves from "≥ 4 KiB" to **"≥ 1 KiB if flushing every 16 buffers, ≥ 4 KiB if flushing every buffer"**. Worth updating the doc comment on `PipeWriter.Append` (currently absent — flagged as out-of-scope minor in the original spec review).

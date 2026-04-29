@@ -1,15 +1,15 @@
-# SpscPipe Buffer Ownership Transfer (`SpscPipeWriter.Append`) — Design
+# Pipe Buffer Ownership Transfer (`PipeWriter.Append`) — Design
 
 **Date:** 2026-04-28
 **Status:** Spec (pre-implementation). Adds zero-copy buffer donation to the writer surface; amends `2026-04-25-spsc-pipe-tripleBuffer-design.md` §3 / §4 / §X.
 
 ## Top-level key takeaways
 
-- New writer-side method `SpscPipeWriter.Append(IMemoryOwner<byte> buffer[, int start, int length])`. Caller transfers ownership of an already-filled buffer; the pipe takes responsibility for `Dispose`.
+- New writer-side method `PipeWriter.Append(IMemoryOwner<byte> buffer[, int start, int length])`. Caller transfers ownership of an already-filled buffer; the pipe takes responsibility for `Dispose`.
 - Donated buffers ride the existing segment chain. A donated `BufferSegment` is constructed with `End == length` and is spliced in as the new tail via the existing `Freeze`/transition machinery. No parallel state, no new chain.
 - `Append` is writer-thread-local — same publication boundary as `GetMemory`/`Advance`. Nothing becomes visible to the reader until the next `FlushAsync` (or `Complete`).
 - Recycle path forks on a new `BufferSegment.IsDonated` discriminator: rented segments → `PushFreelist` (existing); donated → `DisposeOwned()` and discard. Foreign `IMemoryOwner`s are never reused.
-- Public surface impact: `SpscPipeWriter` becomes `public`; `SpscPipe.Writer`'s declared return type widens from `PipeWriter` to `SpscPipeWriter`. Source-compatible with existing `PipeWriter w = pipe.Writer;` call sites. `SpscPipeReader` remains internal.
+- Public surface impact: `PipeWriter` becomes `public`; `Pipe.Writer`'s declared return type widens from `PipeWriter` to `PipeWriter`. Source-compatible with existing `PipeWriter w = pipe.Writer;` call sites. `PipeReader` remains internal.
 - Ownership contract: ownership of `buffer` transfers to the pipe **iff** `Append` returns normally. On any throw (argument, disposed, completed), the caller still owns and must `Dispose`.
 
 ## Section 1 — Background and motivation
@@ -155,7 +155,7 @@ public void Append(IMemoryOwner<byte> buffer, int start, int length)
     if (buffer is null) throw new ArgumentNullException(nameof(buffer));
 
     // State-precondition checks. On throw, caller still owns `buffer`.
-    if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+    if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
     if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
 
     // Range validation against `buffer.Memory.Length`.
@@ -208,7 +208,7 @@ All validation runs **before** any mutation of `_chainHead`, `_writingHead`, `_w
 - `ArgumentNullException` (null buffer): nothing was passed; nothing transferred.
 - `ObjectDisposedException` / `InvalidOperationException` (state precondition): caller still owns `buffer`; pipe state unchanged.
 - `ArgumentOutOfRangeException` (range): caller still owns `buffer`; pipe state unchanged.
-- Normal return: pipe owns `buffer` and will dispose it on recycle or `SpscPipe.Dispose`.
+- Normal return: pipe owns `buffer` and will dispose it on recycle or `Pipe.Dispose`.
 
 After validation, the body's only operations are `new BufferSegment()` (a parameterless constructor that doesn't throw under normal conditions) and `AdoptFrom` (allocation- and throw-free by construction — see §3). The chain pointer updates and scalar increments that follow cannot throw. So the post-validation body has no observable mid-state: either we return normally and ownership has transferred, or validation threw and the caller's buffer is untouched.
 
@@ -217,7 +217,7 @@ After validation, the body's only operations are `new BufferSegment()` (a parame
 After `Append`, `_writingHead.AvailableMemory.Length == _writingHeadBytesBuffered == length`. Two consequences fall out without code changes:
 
 - **Subsequent `GetMemory(N)` transitions** because `remaining = AvailableMemory.Length - _writingHeadBytesBuffered = 0 < N`. The existing transition path rents a fresh tail and freezes the donated segment as a non-tail chain segment.
-- **Subsequent `Advance(N>0)` throws** via the existing bounds check at `SpscPipe.Writer.cs:52` (`_writingHeadBytesBuffered + bytes > _writingHead.AvailableMemory.Length`). Callers cannot accidentally over-write into a donated segment.
+- **Subsequent `Advance(N>0)` throws** via the existing bounds check at `Pipe.Writer.cs:52` (`_writingHeadBytesBuffered + bytes > _writingHead.AvailableMemory.Length`). Callers cannot accidentally over-write into a donated segment.
 
 ### 4.4 — Backpressure interaction
 
@@ -256,7 +256,7 @@ The walk predicate is unchanged — `IsDonated` only affects what happens after 
 
 The TripleBuffer slot-pinning caveat (§3 Nit-6 of base spec) carries over: a recycled donated segment may stay reachable via the unused `_writerTb` slot until the next publish overwrites that slot's `WriterState.HeadSegment`/`TailSegment` references. The foreign owner is alive slightly longer than the recycle moment, but never past the next publish. Same caveat as today's rented segments; not worth additional complexity.
 
-`SpscPipe.Dispose()` walks both the chain and the rented-segment freelist calling `DisposeOwned()` on each. The donated-shell freelist (introduced below) holds shells whose `IMemoryOwner` was already disposed in `RecycleDrainedSegments`, so `Dispose` simply nulls the donated-shell freelist's head — no per-shell action required.
+`Pipe.Dispose()` walks both the chain and the rented-segment freelist calling `DisposeOwned()` on each. The donated-shell freelist (introduced below) holds shells whose `IMemoryOwner` was already disposed in `RecycleDrainedSegments`, so `Dispose` simply nulls the donated-shell freelist's head — no per-shell action required.
 
 ### 5.1 — Donated-shell freelist (rationale, separate from rented freelist)
 
@@ -305,11 +305,11 @@ shell.AdoptFrom(buffer, slice, runningIndex, pipeOwner: _pipe);
 ## Section 6 — Public API surface
 
 ```csharp
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed class SpscPipeWriter : System.IO.Pipelines.PipeWriter
+public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
 {
-    internal SpscPipeWriter(SpscPipe pipe);   // ctor stays internal — only SpscPipe constructs it
+    internal PipeWriter(Pipe pipe);   // ctor stays internal — only Pipe constructs it
 
     // Existing PipeWriter overrides — unchanged:
     public override Memory<byte> GetMemory(int sizeHint = 0);
@@ -324,25 +324,25 @@ public sealed class SpscPipeWriter : System.IO.Pipelines.PipeWriter
     public void Append(IMemoryOwner<byte> buffer, int start, int length);
 }
 
-public sealed partial class SpscPipe : IDisposable
+public sealed partial class Pipe : IDisposable
 {
-    public SpscPipeWriter Writer => _writerInstance;   // was: PipeWriter
+    public PipeWriter Writer => _writerInstance;   // was: PipeWriter
     public PipeReader     Reader => _readerInstance;   // unchanged
 }
 ```
 
 ### 6.1 — Source compatibility
 
-`SpscPipeWriter : PipeWriter`, so existing call sites that bind the result of `pipe.Writer` to a `PipeWriter` variable continue to compile via implicit upcast:
+`PipeWriter : PipeWriter`, so existing call sites that bind the result of `pipe.Writer` to a `PipeWriter` variable continue to compile via implicit upcast:
 ```csharp
 PipeWriter w = pipe.Writer;          // still works — implicit upcast
-var w2 = pipe.Writer;                // now SpscPipeWriter; .Append available
-SpscPipeWriter w3 = pipe.Writer;     // explicit binding
+var w2 = pipe.Writer;                // now PipeWriter; .Append available
+PipeWriter w3 = pipe.Writer;     // explicit binding
 ```
 
-### 6.2 — Why `SpscPipeReader` stays internal
+### 6.2 — Why `PipeReader` stays internal
 
-The asymmetry is intentional. `Append` is the only addition beyond the BCL `PipeWriter` surface; the reader has no analogous addition. Exposing `SpscPipeReader` for symmetry alone would commit us to maintaining a public type with no extra public methods on it — pure surface area for no benefit. If a reader-side feature is ever motivated (none currently is), the type can be made public at that point.
+The asymmetry is intentional. `Append` is the only addition beyond the BCL `PipeWriter` surface; the reader has no analogous addition. Exposing `PipeReader` for symmetry alone would commit us to maintaining a public type with no extra public methods on it — pure surface area for no benefit. If a reader-side feature is ever motivated (none currently is), the type can be made public at that point.
 
 ### 6.3 — `Append` ownership contract
 
@@ -395,20 +395,20 @@ A simpler "always-take-ownership-even-on-throw" alternative was considered and r
 | `Append` after `GetMemory` + `Advance(0)` (zero buffered) | Freezes empty rented segment with `End == 0`, splices donated. The empty rented segment is harmless in the chain and recycles into the freelist normally on drain. |
 | Three back-to-back `Append`s with no intervening `GetMemory` | Chain becomes `[..., previousTail-frozen, d1, d2, d3]` with `_writingHead = d3`. No empty rented tails between donations. Freezes are idempotent on `End`/`Memory` for donated previous tails. |
 | `GetMemory(N)` after `Append` | Forces transition (since `remaining == 0`). Rents a fresh tail. Freezes donated as a non-tail chain segment. |
-| `Advance(N>0)` after `Append` | Throws `ArgumentOutOfRangeException` via existing bounds check at `SpscPipe.Writer.cs:52`. |
+| `Advance(N>0)` after `Append` | Throws `ArgumentOutOfRangeException` via existing bounds check at `Pipe.Writer.cs:52`. |
 | `FlushAsync` after `Append` | Publishes new `WriterState` with `TailSegment == donated`, `TailWritten == donated.End`. Backpressure check sees boosted `_totalWritten`; parks if `unconsumed >= PauseWriterThreshold`. |
 | Reader drains past donated segment | `RecycleDrainedSegments` calls `donated.DisposeOwned()` (releasing the foreign `IMemoryOwner`); the `BufferSegment` shell is pushed to the donated-shell freelist (capped at `MaxFreelistSegments`; over-cap shells drop to GC). Rented freelist count unchanged. |
 | Append after a recycle, donated-shell freelist non-empty | `Append` pops the shell instead of allocating; `AdoptFrom` overwrites all fields. Donated-shell freelist count decrements. |
 | `AdvanceTo` to a `SequencePosition` inside a donated segment of the same pipe | Passes pipe-identity check (`OwnerToken == pipe`). Standard `AdvanceTo` semantics apply. |
 | `AdvanceTo` to a `SequencePosition` from a *different* pipe's donated segment | Throws `InvalidOperationException` ("SequencePosition is from a different pipe.") via the existing R4-7 check. |
-| `SpscPipe.Dispose` with un-flushed donated segments in chain | Existing chain walk calls `DisposeOwned()` on every segment; works uniformly for donated. |
+| `Pipe.Dispose` with un-flushed donated segments in chain | Existing chain walk calls `DisposeOwned()` on every segment; works uniformly for donated. |
 | Pathological large Append (many GB) without intervening flush | Allowed at `Append` time. Next `FlushAsync` parks if backpressure threshold exceeded. Same as `GetMemory(huge)` + `Advance(huge)`. |
 
 ## Section 9 — Spec amendments (against `2026-04-25-spsc-pipe-tripleBuffer-design.md`)
 
 | Section | Amendment |
 |---|---|
-| §3 Ownership table | Add row: foreign `IMemoryOwner<byte>` (donated) — owned by writer, released on recycle (`DisposeOwned`) or `SpscPipe.Dispose`. |
+| §3 Ownership table | Add row: foreign `IMemoryOwner<byte>` (donated) — owned by writer, released on recycle (`DisposeOwned`) or `Pipe.Dispose`. |
 | §3 `BufferSegment` definition | Add `IsDonated` field, `AdoptFrom` initializer; clarify that `Freeze` on a donated segment is idempotent on `End`/`Memory`. |
 | §3 Allocation path | Reference new sibling subsection "Donation path" (this design's §4). |
 | §3 Recycling path | Update pseudocode to branch on `IsDonated`: `DisposeOwned` + push to donated-shell freelist vs `PushFreelist`. |
@@ -416,7 +416,7 @@ A simpler "always-take-ownership-even-on-throw" alternative was considered and r
 | §3 `Memory<T>` torn-read note (Nit-5) | Note: donated segments are immune; `base.Memory` is not re-sliced post-adoption. |
 | §3 Lifecycle / Dispose | Note: `DisposeOwned` walk is uniform across donated and rented. |
 | §4 Hot paths | New subsection: "Writer: `Append`" with the pseudocode from §4 of this document. |
-| §X Public API | Note `SpscPipeWriter` visibility change and the two `Append` overloads. |
+| §X Public API | Note `PipeWriter` visibility change and the two `Append` overloads. |
 
 No changes to §2 (state shapes), §5 (awaiter coordination), or §6 (completion/cancellation) — `Append` does not interact with awaiters or completion mechanisms.
 
@@ -432,7 +432,7 @@ Three groups, mirroring the existing test layout under `tests/`.
 - ~~`RecycleReset_AssertsNotDonated`~~ — deferred. The `Debug.Assert` is documentation of the invariant; testing it requires `#if DEBUG`-guarded trace-listener swapping which is brittle and offers little value over the inline assertion itself.
 - `Freeze_OnDonatedSegment_IsIdempotent` — pin the documented "End/Memory writes are idempotent" property: `donated.Freeze(donated.End, next)` produces same `End`/`base.Memory` and updated `Next`.
 
-### 10.2 — `SpscPipeWriterAppendTests` (new file)
+### 10.2 — `PipeWriterAppendTests` (new file)
 
 Argument validation + ownership-on-throw:
 - `Append_NullBuffer_Throws_ArgumentNull` (both overloads).
@@ -468,18 +468,18 @@ Zero-length:
 - `Recycle_DonatedSegmentPushedToShellFreelist` — `_donatedShellFreelistCount` increments by exactly 1 when a single donated segment is recycled.
 - `Append_AfterRecycle_ReusesShellFromFreelist` — `_donatedShellFreelistCount` decrements when `Append` is called after a recycle has populated the shell freelist; the reused shell has `IsDonated == true` and `OwnerToken == pipe` post-`AdoptFrom`.
 - `ShellFreelist_RespectsCap` — after more donated recycles than `MaxFreelistSegments`, `_donatedShellFreelistCount == MaxFreelistSegments` (over-cap shells dropped to GC); subsequent `Append`s still succeed (fall back to `new BufferSegment()` when the freelist eventually empties).
-- `Dispose_ClearsShellFreelist` — `SpscPipe.Dispose` nulls `_donatedShellFreelistHead` and resets count to 0. (No `IMemoryOwner.Dispose` to call — shells were dispose-cleaned in `RecycleDrainedSegments`.)
+- `Dispose_ClearsShellFreelist` — `Pipe.Dispose` nulls `_donatedShellFreelistHead` and resets count to 0. (No `IMemoryOwner.Dispose` to call — shells were dispose-cleaned in `RecycleDrainedSegments`.)
 - `Recycle_RentedSegmentStillFreelisted` — existing rented-recycle behavior preserved (regression guard).
-- `Dispose_WithMixedChain_DisposesAllOwners` — chain has `[rented, donated, rented, donated]`; `SpscPipe.Dispose` results in all four `DisposeOwned` calls.
+- `Dispose_WithMixedChain_DisposesAllOwners` — chain has `[rented, donated, rented, donated]`; `Pipe.Dispose` results in all four `DisposeOwned` calls.
 - `Backpressure_AppendDoesNotPark` — `Append(huge)` returns synchronously even when `huge >= PauseWriterThreshold`; subsequent `FlushAsync` parks.
 
 ### 10.4 — Stress
 
-One new scenario in `tests/SpscPipe.Stress/` that interleaves `Append` with `GetMemory`/`Advance` while the reader concurrently drains. Uses tracking `IMemoryOwner` mocks and verifies at end-of-test that total `Dispose` count equals total `Append` count plus zero-length-skipped count. Catches both leaks (under-dispose) and double-disposes (over-dispose).
+One new scenario in `tests/Pipe.Stress/` that interleaves `Append` with `GetMemory`/`Advance` while the reader concurrently drains. Uses tracking `IMemoryOwner` mocks and verifies at end-of-test that total `Dispose` count equals total `Append` count plus zero-length-skipped count. Catches both leaks (under-dispose) and double-disposes (over-dispose).
 
 ## Section 11 — Out of scope
 
-- A reader-side counterpart that "claims ownership" of a donated segment from the read sequence. Not currently motivated; would require `SpscPipeReader` to become public and `BufferSegment.IsDonated` to be exposed. Deferred until a concrete use case arises.
-- Helper extensions like `static class SpscPipeWriterExtensions { public static void Append(this SpscPipeWriter w, byte[] array) { ... } }` that wrap byte arrays into ad-hoc `IMemoryOwner`s. Easy to add later as nice-to-haves; not part of this design.
+- A reader-side counterpart that "claims ownership" of a donated segment from the read sequence. Not currently motivated; would require `PipeReader` to become public and `BufferSegment.IsDonated` to be exposed. Deferred until a concrete use case arises.
+- Helper extensions like `static class PipeWriterExtensions { public static void Append(this PipeWriter w, byte[] array) { ... } }` that wrap byte arrays into ad-hoc `IMemoryOwner`s. Easy to add later as nice-to-haves; not part of this design.
 - Diagnostic counters specifically for donated segments (e.g., `_donatedAppendCount`, `_donatedDisposeCount`). Could be added at implementation time if observability needs surface; not required by the design.
 - ~~Pooling of `BufferSegment` shell objects allocated for donated segments.~~ **Brought in scope post-2026-04-29 by AppendBenchmarks results.** A round of benchmark-driven analysis showed the per-Append `BufferSegment` allocation contributing ~9% of wall-clock at small buffer sizes (`BufferSize=256`, `BuffersBeforeFlush=1`) and consistently ~4× the BCL allocation rate at all sizes. Section 5.1 specifies the donated-shell freelist that addresses this.

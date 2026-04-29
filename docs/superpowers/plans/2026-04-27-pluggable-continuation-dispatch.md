@@ -1,11 +1,11 @@
-# Pluggable continuation dispatch for SpscPipe
+# Pluggable continuation dispatch for Pipe
 
 **Date:** 2026-04-27
 **Status:** Plan, pending implementation
 
 ## Goal
 
-Let users configure where async continuations run when `SpscPipe`'s parked awaiters are signaled. Default = ThreadPool (preserves current behavior). Optional override = user-supplied dispatcher (e.g., hot-handoff to a dedicated thread on a pinned core, with TP fallback when busy).
+Let users configure where async continuations run when `Pipe`'s parked awaiters are signaled. Default = ThreadPool (preserves current behavior). Optional override = user-supplied dispatcher (e.g., hot-handoff to a dedicated thread on a pinned core, with TP fallback when busy).
 
 Primary use case: custom Kestrel transports where the producer side is owned by the user but the consumer side (Kestrel) uses async/await on TP and is sensitive to wake-gap latency.
 
@@ -17,10 +17,10 @@ Primary use case: custom Kestrel transports where the producer side is owned by 
 
 ## API design
 
-**Public interface (added to `SpscPipelines`):**
+**Public interface (added to `Pipely`):**
 
 ```csharp
-namespace SpscPipelines;
+namespace Pipely;
 
 public interface IContinuationDispatcher
 {
@@ -30,7 +30,7 @@ public interface IContinuationDispatcher
     ///
     /// 1. The callback MUST be invoked exactly once.
     /// 2. The implementation MUST NOT capture or apply an ExecutionContext.
-    ///    SpscPipe relies on MRVTSC's internal EC restoration (via the consumer-captured
+    ///    Pipe relies on MRVTSC's internal EC restoration (via the consumer-captured
     ///    EC from OnCompleted) to scope the continuation correctly. Adding EC manipulation
     ///    in the dispatcher will either leak the producer's EC into the continuation
     ///    (when FlowExecutionContext is absent on the original await) or introduce
@@ -60,7 +60,7 @@ internal sealed class ThreadPoolContinuationDispatcher : IContinuationDispatcher
 }
 ```
 
-**Added to `SpscPipeOptions`:**
+**Added to `PipeOptions`:**
 
 ```csharp
 public IContinuationDispatcher? ContinuationDispatcher { get; init; }
@@ -83,7 +83,7 @@ For the default user (no custom dispatcher), our default dispatcher forwards to 
 Instead of packaging `(awaiter, value)` into a `Tuple<,>` per dispatch, stash the result on the awaiter itself:
 
 ```csharp
-internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
+internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
 {
     // ... existing fields ...
 
@@ -107,7 +107,7 @@ dispatcher.UnsafeQueueUserWorkItem(s_dispatchReadSetResult, _readAwaiter);
 // Where s_dispatchReadSetResult is a static delegate:
 private static readonly Action<object?> s_dispatchReadSetResult = static state =>
 {
-    var awaiter = (SpscAwaiter<ReadResult>)state!;
+    var awaiter = (PipelyAwaiter<ReadResult>)state!;
     var result = awaiter._dispatchResult;
     awaiter._dispatchResult = default;
     awaiter._core.SetResult(result);
@@ -116,25 +116,25 @@ private static readonly Action<object?> s_dispatchReadSetResult = static state =
 
 Zero allocations per dispatch (the static delegates are allocated once at type-init).
 
-Symmetric pattern for `SetException` and for `SpscAwaiter<FlushResult>`.
+Symmetric pattern for `SetException` and for `PipelyAwaiter<FlushResult>`.
 
 ## Where the wrapping goes
 
 Every site that currently calls `_core.SetResult(...)` or `_core.SetException(...)` needs to instead stash the value/exception on the awaiter and route through the dispatcher:
 
-**`SpscPipe.cs`:**
+**`Pipe.cs`:**
 - `SignalReadAwaiterIfPending` — SetResult (data) and SetException (writer-completion-exception)
 - `SignalFlushIfBackpressureRelieved` → `DeliverFlushResult` — SetResult / SetException
 - `SignalFlushAwaiterIfPending` → `DeliverFlushResult`
 - `OnReadAwaiterTokenCancel` — SetException with OCE
 - `OnFlushAwaiterTokenCancel` — SetException with OCE
 
-**`SpscPipe.Reader.cs`:**
+**`Pipe.Reader.cs`:**
 - `CancelPendingRead` — SetResult (canceled ReadResult)
 - `ParkReadAwaiter` lost-wakeup throw path — SetException
 - `ParkReadAwaiter` lost-cancel path — SetResult (canceled)
 
-**`SpscPipe.Writer.cs`:**
+**`Pipe.Writer.cs`:**
 - `CancelPendingFlush` — SetResult (canceled FlushResult)
 - `ParkFlushAwaiter` lost-wakeup throw path — SetException
 - `ParkFlushAwaiter` lost-cancel path — SetResult (canceled)
@@ -174,7 +174,7 @@ The only difference vs today's RCA=true path: there's one extra `IContinuationDi
 
 **Existing test suite must pass unchanged** with the default dispatcher. Run all 70 unit tests + stress harness.
 
-**New tests (add to `SpscPipe.Tests`):**
+**New tests (add to `Pipe.Tests`):**
 
 1. Custom dispatcher receives the callback for each signal site:
    - Data-path SetResult: Read awaiter via `SignalReadAwaiterIfPending`, Flush awaiter via gated and unconditional flush signalers.
@@ -202,7 +202,7 @@ Sections affected:
 
 - §5 (Awaiter state machine): note that `_core.RunContinuationsAsynchronously = false`, with continuation dispatch routed through `IContinuationDispatcher` (default = TP).
 - §5 (Signal paths): each SetResult/SetException site description should reference "dispatched via `IContinuationDispatcher.UnsafeQueueUserWorkItem`" instead of "queued to TP via MRVTSC".
-- §6 (Options): document `SpscPipeOptions.ContinuationDispatcher` and the contract.
+- §6 (Options): document `PipeOptions.ContinuationDispatcher` and the contract.
 - New invariant: "EC capture for await continuations occurs on the consumer's thread at `OnCompleted` time and is applied via MRVTSC's `RunInternal` inside `SetResult`. Dispatcher implementations must not interpose EC manipulation."
 
 Probably a single PR ~30-50 lines of spec changes, alongside the code change.
@@ -210,7 +210,7 @@ Probably a single PR ~30-50 lines of spec changes, alongside the code change.
 ## Effort estimate
 
 - ~80 lines new code (interface, default impl, helper static delegates, dispatcher field, awaiter fields for stash)
-- ~40 lines mechanical edits across `SpscPipe.cs`, `Reader.cs`, `Writer.cs` (replacing direct `_core.SetResult/SetException` calls with the dispatched form)
+- ~40 lines mechanical edits across `Pipe.cs`, `Reader.cs`, `Writer.cs` (replacing direct `_core.SetResult/SetException` calls with the dispatched form)
 - ~150 lines of new tests
 - Spec update ~30-50 lines
 - Re-run unit tests, stress harness, latency benchmark to confirm no regression
@@ -218,7 +218,7 @@ Probably a single PR ~30-50 lines of spec changes, alongside the code change.
 
 ## Open questions
 
-1. **Should we expose a built-in `HotHandoffContinuationDispatcher` in the `SpscPipelines` package?** Tempting (it's the canonical use case) but it has its own lifecycle (thread start/stop), tuning concerns (spin intensity), and exception handling. Better as a documentation example than a library type — keeps SpscPipe's public surface minimal. Users implementing the interface get full control.
+1. **Should we expose a built-in `HotHandoffContinuationDispatcher` in the `Pipely` package?** Tempting (it's the canonical use case) but it has its own lifecycle (thread start/stop), tuning concerns (spin intensity), and exception handling. Better as a documentation example than a library type — keeps Pipe's public surface minimal. Users implementing the interface get full control.
 
 2. **Should the default dispatcher be a singleton (`Instance`) or instantiated per pipe?** Singleton is fine — it's stateless. Cheaper than per-pipe construction.
 
@@ -251,7 +251,7 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
 
     public HotHandoffContinuationDispatcher()
     {
-        _thread = new Thread(Loop) { IsBackground = true, Name = "SpscPipe HotHandoff" };
+        _thread = new Thread(Loop) { IsBackground = true, Name = "Pipe HotHandoff" };
         _thread.Start();
     }
 

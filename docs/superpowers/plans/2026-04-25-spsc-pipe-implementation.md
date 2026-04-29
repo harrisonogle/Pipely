@@ -4,7 +4,7 @@
 
 **Goal:** Implement a lock-free single-producer single-consumer (SPSC) `PipeReader`/`PipeWriter` per the design at `docs/superpowers/specs/2026-04-25-spsc-pipe-tripleBuffer-design.md`, demonstrably faster than BCL `Pipe` under SPSC scheduling.
 
-**Architecture:** Two `TripleBuffer<T>` instances carry cross-thread state snapshots; two single-packed-int `SpscAwaiter<T>` instances handle wakeups via a stash-and-construct (Pattern 2) pattern. Writer is sole mutator of segments and chain. Recycle predicate is reference comparison. Read/flush precedence is throw-first (BCL-strict per `IsCompletedOrThrow`).
+**Architecture:** Two `TripleBuffer<T>` instances carry cross-thread state snapshots; two single-packed-int `PipelyAwaiter<T>` instances handle wakeups via a stash-and-construct (Pattern 2) pattern. Writer is sole mutator of segments and chain. Recycle predicate is reference comparison. Read/flush precedence is throw-first (BCL-strict per `IsCompletedOrThrow`).
 
 **Tech Stack:** C# / .NET 10, `System.IO.Pipelines`, `System.Buffers`, `System.Threading`, `ManualResetValueTaskSourceCore<T>`, `ReadOnlySequence<byte>`. Tests: xUnit. Benchmarks: BenchmarkDotNet + `MemoryDiagnoser`.
 
@@ -16,49 +16,49 @@
 - TDD per checkpoint: every public-API task pairs implementation with tests in the same commit.
 - R4-7 (pipe-identity check): included in Task 2 via per-segment back-reference.
 - R4-13 (zero-byte flush optimization): deferred. Spec acknowledges as optional.
-- R4-15 (`SpscAwaiter<FlushResult>` stash-field savings): deferred. Spec acknowledges as cosmetic.
+- R4-15 (`PipelyAwaiter<FlushResult>` stash-field savings): deferred. Spec acknowledges as cosmetic.
 
 ---
 
 ## File structure
 
 ```
-SpscPipe/                                          (existing root)
-├── SpscPipe.sln                                   (NEW)
+Pipe/                                          (existing root)
+├── Pipe.sln                                   (NEW)
 ├── src/
-│   └── SpscPipelines/
-│       ├── SpscPipelines.csproj                   (existing — minor edit for InternalsVisibleTo)
+│   └── Pipely/
+│       ├── Pipely.csproj                   (existing — minor edit for InternalsVisibleTo)
 │       ├── TripleBuffer.cs                        (existing — unchanged)
 │       ├── BufferSegment.cs                       (NEW)
-│       ├── SpscAwaiter.cs                         (NEW)
-│       ├── SpscPipeOptions.cs                     (NEW)
+│       ├── PipelyAwaiter.cs                         (NEW)
+│       ├── PipeOptions.cs                     (NEW)
 │       ├── WriterState.cs                         (NEW — internal struct)
 │       ├── ReaderState.cs                         (NEW — internal struct)
-│       ├── SpscPipe.cs                            (NEW — main class + nested Reader/Writer)
-│       ├── SpscPipe.Reader.cs                     (NEW — partial; nested SpscPipeReader)
-│       └── SpscPipe.Writer.cs                     (NEW — partial; nested SpscPipeWriter)
+│       ├── Pipe.cs                            (NEW — main class + nested Reader/Writer)
+│       ├── Pipe.Reader.cs                     (NEW — partial; nested PipeReader)
+│       └── Pipe.Writer.cs                     (NEW — partial; nested PipeWriter)
 └── tests/
-    ├── SpscPipe.Tests/                            (NEW)
-    │   ├── SpscPipe.Tests.csproj
+    ├── Pipe.Tests/                            (NEW)
+    │   ├── Pipe.Tests.csproj
     │   ├── BufferSegmentTests.cs
-    │   ├── SpscAwaiterTests.cs
-    │   ├── SpscPipeWriterTests.cs
-    │   ├── SpscPipeReaderTests.cs
-    │   ├── SpscPipeAdvanceToTests.cs
-    │   ├── SpscPipeLifecycleTests.cs
-    │   ├── SpscPipeCancellationTests.cs
-    │   ├── SpscPipeDisposeTests.cs
+    │   ├── PipelyAwaiterTests.cs
+    │   ├── PipeWriterTests.cs
+    │   ├── PipeReaderTests.cs
+    │   ├── PipeAdvanceToTests.cs
+    │   ├── PipeLifecycleTests.cs
+    │   ├── PipeCancellationTests.cs
+    │   ├── PipeDisposeTests.cs
     │   └── BclParityTests.cs
-    ├── SpscPipe.Stress/                           (NEW)
-    │   ├── SpscPipe.Stress.csproj
+    ├── Pipe.Stress/                           (NEW)
+    │   ├── Pipe.Stress.csproj
     │   ├── ByteSequence.cs
     │   ├── StressHarness.cs
     │   └── Program.cs
-    └── SpscPipe.Benchmarks/                       (NEW)
-        ├── SpscPipe.Benchmarks.csproj
+    └── Pipe.Benchmarks/                       (NEW)
+        ├── Pipe.Benchmarks.csproj
         ├── IPipeAdapter.cs
         ├── BclPipeAdapter.cs
-        ├── SpscPipeAdapter.cs                     (added in Task 13)
+        ├── PipeAdapter.cs                     (added in Task 13)
         ├── ThroughputBenchmarks.cs
         ├── LatencyHarness.cs
         ├── Histogram.cs
@@ -75,8 +75,8 @@ SpscPipe/                                          (existing root)
 - [ ] **Step 1: Create the implementation worktree from master**
 
 ```bash
-git worktree add /home/harrison/src/worktrees/SpscPipe/spsc-impl -b spsc-impl
-cd /home/harrison/src/worktrees/SpscPipe/spsc-impl
+git worktree add /home/harrison/src/worktrees/Pipe/spsc-impl -b spsc-impl
+cd /home/harrison/src/worktrees/Pipe/spsc-impl
 ```
 
 Expected: new worktree on branch `spsc-impl` with all current files present.
@@ -93,7 +93,7 @@ Expected: spec file exists; latest commit is `2ca40e9` (round-4 lock-in) or late
 - [ ] **Step 3: Verify existing TripleBuffer compiles**
 
 ```bash
-dotnet build src/SpscPipelines/SpscPipelines.csproj
+dotnet build src/Pipely/Pipely.csproj
 ```
 
 Expected: build succeeds with no errors.
@@ -105,38 +105,38 @@ Expected: build succeeds with no errors.
 **Goal:** Establish a solution, a benchmark project against BCL `Pipe`, and verify it runs end-to-end before writing any new SPSC code. This is Section 7's prerequisite — without baseline benchmarks, "materially higher than BCL" can't be measured.
 
 **Files:**
-- Create: `SpscPipe.sln` (root)
-- Create: `tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj`
-- Create: `tests/SpscPipe.Benchmarks/IPipeAdapter.cs`
-- Create: `tests/SpscPipe.Benchmarks/BclPipeAdapter.cs`
-- Create: `tests/SpscPipe.Benchmarks/Histogram.cs`
-- Create: `tests/SpscPipe.Benchmarks/ThroughputBenchmarks.cs`
-- Create: `tests/SpscPipe.Benchmarks/LatencyHarness.cs`
-- Create: `tests/SpscPipe.Benchmarks/Program.cs`
+- Create: `Pipe.sln` (root)
+- Create: `tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj`
+- Create: `tests/Pipe.Benchmarks/IPipeAdapter.cs`
+- Create: `tests/Pipe.Benchmarks/BclPipeAdapter.cs`
+- Create: `tests/Pipe.Benchmarks/Histogram.cs`
+- Create: `tests/Pipe.Benchmarks/ThroughputBenchmarks.cs`
+- Create: `tests/Pipe.Benchmarks/LatencyHarness.cs`
+- Create: `tests/Pipe.Benchmarks/Program.cs`
 
 - [ ] **Step 1: Create the solution and add the existing project**
 
 ```bash
-cd /home/harrison/src/worktrees/SpscPipe/spsc-impl
-dotnet new sln -n SpscPipe
-dotnet sln add src/SpscPipelines/SpscPipelines.csproj
+cd /home/harrison/src/worktrees/Pipe/spsc-impl
+dotnet new sln -n Pipe
+dotnet sln add src/Pipely/Pipely.csproj
 ```
 
-Expected: `SpscPipe.sln` created; project added.
+Expected: `Pipe.sln` created; project added.
 
 - [ ] **Step 2: Create the benchmarks project**
 
 ```bash
-mkdir -p tests/SpscPipe.Benchmarks
-dotnet new console -n SpscPipe.Benchmarks -o tests/SpscPipe.Benchmarks --framework net10.0
-dotnet sln add tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj
-dotnet add tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj reference src/SpscPipelines/SpscPipelines.csproj
-dotnet add tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj package BenchmarkDotNet
+mkdir -p tests/Pipe.Benchmarks
+dotnet new console -n Pipe.Benchmarks -o tests/Pipe.Benchmarks --framework net10.0
+dotnet sln add tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj
+dotnet add tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj reference src/Pipely/Pipely.csproj
+dotnet add tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj package BenchmarkDotNet
 ```
 
 Expected: project created, BenchmarkDotNet referenced.
 
-- [ ] **Step 3: Edit `tests/SpscPipe.Benchmarks/SpscPipe.Benchmarks.csproj` to set release config defaults**
+- [ ] **Step 3: Edit `tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj` to set release config defaults**
 
 Set `<PropertyGroup>` to include:
 ```xml
@@ -147,14 +147,14 @@ Set `<PropertyGroup>` to include:
 <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
 ```
 
-Verify: `dotnet build tests/SpscPipe.Benchmarks/ -c Release` succeeds.
+Verify: `dotnet build tests/Pipe.Benchmarks/ -c Release` succeeds.
 
 - [ ] **Step 4: Write `IPipeAdapter.cs`**
 
 ```csharp
 using System.IO.Pipelines;
 
-namespace SpscPipe.Benchmarks;
+namespace Pipe.Benchmarks;
 
 internal interface IPipeAdapter : IDisposable
 {
@@ -168,7 +168,7 @@ internal interface IPipeAdapter : IDisposable
 ```csharp
 using System.IO.Pipelines;
 
-namespace SpscPipe.Benchmarks;
+namespace Pipe.Benchmarks;
 
 internal sealed class BclPipeAdapter : IPipeAdapter
 {
@@ -183,7 +183,7 @@ internal sealed class BclPipeAdapter : IPipeAdapter
 - [ ] **Step 6: Write `Histogram.cs` (log-bucket histogram for latency)**
 
 ```csharp
-namespace SpscPipe.Benchmarks;
+namespace Pipe.Benchmarks;
 
 internal sealed class Histogram
 {
@@ -222,7 +222,7 @@ internal sealed class Histogram
 using BenchmarkDotNet.Attributes;
 using System.IO.Pipelines;
 
-namespace SpscPipe.Benchmarks;
+namespace Pipe.Benchmarks;
 
 [MemoryDiagnoser]
 public class ThroughputBenchmarks
@@ -268,7 +268,7 @@ public class ThroughputBenchmarks
 - [ ] **Step 8: Write `LatencyHarness.cs` (skeleton; populated in Task 13)**
 
 ```csharp
-namespace SpscPipe.Benchmarks;
+namespace Pipe.Benchmarks;
 
 internal static class LatencyHarness
 {
@@ -287,7 +287,7 @@ internal static class LatencyHarness
 
 ```csharp
 using BenchmarkDotNet.Running;
-using SpscPipe.Benchmarks;
+using Pipe.Benchmarks;
 
 if (args.Length > 0 && args[0] == "latency")
 {
@@ -302,7 +302,7 @@ BenchmarkSwitcher.FromAssembly(typeof(ThroughputBenchmarks).Assembly).Run(args);
 - [ ] **Step 10: Smoke-test the benchmark infrastructure**
 
 ```bash
-dotnet run --project tests/SpscPipe.Benchmarks -c Release -- --filter "*BclPipe_ProduceAndDrain*" --maxIterationCount 5 --warmupCount 2 --invocationCount 1
+dotnet run --project tests/Pipe.Benchmarks -c Release -- --filter "*BclPipe_ProduceAndDrain*" --maxIterationCount 5 --warmupCount 2 --invocationCount 1
 ```
 
 Expected: BDN runs, completes 5 iterations of `BclPipe_ProduceAndDrain`, prints throughput numbers. No exceptions.
@@ -310,7 +310,7 @@ Expected: BDN runs, completes 5 iterations of `BclPipe_ProduceAndDrain`, prints 
 - [ ] **Step 11: Verify latency harness skeleton runs**
 
 ```bash
-dotnet run --project tests/SpscPipe.Benchmarks -c Release -- latency
+dotnet run --project tests/Pipe.Benchmarks -c Release -- latency
 ```
 
 Expected: Prints the skeleton message; no exceptions.
@@ -318,7 +318,7 @@ Expected: Prints the skeleton message; no exceptions.
 - [ ] **Step 12: Commit**
 
 ```bash
-git add SpscPipe.sln tests/SpscPipe.Benchmarks/
+git add Pipe.sln tests/Pipe.Benchmarks/
 git commit -m "Benchmarks: project + IPipeAdapter + BCL adapter + throughput skeleton"
 ```
 
@@ -329,44 +329,44 @@ git commit -m "Benchmarks: project + IPipeAdapter + BCL adapter + throughput ske
 **Goal:** Implement the segment type per Spec §3, including the R4-7 `OwnerToken` for cross-pipe `SequencePosition` detection.
 
 **Files:**
-- Create: `src/SpscPipelines/BufferSegment.cs`
-- Create: `tests/SpscPipe.Tests/SpscPipe.Tests.csproj`
-- Create: `tests/SpscPipe.Tests/BufferSegmentTests.cs`
-- Modify: `src/SpscPipelines/SpscPipelines.csproj` (add `InternalsVisibleTo` for tests)
+- Create: `src/Pipely/BufferSegment.cs`
+- Create: `tests/Pipe.Tests/Pipe.Tests.csproj`
+- Create: `tests/Pipe.Tests/BufferSegmentTests.cs`
+- Modify: `src/Pipely/Pipely.csproj` (add `InternalsVisibleTo` for tests)
 
 - [ ] **Step 1: Create the test project and add references**
 
 ```bash
-mkdir -p tests/SpscPipe.Tests
-dotnet new xunit -n SpscPipe.Tests -o tests/SpscPipe.Tests --framework net10.0
-dotnet sln add tests/SpscPipe.Tests/SpscPipe.Tests.csproj
-dotnet add tests/SpscPipe.Tests/SpscPipe.Tests.csproj reference src/SpscPipelines/SpscPipelines.csproj
+mkdir -p tests/Pipe.Tests
+dotnet new xunit -n Pipe.Tests -o tests/Pipe.Tests --framework net10.0
+dotnet sln add tests/Pipe.Tests/Pipe.Tests.csproj
+dotnet add tests/Pipe.Tests/Pipe.Tests.csproj reference src/Pipely/Pipely.csproj
 ```
 
-Verify: `dotnet build tests/SpscPipe.Tests/` succeeds with stub test passing.
+Verify: `dotnet build tests/Pipe.Tests/` succeeds with stub test passing.
 
 - [ ] **Step 2: Add `InternalsVisibleTo` to the main project**
 
-Edit `src/SpscPipelines/SpscPipelines.csproj`, add inside `<Project>`:
+Edit `src/Pipely/Pipely.csproj`, add inside `<Project>`:
 
 ```xml
 <ItemGroup>
-  <InternalsVisibleTo Include="SpscPipe.Tests" />
-  <InternalsVisibleTo Include="SpscPipe.Stress" />
-  <InternalsVisibleTo Include="SpscPipe.Benchmarks" />
+  <InternalsVisibleTo Include="Pipe.Tests" />
+  <InternalsVisibleTo Include="Pipe.Stress" />
+  <InternalsVisibleTo Include="Pipe.Benchmarks" />
 </ItemGroup>
 ```
 
-Verify: `dotnet build src/SpscPipelines/` still succeeds.
+Verify: `dotnet build src/Pipely/` still succeeds.
 
-- [ ] **Step 3: Write the failing rent test in `tests/SpscPipe.Tests/BufferSegmentTests.cs`**
+- [ ] **Step 3: Write the failing rent test in `tests/Pipe.Tests/BufferSegmentTests.cs`**
 
 ```csharp
 using System.Buffers;
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
 public class BufferSegmentTests
 {
@@ -391,19 +391,19 @@ public class BufferSegmentTests
 - [ ] **Step 4: Run the failing test**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~BufferSegmentTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~BufferSegmentTests"
 ```
 
 Expected: FAIL with "BufferSegment not defined" or "RentFrom not defined".
 
 - [ ] **Step 5: Implement `BufferSegment.cs`**
 
-Create `src/SpscPipelines/BufferSegment.cs`:
+Create `src/Pipely/BufferSegment.cs`:
 
 ```csharp
 using System.Buffers;
 
-namespace SpscPipelines;
+namespace Pipely;
 
 internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
 {
@@ -451,7 +451,7 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
         AvailableMemory = default;
     }
 
-    // Used by SpscPipe's freelist to link recycled segments without affecting End/Memory.
+    // Used by Pipe's freelist to link recycled segments without affecting End/Memory.
     // (Avoids overloading Freeze/RecycleReset for the freelist-link use case.)
     public void SetFreelistNext(BufferSegment? next)
     {
@@ -464,7 +464,7 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
 - [ ] **Step 6: Run test, expect pass**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~RentFrom_SetsAvailableMemoryAndOwnerToken"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~RentFrom_SetsAvailableMemoryAndOwnerToken"
 ```
 
 Expected: PASS.
@@ -525,7 +525,7 @@ public void DisposeOwned_ReleasesMemoryOwner()
 - [ ] **Step 8: Run all `BufferSegmentTests`**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~BufferSegmentTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~BufferSegmentTests"
 ```
 
 Expected: all 4 tests PASS.
@@ -561,67 +561,67 @@ Run; expect pass. This is a regression sentry — if it ever fails, the spec's S
 - [ ] **Step 10: Commit**
 
 ```bash
-git add src/SpscPipelines/BufferSegment.cs src/SpscPipelines/SpscPipelines.csproj tests/SpscPipe.Tests/
+git add src/Pipely/BufferSegment.cs src/Pipely/Pipely.csproj tests/Pipe.Tests/
 git commit -m "BufferSegment: implementation + unit tests + Memory<T> sentinel"
 ```
 
 ---
 
-## Task 3: SpscAwaiter<T> + state machine
+## Task 3: PipelyAwaiter<T> + state machine
 
-**Goal:** Implement the awaiter per Spec §5 — single packed `int` state, Pattern 2 stash, IValueTaskSource<T>. Test the state machine via direct CAS sequences (state-machine in isolation; integration tested later via SpscPipe).
+**Goal:** Implement the awaiter per Spec §5 — single packed `int` state, Pattern 2 stash, IValueTaskSource<T>. Test the state machine via direct CAS sequences (state-machine in isolation; integration tested later via Pipe).
 
 **Files:**
-- Create: `src/SpscPipelines/SpscAwaiter.cs`
-- Create: `tests/SpscPipe.Tests/SpscAwaiterTests.cs`
+- Create: `src/Pipely/PipelyAwaiter.cs`
+- Create: `tests/Pipe.Tests/PipelyAwaiterTests.cs`
 
 - [ ] **Step 1: Write the failing initial-state test**
 
 ```csharp
 using System.Threading;
 using System.Threading.Tasks.Sources;
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
-public class SpscAwaiterTests
+public class PipelyAwaiterTests
 {
     [Fact]
     public void NewAwaiter_StateIsInactive()
     {
-        var a = new SpscAwaiter<int>();
-        Assert.Equal(SpscAwaiter<int>.Inactive, a._state);
+        var a = new PipelyAwaiter<int>();
+        Assert.Equal(PipelyAwaiter<int>.Inactive, a._state);
     }
 }
 ```
 
-- [ ] **Step 2: Run, expect fail (`SpscAwaiter` not defined)**
+- [ ] **Step 2: Run, expect fail (`PipelyAwaiter` not defined)**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~SpscAwaiterTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~PipelyAwaiterTests"
 ```
 
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `SpscAwaiter.cs` (skeleton + state constants)**
+- [ ] **Step 3: Implement `PipelyAwaiter.cs` (skeleton + state constants)**
 
-Create `src/SpscPipelines/SpscAwaiter.cs`:
+Create `src/Pipely/PipelyAwaiter.cs`:
 
 ```csharp
 using System.Threading;
 using System.Threading.Tasks.Sources;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
+internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
 {
     public ManualResetValueTaskSourceCore<T> _core = new() { RunContinuationsAsynchronously = true };
     public int _state;
     public CancellationTokenRegistration _ctr;
     public CancellationToken _token;
 
-    // Pattern 2 stash (used by SpscAwaiter<ReadResult>; ignored by SpscAwaiter<FlushResult>).
+    // Pattern 2 stash (used by PipelyAwaiter<ReadResult>; ignored by PipelyAwaiter<FlushResult>).
     public BufferSegment? _stashHead;
     public int _stashHeadIdx;
     public BufferSegment? _stashTail;
@@ -643,36 +643,36 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
 - [ ] **Step 4: Run; expect pass**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~NewAwaiter_StateIsInactive"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~NewAwaiter_StateIsInactive"
 ```
 
 Expected: PASS.
 
 - [ ] **Step 5: Add cancel-flag tests (Or sets, owner CAS clears)**
 
-Append to `SpscAwaiterTests.cs`:
+Append to `PipelyAwaiterTests.cs`:
 
 ```csharp
 [Fact]
 public void Or_CancelFlag_SetsBitAndReturnsOldValue()
 {
-    var a = new SpscAwaiter<int>();
-    int old = Interlocked.Or(ref a._state, SpscAwaiter<int>.CancelFlag);
+    var a = new PipelyAwaiter<int>();
+    int old = Interlocked.Or(ref a._state, PipelyAwaiter<int>.CancelFlag);
 
-    Assert.Equal(SpscAwaiter<int>.Inactive, old);
-    Assert.Equal(SpscAwaiter<int>.CancelFlag, a._state);
+    Assert.Equal(PipelyAwaiter<int>.Inactive, old);
+    Assert.Equal(PipelyAwaiter<int>.CancelFlag, a._state);
 }
 
 [Fact]
 public void OwnerCanClearCancelFlagViaCAS()
 {
-    var a = new SpscAwaiter<int>();
-    a._state = SpscAwaiter<int>.CancelFlag;     // simulate canceler's Or
+    var a = new PipelyAwaiter<int>();
+    a._state = PipelyAwaiter<int>.CancelFlag;     // simulate canceler's Or
 
-    int prior = Interlocked.CompareExchange(ref a._state, SpscAwaiter<int>.Inactive, SpscAwaiter<int>.CancelFlag);
+    int prior = Interlocked.CompareExchange(ref a._state, PipelyAwaiter<int>.Inactive, PipelyAwaiter<int>.CancelFlag);
 
-    Assert.Equal(SpscAwaiter<int>.CancelFlag, prior);
-    Assert.Equal(SpscAwaiter<int>.Inactive, a._state);
+    Assert.Equal(PipelyAwaiter<int>.CancelFlag, prior);
+    Assert.Equal(PipelyAwaiter<int>.Inactive, a._state);
 }
 ```
 
@@ -684,20 +684,20 @@ Run; expect pass. (Tests state semantics only; no parking yet.)
 [Fact]
 public async Task ParkThenSignal_DeliversResult()
 {
-    var a = new SpscAwaiter<int>();
+    var a = new PipelyAwaiter<int>();
     a._core.Reset();
 
     // Owner: CAS Inactive → Pending.
-    int prior = Interlocked.CompareExchange(ref a._state, SpscAwaiter<int>.Pending, SpscAwaiter<int>.Inactive);
-    Assert.Equal(SpscAwaiter<int>.Inactive, prior);
+    int prior = Interlocked.CompareExchange(ref a._state, PipelyAwaiter<int>.Pending, PipelyAwaiter<int>.Inactive);
+    Assert.Equal(PipelyAwaiter<int>.Inactive, prior);
 
     var task = new ValueTask<int>(a, a.Version);
 
     // Signaler: CAS Pending → Inactive (state cleared, flag preserved). Then SetResult.
     int oldV = a._state;
-    int desired = oldV & ~SpscAwaiter<int>.StateMask;
+    int desired = oldV & ~PipelyAwaiter<int>.StateMask;
     int seen = Interlocked.CompareExchange(ref a._state, desired, oldV);
-    Assert.Equal(SpscAwaiter<int>.Pending, seen);
+    Assert.Equal(PipelyAwaiter<int>.Pending, seen);
 
     a._core.SetResult(42);
 
@@ -713,27 +713,27 @@ Run; expect PASS.
 [Fact]
 public async Task ParkThenCancelerSetsFlagThenSignaler_FlagPreservedAfterDelivery()
 {
-    var a = new SpscAwaiter<int>();
+    var a = new PipelyAwaiter<int>();
     a._core.Reset();
 
-    Interlocked.CompareExchange(ref a._state, SpscAwaiter<int>.Pending, SpscAwaiter<int>.Inactive);
+    Interlocked.CompareExchange(ref a._state, PipelyAwaiter<int>.Pending, PipelyAwaiter<int>.Inactive);
 
     // Canceler races first: Or flag.
-    Interlocked.Or(ref a._state, SpscAwaiter<int>.CancelFlag);
-    Assert.Equal(SpscAwaiter<int>.Pending | SpscAwaiter<int>.CancelFlag, a._state);
+    Interlocked.Or(ref a._state, PipelyAwaiter<int>.CancelFlag);
+    Assert.Equal(PipelyAwaiter<int>.Pending | PipelyAwaiter<int>.CancelFlag, a._state);
 
     var task = new ValueTask<int>(a, a.Version);
 
     // Signaler wins CAS Pending|Flag → Inactive|Flag (state cleared, flag preserved).
     int oldV = a._state;
-    int desired = oldV & ~SpscAwaiter<int>.StateMask;
+    int desired = oldV & ~PipelyAwaiter<int>.StateMask;
     int seen = Interlocked.CompareExchange(ref a._state, desired, oldV);
-    Assert.Equal(SpscAwaiter<int>.Pending | SpscAwaiter<int>.CancelFlag, seen);
+    Assert.Equal(PipelyAwaiter<int>.Pending | PipelyAwaiter<int>.CancelFlag, seen);
     a._core.SetResult(7);
 
     Assert.Equal(7, await task);
     // Flag remains set; next Park's R4 lost-cancel re-check picks it up.
-    Assert.Equal(SpscAwaiter<int>.CancelFlag, a._state);
+    Assert.Equal(PipelyAwaiter<int>.CancelFlag, a._state);
 }
 ```
 
@@ -745,24 +745,24 @@ Run; expect PASS.
 [Fact]
 public async Task CancelerWinsCAS_DeliversResultAndClearsFlag()
 {
-    var a = new SpscAwaiter<int>();
+    var a = new PipelyAwaiter<int>();
     a._core.Reset();
 
-    Interlocked.CompareExchange(ref a._state, SpscAwaiter<int>.Pending, SpscAwaiter<int>.Inactive);
-    Interlocked.Or(ref a._state, SpscAwaiter<int>.CancelFlag);
+    Interlocked.CompareExchange(ref a._state, PipelyAwaiter<int>.Pending, PipelyAwaiter<int>.Inactive);
+    Interlocked.Or(ref a._state, PipelyAwaiter<int>.CancelFlag);
 
     var task = new ValueTask<int>(a, a.Version);
 
     // Canceler CAS Pending|Flag → Inactive (flag cleared by this CAS).
     int seen = Interlocked.CompareExchange(
         ref a._state,
-        SpscAwaiter<int>.Inactive,
-        SpscAwaiter<int>.Pending | SpscAwaiter<int>.CancelFlag);
-    Assert.Equal(SpscAwaiter<int>.Pending | SpscAwaiter<int>.CancelFlag, seen);
+        PipelyAwaiter<int>.Inactive,
+        PipelyAwaiter<int>.Pending | PipelyAwaiter<int>.CancelFlag);
+    Assert.Equal(PipelyAwaiter<int>.Pending | PipelyAwaiter<int>.CancelFlag, seen);
     a._core.SetResult(99);
 
     Assert.Equal(99, await task);
-    Assert.Equal(SpscAwaiter<int>.Inactive, a._state);
+    Assert.Equal(PipelyAwaiter<int>.Inactive, a._state);
 }
 ```
 
@@ -774,7 +774,7 @@ Run; expect PASS.
 [Fact]
 public void StashFields_AreReadableAfterAssignment()
 {
-    var a = new SpscAwaiter<int>();
+    var a = new PipelyAwaiter<int>();
     var head = new BufferSegment();
     head.RentFrom(System.Buffers.MemoryPool<byte>.Shared, 1024, 0, this);
     var tail = new BufferSegment();
@@ -797,33 +797,33 @@ Run; expect PASS.
 - [ ] **Step 10: Commit**
 
 ```bash
-git add src/SpscPipelines/SpscAwaiter.cs tests/SpscPipe.Tests/SpscAwaiterTests.cs
-git commit -m "SpscAwaiter<T>: state machine + Pattern 2 stash + unit tests"
+git add src/Pipely/PipelyAwaiter.cs tests/Pipe.Tests/PipelyAwaiterTests.cs
+git commit -m "PipelyAwaiter<T>: state machine + Pattern 2 stash + unit tests"
 ```
 
 ---
 
-## Task 4: SpscPipeOptions + SpscPipe scaffolding + GetMemory/GetSpan/Advance
+## Task 4: PipeOptions + Pipe scaffolding + GetMemory/GetSpan/Advance
 
 **Goal:** Define the public API shell, options, and the writer-local `GetMemory`/`Advance` methods. No cross-thread interaction yet.
 
 **Files:**
-- Create: `src/SpscPipelines/SpscPipeOptions.cs`
-- Create: `src/SpscPipelines/WriterState.cs`
-- Create: `src/SpscPipelines/ReaderState.cs`
-- Create: `src/SpscPipelines/SpscPipe.cs`
-- Create: `src/SpscPipelines/SpscPipe.Writer.cs`
-- Create: `src/SpscPipelines/SpscPipe.Reader.cs`
-- Create: `tests/SpscPipe.Tests/SpscPipeWriterTests.cs`
+- Create: `src/Pipely/PipeOptions.cs`
+- Create: `src/Pipely/WriterState.cs`
+- Create: `src/Pipely/ReaderState.cs`
+- Create: `src/Pipely/Pipe.cs`
+- Create: `src/Pipely/Pipe.Writer.cs`
+- Create: `src/Pipely/Pipe.Reader.cs`
+- Create: `tests/Pipe.Tests/PipeWriterTests.cs`
 
-- [ ] **Step 1: Write `SpscPipeOptions.cs` per Spec §6**
+- [ ] **Step 1: Write `PipeOptions.cs` per Spec §6**
 
 ```csharp
 using System.Buffers;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed class SpscPipeOptions
+public sealed class PipeOptions
 {
     public MemoryPool<byte> Pool { get; }
     public int  MinimumSegmentSize    { get; }
@@ -831,7 +831,7 @@ public sealed class SpscPipeOptions
     public long ResumeWriterThreshold { get; }
     public int  MaxFreelistSegments   { get; }
 
-    public SpscPipeOptions(
+    public PipeOptions(
         MemoryPool<byte>? pool = null,
         int  minimumSegmentSize    = 4096,
         long pauseWriterThreshold  = 65536,
@@ -852,7 +852,7 @@ public sealed class SpscPipeOptions
         MaxFreelistSegments   = maxFreelistSegments;
     }
 
-    public static SpscPipeOptions Default { get; } = new();
+    public static PipeOptions Default { get; } = new();
 }
 ```
 
@@ -860,7 +860,7 @@ public sealed class SpscPipeOptions
 
 `WriterState.cs`:
 ```csharp
-namespace SpscPipelines;
+namespace Pipely;
 
 internal struct WriterState
 {
@@ -875,7 +875,7 @@ internal struct WriterState
 
 `ReaderState.cs`:
 ```csharp
-namespace SpscPipelines;
+namespace Pipely;
 
 internal struct ReaderState
 {
@@ -887,20 +887,20 @@ internal struct ReaderState
 }
 ```
 
-- [ ] **Step 3: Write `SpscPipe.cs` (main class, options, fields, nested Reader/Writer placeholders)**
+- [ ] **Step 3: Write `Pipe.cs` (main class, options, fields, nested Reader/Writer placeholders)**
 
 ```csharp
 using System.IO.Pipelines;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed partial class SpscPipe : IDisposable
+public sealed partial class Pipe : IDisposable
 {
-    internal readonly SpscPipeOptions _options;
+    internal readonly PipeOptions _options;
     internal readonly TripleBuffer<WriterState> _writerTb = new();
     internal readonly TripleBuffer<ReaderState> _readerTb = new();
-    internal readonly SpscAwaiter<ReadResult>  _readAwaiter  = new();
-    internal readonly SpscAwaiter<FlushResult> _flushAwaiter = new();
+    internal readonly PipelyAwaiter<ReadResult>  _readAwaiter  = new();
+    internal readonly PipelyAwaiter<FlushResult> _flushAwaiter = new();
 
     // Writer-side cursors (writer thread only).
     internal BufferSegment? _chainHead;
@@ -927,15 +927,15 @@ public sealed partial class SpscPipe : IDisposable
     // Pipe-level (mutated by Dispose only).
     internal bool _disposed;
 
-    private readonly SpscPipeWriter _writerInstance;
-    private readonly SpscPipeReader _readerInstance;
+    private readonly PipeWriter _writerInstance;
+    private readonly PipeReader _readerInstance;
 
-    public SpscPipe() : this(SpscPipeOptions.Default) { }
-    public SpscPipe(SpscPipeOptions options)
+    public Pipe() : this(PipeOptions.Default) { }
+    public Pipe(PipeOptions options)
     {
         _options       = options;
-        _writerInstance = new SpscPipeWriter(this);
-        _readerInstance = new SpscPipeReader(this);
+        _writerInstance = new PipeWriter(this);
+        _readerInstance = new PipeReader(this);
     }
 
     public PipeWriter Writer => _writerInstance;
@@ -950,24 +950,24 @@ public sealed partial class SpscPipe : IDisposable
 }
 ```
 
-- [ ] **Step 4: Write `SpscPipe.Writer.cs` (nested SpscPipeWriter with GetMemory/GetSpan/Advance)**
+- [ ] **Step 4: Write `Pipe.Writer.cs` (nested PipeWriter with GetMemory/GetSpan/Advance)**
 
 ```csharp
 using System.Buffers;
 using System.IO.Pipelines;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed partial class SpscPipe
+public sealed partial class Pipe
 {
-    internal sealed class SpscPipeWriter : PipeWriter
+    internal sealed class PipeWriter : PipeWriter
     {
-        private readonly SpscPipe _pipe;
-        public SpscPipeWriter(SpscPipe pipe) => _pipe = pipe;
+        private readonly Pipe _pipe;
+        public PipeWriter(Pipe pipe) => _pipe = pipe;
 
         public override Memory<byte> GetMemory(int sizeHint = 0)
         {
-            if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+            if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
             if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
             if (sizeHint < 0) throw new ArgumentOutOfRangeException(nameof(sizeHint));
             if (sizeHint == 0) sizeHint = 1;
@@ -999,7 +999,7 @@ public sealed partial class SpscPipe
 
         public override void Advance(int bytes)
         {
-            if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+            if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
             if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
             if (_pipe._writingHead == null) throw new InvalidOperationException("Advance without prior GetMemory.");
             if (_pipe._writingHeadBytesBuffered + bytes > _pipe._writingHead.AvailableMemory.Length)
@@ -1016,19 +1016,19 @@ public sealed partial class SpscPipe
 }
 ```
 
-- [ ] **Step 5: Write `SpscPipe.Reader.cs` (nested placeholder)**
+- [ ] **Step 5: Write `Pipe.Reader.cs` (nested placeholder)**
 
 ```csharp
 using System.IO.Pipelines;
 
-namespace SpscPipelines;
+namespace Pipely;
 
-public sealed partial class SpscPipe
+public sealed partial class Pipe
 {
-    internal sealed class SpscPipeReader : PipeReader
+    internal sealed class PipeReader : PipeReader
     {
-        private readonly SpscPipe _pipe;
-        public SpscPipeReader(SpscPipe pipe) => _pipe = pipe;
+        private readonly Pipe _pipe;
+        public PipeReader(Pipe pipe) => _pipe = pipe;
 
         public override ValueTask<ReadResult> ReadAsync(CancellationToken ct = default) => throw new NotImplementedException();
         public override bool TryRead(out ReadResult result) => throw new NotImplementedException();
@@ -1040,9 +1040,9 @@ public sealed partial class SpscPipe
 }
 ```
 
-- [ ] **Step 6: Add `RentSegment` and freelist helpers to `SpscPipe.Writer.cs` (or back on SpscPipe.cs)**
+- [ ] **Step 6: Add `RentSegment` and freelist helpers to `Pipe.Writer.cs` (or back on Pipe.cs)**
 
-Add inside `SpscPipe`:
+Add inside `Pipe`:
 
 ```csharp
 internal BufferSegment RentSegment(int sizeHint, long runningIndex)
@@ -1096,20 +1096,20 @@ internal void PushFreelist(BufferSegment s)
 
 - [ ] **Step 7: Write writer tests**
 
-Create `tests/SpscPipe.Tests/SpscPipeWriterTests.cs`:
+Create `tests/Pipe.Tests/PipeWriterTests.cs`:
 
 ```csharp
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
-public class SpscPipeWriterTests
+public class PipeWriterTests
 {
     [Fact]
     public void GetMemory_ReturnsAtLeastSizeHint_AndAdvanceTracksBytes()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var mem = pipe.Writer.GetMemory(100);
         Assert.True(mem.Length >= 100);
         for (int i = 0; i < 100; i++) mem.Span[i] = (byte)i;
@@ -1123,7 +1123,7 @@ public class SpscPipeWriterTests
     [Fact]
     public void GetMemory_TransitionsToNewSegmentWhenSizeHintExceedsRemaining()
     {
-        using var pipe = new SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipe(new PipeOptions(minimumSegmentSize: 64));
         var mem1 = pipe.Writer.GetMemory(64);
         pipe.Writer.Advance(50);
 
@@ -1134,7 +1134,7 @@ public class SpscPipeWriterTests
     [Fact]
     public void Advance_BeyondCapacity_Throws()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         pipe.Writer.GetMemory(1);
         Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Advance(int.MaxValue));
     }
@@ -1142,9 +1142,9 @@ public class SpscPipeWriterTests
     [Fact]
     public void GetMemory_AfterComplete_Throws()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         // Manually set the internal flag to test the entry guard. Complete is wired in Task 9.
-        // SpscPipe.Tests has InternalsVisibleTo, so direct field access works.
+        // Pipe.Tests has InternalsVisibleTo, so direct field access works.
         pipe._writerCompleted = true;
 
         Assert.Throws<InvalidOperationException>(() => pipe.Writer.GetMemory(0));
@@ -1153,7 +1153,7 @@ public class SpscPipeWriterTests
     [Fact]
     public void GetMemory_AfterDispose_Throws()
     {
-        var pipe = new SpscPipe();
+        var pipe = new Pipe();
         pipe.Dispose();
         Assert.Throws<ObjectDisposedException>(() => pipe.Writer.GetMemory(0));
     }
@@ -1163,14 +1163,14 @@ public class SpscPipeWriterTests
 - [ ] **Step 8: Run all writer tests; expect PASS**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~SpscPipeWriterTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~PipeWriterTests"
 ```
 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/SpscPipelines/ tests/SpscPipe.Tests/
-git commit -m "SpscPipe: scaffolding + GetMemory/GetSpan/Advance + writer entry guards"
+git add src/Pipely/ tests/Pipe.Tests/
+git commit -m "Pipe: scaffolding + GetMemory/GetSpan/Advance + writer entry guards"
 ```
 
 ---
@@ -1180,10 +1180,10 @@ git commit -m "SpscPipe: scaffolding + GetMemory/GetSpan/Advance + writer entry 
 **Goal:** Implement `FlushAsync` per Spec §4 (sync fast path with throw-first ordering, sticky cancel consume, publish, signal). The signaler stub returns immediately if no parked reader (no full Pattern 2 construction yet — Task 8 adds that).
 
 **Files:**
-- Modify: `src/SpscPipelines/SpscPipe.Writer.cs`
-- Modify: `src/SpscPipelines/SpscPipe.cs` (add SignalReadAwaiterIfPending; BuildFlushResult)
+- Modify: `src/Pipely/Pipe.Writer.cs`
+- Modify: `src/Pipely/Pipe.cs` (add SignalReadAwaiterIfPending; BuildFlushResult)
 
-- [ ] **Step 1: Add `BuildFlushResult` and `SignalReadAwaiterIfPending` to `SpscPipe.cs`**
+- [ ] **Step 1: Add `BuildFlushResult` and `SignalReadAwaiterIfPending` to `Pipe.cs`**
 
 ```csharp
 internal FlushResult BuildFlushResult(bool isCanceled)
@@ -1194,8 +1194,8 @@ internal void SignalReadAwaiterIfPending()
     while (true)
     {
         int oldV = _readAwaiter._state;
-        if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) return;
-        int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+        if ((oldV & PipelyAwaiter<ReadResult>.StateMask) != PipelyAwaiter<ReadResult>.Pending) return;
+        int desired = oldV & ~PipelyAwaiter<ReadResult>.StateMask;
         if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
         {
             _readAwaiter._ctr.Dispose();
@@ -1211,14 +1211,14 @@ internal void SignalReadAwaiterIfPending()
 
 (Implementer: Task 8 replaces the `SetResult(default)` placeholder with the full Pattern 2 construction.)
 
-- [ ] **Step 2: Implement `FlushAsync` in `SpscPipe.Writer.cs`**
+- [ ] **Step 2: Implement `FlushAsync` in `Pipe.Writer.cs`**
 
 Replace the `NotImplementedException` body:
 
 ```csharp
 public override ValueTask<FlushResult> FlushAsync(CancellationToken ct = default)
 {
-    if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+    if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
     if (_pipe._writerCompleted) throw new InvalidOperationException("Writing is completed.");
 
     // Throw-first: refresh reader state, then throw if reader-completed-with-ex.
@@ -1232,8 +1232,8 @@ public override ValueTask<FlushResult> FlushAsync(CancellationToken ct = default
     while (true)
     {
         int oldV = _pipe._flushAwaiter._state;
-        if ((oldV & SpscAwaiter<FlushResult>.CancelFlag) == 0) break;
-        int desired = oldV & ~SpscAwaiter<FlushResult>.CancelFlag;
+        if ((oldV & PipelyAwaiter<FlushResult>.CancelFlag) == 0) break;
+        int desired = oldV & ~PipelyAwaiter<FlushResult>.CancelFlag;
         if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
             return new ValueTask<FlushResult>(_pipe.BuildFlushResult(isCanceled: true));
     }
@@ -1279,7 +1279,7 @@ public override ValueTask<FlushResult> FlushAsync(CancellationToken ct = default
 }
 ```
 
-- [ ] **Step 3: Add `RecycleDrainedSegments` to `SpscPipe.cs`**
+- [ ] **Step 3: Add `RecycleDrainedSegments` to `Pipe.cs`**
 
 ```csharp
 internal void RecycleDrainedSegments()
@@ -1300,13 +1300,13 @@ internal void RecycleDrainedSegments()
 
 - [ ] **Step 4: Write FlushAsync tests**
 
-Append to `SpscPipeWriterTests.cs`:
+Append to `PipeWriterTests.cs`:
 
 ```csharp
 [Fact]
 public async Task FlushAsync_NoBackpressure_ReturnsImmediatelyNotCompleted()
 {
-    using var pipe = new SpscPipe();
+    using var pipe = new Pipe();
     pipe.Writer.GetMemory(10);
     pipe.Writer.Advance(10);
 
@@ -1318,7 +1318,7 @@ public async Task FlushAsync_NoBackpressure_ReturnsImmediatelyNotCompleted()
 [Fact]
 public async Task FlushAsync_AfterReaderCompletedNull_ReturnsIsCompletedTrue()
 {
-    using var pipe = new SpscPipe();
+    using var pipe = new Pipe();
     // Manually publish a reader-completed state via the readerTb (proxy for Reader.Complete which is Task 9).
     pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
     var readerSnap = new ReaderState { IsCompleted = true, CompletionException = null };
@@ -1333,7 +1333,7 @@ public async Task FlushAsync_AfterReaderCompletedNull_ReturnsIsCompletedTrue()
 [Fact]
 public async Task FlushAsync_AfterReaderCompletedException_Throws()
 {
-    using var pipe = new SpscPipe();
+    using var pipe = new Pipe();
     pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
     var ex = new InvalidOperationException("from reader");
     pipe._readerTb.ProducerSlot() = new ReaderState { IsCompleted = true, CompletionException = ex };
@@ -1347,14 +1347,14 @@ public async Task FlushAsync_AfterReaderCompletedException_Throws()
 - [ ] **Step 5: Run; expect PASS**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~SpscPipeWriterTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~PipeWriterTests"
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/SpscPipelines/ tests/SpscPipe.Tests/
-git commit -m "SpscPipe.Writer: FlushAsync sync path + signaler stub + recycle"
+git add src/Pipely/ tests/Pipe.Tests/
+git commit -m "Pipe.Writer: FlushAsync sync path + signaler stub + recycle"
 ```
 
 ---
@@ -1364,11 +1364,11 @@ git commit -m "SpscPipe.Writer: FlushAsync sync path + signaler stub + recycle"
 **Goal:** Implement reader sync paths per Spec §4. Throw-first precedence; sticky cancel consume; bootstrap from `WriterState.HeadSegment`.
 
 **Files:**
-- Modify: `src/SpscPipelines/SpscPipe.Reader.cs`
-- Modify: `src/SpscPipelines/SpscPipe.cs` (add IntegrateAcquiredWriterState, HasReadableProgress, BuildReadResult)
-- Create: `tests/SpscPipe.Tests/SpscPipeReaderTests.cs`
+- Modify: `src/Pipely/Pipe.Reader.cs`
+- Modify: `src/Pipely/Pipe.cs` (add IntegrateAcquiredWriterState, HasReadableProgress, BuildReadResult)
+- Create: `tests/Pipe.Tests/PipeReaderTests.cs`
 
-- [ ] **Step 1: Add reader helpers to `SpscPipe.cs`**
+- [ ] **Step 1: Add reader helpers to `Pipe.cs`**
 
 ```csharp
 internal bool HasReadableProgress() => _lastAcquiredWriterState.TotalWritten > _totalExamined;
@@ -1395,14 +1395,14 @@ internal ReadResult BuildReadResult(bool isCanceled)
 }
 ```
 
-- [ ] **Step 2: Implement `ReadAsync` in `SpscPipe.Reader.cs`**
+- [ ] **Step 2: Implement `ReadAsync` in `Pipe.Reader.cs`**
 
 Replace the `NotImplementedException`:
 
 ```csharp
 public override ValueTask<ReadResult> ReadAsync(CancellationToken ct = default)
 {
-    if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+    if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
     if (_pipe._readerCompleted) throw new InvalidOperationException("Reading is completed.");
 
     if (_pipe._writerTb.TryAcquire())
@@ -1417,8 +1417,8 @@ public override ValueTask<ReadResult> ReadAsync(CancellationToken ct = default)
     while (true)
     {
         int oldV = _pipe._readAwaiter._state;
-        if ((oldV & SpscAwaiter<ReadResult>.CancelFlag) == 0) break;
-        int desired = oldV & ~SpscAwaiter<ReadResult>.CancelFlag;
+        if ((oldV & PipelyAwaiter<ReadResult>.CancelFlag) == 0) break;
+        int desired = oldV & ~PipelyAwaiter<ReadResult>.CancelFlag;
         if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
             return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: true));
     }
@@ -1439,7 +1439,7 @@ public override ValueTask<ReadResult> ReadAsync(CancellationToken ct = default)
 ```csharp
 public override bool TryRead(out ReadResult result)
 {
-    if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+    if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
     if (_pipe._readerCompleted) throw new InvalidOperationException("Reading is completed.");
 
     if (_pipe._writerTb.TryAcquire())
@@ -1454,8 +1454,8 @@ public override bool TryRead(out ReadResult result)
     while (true)
     {
         int oldV = _pipe._readAwaiter._state;
-        if ((oldV & SpscAwaiter<ReadResult>.CancelFlag) == 0) break;
-        int desired = oldV & ~SpscAwaiter<ReadResult>.CancelFlag;
+        if ((oldV & PipelyAwaiter<ReadResult>.CancelFlag) == 0) break;
+        int desired = oldV & ~PipelyAwaiter<ReadResult>.CancelFlag;
         if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
         {
             result = _pipe.BuildReadResult(isCanceled: true);
@@ -1476,21 +1476,21 @@ public override bool TryRead(out ReadResult result)
 
 - [ ] **Step 4: Write reader tests**
 
-Create `tests/SpscPipe.Tests/SpscPipeReaderTests.cs`:
+Create `tests/Pipe.Tests/PipeReaderTests.cs`:
 
 ```csharp
 using System.Buffers;
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
-public class SpscPipeReaderTests
+public class PipeReaderTests
 {
     [Fact]
     public async Task ReadAsync_AfterFlushedData_ReturnsBuffer()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var mem = pipe.Writer.GetMemory(5);
         mem.Span[0] = 1; mem.Span[1] = 2; mem.Span[2] = 3; mem.Span[3] = 4; mem.Span[4] = 5;
         pipe.Writer.Advance(5);
@@ -1507,14 +1507,14 @@ public class SpscPipeReaderTests
     [Fact]
     public void TryRead_NoData_ReturnsFalse()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         Assert.False(pipe.Reader.TryRead(out var result));
     }
 
     [Fact]
     public async Task ReadAsync_AfterWriterCompletedNull_ReturnsIsCompletedTrue()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         // Simulate Writer.Complete(null) by direct WriterState publish (real Complete in Task 9).
         pipe._writerTb.ProducerSlot() = new WriterState { IsCompleted = true };
         pipe._writerTb.Publish();
@@ -1527,7 +1527,7 @@ public class SpscPipeReaderTests
     [Fact]
     public async Task ReadAsync_AfterWriterCompletedWithEx_Throws()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var ex = new InvalidOperationException("from writer");
         pipe._writerTb.ProducerSlot() = new WriterState { IsCompleted = true, CompletionException = ex };
         pipe._writerTb.Publish();
@@ -1541,14 +1541,14 @@ public class SpscPipeReaderTests
 - [ ] **Step 5: Run; expect PASS**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~SpscPipeReaderTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~PipeReaderTests"
 ```
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/SpscPipelines/ tests/SpscPipe.Tests/
-git commit -m "SpscPipe.Reader: ReadAsync/TryRead sync paths + bootstrap + throw-first"
+git add src/Pipely/ tests/Pipe.Tests/
+git commit -m "Pipe.Reader: ReadAsync/TryRead sync paths + bootstrap + throw-first"
 ```
 
 ---
@@ -1558,18 +1558,18 @@ git commit -m "SpscPipe.Reader: ReadAsync/TryRead sync paths + bootstrap + throw
 **Goal:** Close the cycle — reader's `AdvanceTo` updates state, publishes, gates the flush signal per Spec §4 / R2-1.
 
 **Files:**
-- Modify: `src/SpscPipelines/SpscPipe.Reader.cs`
-- Modify: `src/SpscPipelines/SpscPipe.cs`
-- Create: `tests/SpscPipe.Tests/SpscPipeAdvanceToTests.cs`
+- Modify: `src/Pipely/Pipe.Reader.cs`
+- Modify: `src/Pipely/Pipe.cs`
+- Create: `tests/Pipe.Tests/PipeAdvanceToTests.cs`
 
-- [ ] **Step 1: Implement `AdvanceTo` (both overloads) in `SpscPipe.Reader.cs`**
+- [ ] **Step 1: Implement `AdvanceTo` (both overloads) in `Pipe.Reader.cs`**
 
 ```csharp
 public override void AdvanceTo(SequencePosition consumed) => AdvanceTo(consumed, consumed);
 
 public override void AdvanceTo(SequencePosition consumed, SequencePosition examined)
 {
-    if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+    if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
     if (_pipe._readerCompleted) throw new InvalidOperationException("Reading is completed.");
 
     var consumedSeg = consumed.GetObject() as BufferSegment;
@@ -1617,7 +1617,7 @@ public override void AdvanceTo(SequencePosition consumed, SequencePosition exami
 }
 ```
 
-- [ ] **Step 2: Add `PublishReaderState` and `SignalFlushIfBackpressureRelieved` to `SpscPipe.cs`**
+- [ ] **Step 2: Add `PublishReaderState` and `SignalFlushIfBackpressureRelieved` to `Pipe.cs`**
 
 ```csharp
 internal void PublishReaderState()
@@ -1639,7 +1639,7 @@ internal void PublishReaderState()
 
 internal void SignalFlushIfBackpressureRelieved()
 {
-    if ((_flushAwaiter._state & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
+    if ((_flushAwaiter._state & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) return;
 
     if (_writerTb.TryAcquire())
     {
@@ -1653,8 +1653,8 @@ internal void SignalFlushIfBackpressureRelieved()
     while (true)
     {
         int oldV = _flushAwaiter._state;
-        if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
-        int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+        if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) return;
+        int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
         if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
         {
             _flushAwaiter._ctr.Dispose();
@@ -1669,8 +1669,8 @@ internal void SignalFlushAwaiterIfPending()       // unconditional; called from 
     while (true)
     {
         int oldV = _flushAwaiter._state;
-        if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
-        int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+        if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) return;
+        int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
         if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
         {
             _flushAwaiter._ctr.Dispose();
@@ -1690,20 +1690,20 @@ private void DeliverFlushResult()
 }
 ```
 
-- [ ] **Step 3: Write `SpscPipeAdvanceToTests.cs`**
+- [ ] **Step 3: Write `PipeAdvanceToTests.cs`**
 
 ```csharp
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
-public class SpscPipeAdvanceToTests
+public class PipeAdvanceToTests
 {
     [Fact]
     public async Task AdvanceTo_PartialConsume_PreservesRemainder()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var mem = pipe.Writer.GetMemory(10);
         for (int i = 0; i < 10; i++) mem.Span[i] = (byte)i;
         pipe.Writer.Advance(10);
@@ -1721,7 +1721,7 @@ public class SpscPipeAdvanceToTests
     [Fact]
     public async Task AdvanceTo_FullConsume_NextReadHasEmptyBuffer_IfNoData()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var mem = pipe.Writer.GetMemory(10);
         for (int i = 0; i < 10; i++) mem.Span[i] = (byte)i;
         pipe.Writer.Advance(10);
@@ -1736,7 +1736,7 @@ public class SpscPipeAdvanceToTests
     [Fact]
     public async Task AdvanceTo_BackwardsConsumed_Throws()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var mem = pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
         await pipe.Writer.FlushAsync();
         var r1 = await pipe.Reader.ReadAsync();
@@ -1750,7 +1750,7 @@ public class SpscPipeAdvanceToTests
     [Fact]
     public async Task AdvanceTo_OnEmptyBuffer_DoesNotThrow_WithDefaultPositions()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         // Simulate empty IsCompleted=true ReadResult by direct publish.
         pipe._writerTb.ProducerSlot() = new WriterState { IsCompleted = true };
         pipe._writerTb.Publish();
@@ -1766,8 +1766,8 @@ public class SpscPipeAdvanceToTests
     [Fact]
     public async Task AdvanceTo_FromDifferentPipe_Throws()
     {
-        using var pipe1 = new SpscPipe();
-        using var pipe2 = new SpscPipe();
+        using var pipe1 = new Pipe();
+        using var pipe2 = new Pipe();
 
         pipe1.Writer.GetMemory(5); pipe1.Writer.Advance(5);
         await pipe1.Writer.FlushAsync();
@@ -1782,14 +1782,14 @@ public class SpscPipeAdvanceToTests
 - [ ] **Step 4: Run; expect PASS**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~SpscPipeAdvanceToTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~PipeAdvanceToTests"
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/SpscPipelines/ tests/SpscPipe.Tests/
-git commit -m "SpscPipe.Reader: AdvanceTo + PublishReaderState + gated flush signaler + R4-7"
+git add src/Pipely/ tests/Pipe.Tests/
+git commit -m "Pipe.Reader: AdvanceTo + PublishReaderState + gated flush signaler + R4-7"
 ```
 
 ---
@@ -1799,13 +1799,13 @@ git commit -m "SpscPipe.Reader: AdvanceTo + PublishReaderState + gated flush sig
 **Goal:** Implement parking and the full Pattern 2 stash-and-construct signaler completion.
 
 **Files:**
-- Modify: `src/SpscPipelines/SpscPipe.Reader.cs`
-- Modify: `src/SpscPipelines/SpscPipe.Writer.cs`
-- Modify: `src/SpscPipelines/SpscPipe.cs`
+- Modify: `src/Pipely/Pipe.Reader.cs`
+- Modify: `src/Pipely/Pipe.Writer.cs`
+- Modify: `src/Pipely/Pipe.cs`
 
 - [ ] **Step 1: Replace `SignalReadAwaiterIfPending` placeholder with full Pattern 2 construction**
 
-In `SpscPipe.cs`:
+In `Pipe.cs`:
 
 ```csharp
 internal void SignalReadAwaiterIfPending()
@@ -1813,8 +1813,8 @@ internal void SignalReadAwaiterIfPending()
     while (true)
     {
         int oldV = _readAwaiter._state;
-        if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) return;
-        int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+        if ((oldV & PipelyAwaiter<ReadResult>.StateMask) != PipelyAwaiter<ReadResult>.Pending) return;
+        int desired = oldV & ~PipelyAwaiter<ReadResult>.StateMask;
         if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
         {
             _readAwaiter._ctr.Dispose();
@@ -1841,7 +1841,7 @@ internal void SignalReadAwaiterIfPending()
 }
 ```
 
-- [ ] **Step 2: Add `ParkReadAwaiter` to `SpscPipe.Reader.cs`**
+- [ ] **Step 2: Add `ParkReadAwaiter` to `Pipe.Reader.cs`**
 
 ```csharp
 private ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
@@ -1858,8 +1858,8 @@ private ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
     while (true)
     {
         int oldV = _pipe._readAwaiter._state;
-        Debug.Assert((oldV & SpscAwaiter<ReadResult>.StateMask) == SpscAwaiter<ReadResult>.Inactive);
-        int desired = (oldV & SpscAwaiter<ReadResult>.CancelFlag) | SpscAwaiter<ReadResult>.Pending;
+        Debug.Assert((oldV & PipelyAwaiter<ReadResult>.StateMask) == PipelyAwaiter<ReadResult>.Inactive);
+        int desired = (oldV & PipelyAwaiter<ReadResult>.CancelFlag) | PipelyAwaiter<ReadResult>.Pending;
         if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV) break;
     }
 
@@ -1874,8 +1874,8 @@ private ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
             while (true)
             {
                 int oldV = _pipe._readAwaiter._state;
-                if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) break;
-                int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+                if ((oldV & PipelyAwaiter<ReadResult>.StateMask) != PipelyAwaiter<ReadResult>.Pending) break;
+                int desired = oldV & ~PipelyAwaiter<ReadResult>.StateMask;
                 if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
                 {
                     _pipe._readAwaiter._core.SetException(_pipe._lastAcquiredWriterState.CompletionException);
@@ -1889,8 +1889,8 @@ private ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
             while (true)
             {
                 int oldV = _pipe._readAwaiter._state;
-                if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) break;
-                int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+                if ((oldV & PipelyAwaiter<ReadResult>.StateMask) != PipelyAwaiter<ReadResult>.Pending) break;
+                int desired = oldV & ~PipelyAwaiter<ReadResult>.StateMask;
                 if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
                     return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: false));
             }
@@ -1899,19 +1899,19 @@ private ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
 
     // Lost-cancel re-check.
     int v = _pipe._readAwaiter._state;
-    if ((v & SpscAwaiter<ReadResult>.CancelFlag) != 0
+    if ((v & PipelyAwaiter<ReadResult>.CancelFlag) != 0
         && Interlocked.CompareExchange(
                ref _pipe._readAwaiter._state,
-               SpscAwaiter<ReadResult>.Inactive,
-               SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag)
-           == (SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag))
+               PipelyAwaiter<ReadResult>.Inactive,
+               PipelyAwaiter<ReadResult>.Pending | PipelyAwaiter<ReadResult>.CancelFlag)
+           == (PipelyAwaiter<ReadResult>.Pending | PipelyAwaiter<ReadResult>.CancelFlag))
     {
         _pipe._readAwaiter._core.SetResult(_pipe.BuildReadResult(isCanceled: true));
         return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
     }
 
-    _pipe._readAwaiter._ctr = ct.UnsafeRegister(static p => ((SpscPipe)p!).OnReadAwaiterTokenCancel(), _pipe);
-    if ((_pipe._readAwaiter._state & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending)
+    _pipe._readAwaiter._ctr = ct.UnsafeRegister(static p => ((Pipe)p!).OnReadAwaiterTokenCancel(), _pipe);
+    if ((_pipe._readAwaiter._state & PipelyAwaiter<ReadResult>.StateMask) != PipelyAwaiter<ReadResult>.Pending)
         _pipe._readAwaiter._ctr.Dispose();
     return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
 }
@@ -1919,7 +1919,7 @@ private ValueTask<ReadResult> ParkReadAwaiter(CancellationToken ct)
 
 Replace the `throw new NotImplementedException("Read parking implemented in Task 8.")` in `ReadAsync` with `return ParkReadAwaiter(ct);`.
 
-- [ ] **Step 3: Add `OnReadAwaiterTokenCancel` to `SpscPipe.cs`**
+- [ ] **Step 3: Add `OnReadAwaiterTokenCancel` to `Pipe.cs`**
 
 ```csharp
 internal void OnReadAwaiterTokenCancel()
@@ -1927,8 +1927,8 @@ internal void OnReadAwaiterTokenCancel()
     while (true)
     {
         int oldV = _readAwaiter._state;
-        if ((oldV & SpscAwaiter<ReadResult>.StateMask) != SpscAwaiter<ReadResult>.Pending) return;
-        int desired = oldV & ~SpscAwaiter<ReadResult>.StateMask;
+        if ((oldV & PipelyAwaiter<ReadResult>.StateMask) != PipelyAwaiter<ReadResult>.Pending) return;
+        int desired = oldV & ~PipelyAwaiter<ReadResult>.StateMask;
         if (Interlocked.CompareExchange(ref _readAwaiter._state, desired, oldV) == oldV)
         {
             _readAwaiter._core.SetException(new OperationCanceledException(_readAwaiter._token));
@@ -1938,7 +1938,7 @@ internal void OnReadAwaiterTokenCancel()
 }
 ```
 
-- [ ] **Step 4: Add `ParkFlushAwaiter` to `SpscPipe.Writer.cs`**
+- [ ] **Step 4: Add `ParkFlushAwaiter` to `Pipe.Writer.cs`**
 
 ```csharp
 private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
@@ -1950,9 +1950,9 @@ private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
     while (true)
     {
         int oldV = _pipe._flushAwaiter._state;
-        Debug.Assert((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Inactive,
+        Debug.Assert((oldV & PipelyAwaiter<FlushResult>.StateMask) == PipelyAwaiter<FlushResult>.Inactive,
                      "SPSC violation: concurrent FlushAsync");
-        int desired = (oldV & SpscAwaiter<FlushResult>.CancelFlag) | SpscAwaiter<FlushResult>.Pending;
+        int desired = (oldV & PipelyAwaiter<FlushResult>.CancelFlag) | PipelyAwaiter<FlushResult>.Pending;
         if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV) break;
     }
 
@@ -1966,8 +1966,8 @@ private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
             while (true)
             {
                 int oldV = _pipe._flushAwaiter._state;
-                if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
-                int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) break;
+                int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
                 if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                 {
                     _pipe._flushAwaiter._core.SetException(_pipe._lastAcquiredReaderState.CompletionException);
@@ -1985,8 +1985,8 @@ private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
             while (true)
             {
                 int oldV = _pipe._flushAwaiter._state;
-                if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) break;
-                int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+                if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) break;
+                int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
                 if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
                     return new ValueTask<FlushResult>(_pipe.BuildFlushResult(isCanceled: false));
             }
@@ -1995,19 +1995,19 @@ private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
 
     // Lost-cancel re-check.
     int v = _pipe._flushAwaiter._state;
-    if ((v & SpscAwaiter<FlushResult>.CancelFlag) != 0
+    if ((v & PipelyAwaiter<FlushResult>.CancelFlag) != 0
         && Interlocked.CompareExchange(
                ref _pipe._flushAwaiter._state,
-               SpscAwaiter<FlushResult>.Inactive,
-               SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
-           == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
+               PipelyAwaiter<FlushResult>.Inactive,
+               PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag)
+           == (PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag))
     {
         _pipe._flushAwaiter._core.SetResult(_pipe.BuildFlushResult(isCanceled: true));
         return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
     }
 
-    _pipe._flushAwaiter._ctr = ct.UnsafeRegister(static p => ((SpscPipe)p!).OnFlushAwaiterTokenCancel(), _pipe);
-    if ((_pipe._flushAwaiter._state & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending)
+    _pipe._flushAwaiter._ctr = ct.UnsafeRegister(static p => ((Pipe)p!).OnFlushAwaiterTokenCancel(), _pipe);
+    if ((_pipe._flushAwaiter._state & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending)
         _pipe._flushAwaiter._ctr.Dispose();
     return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
 }
@@ -2015,7 +2015,7 @@ private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
 
 Replace the `throw new NotImplementedException("Flush parking implemented in Task 8.")` in `FlushAsync` (Task 5 final line) with `return ParkFlushAwaiter(ct);`.
 
-- [ ] **Step 4b: Add `OnFlushAwaiterTokenCancel` to `SpscPipe.cs`**
+- [ ] **Step 4b: Add `OnFlushAwaiterTokenCancel` to `Pipe.cs`**
 
 ```csharp
 internal void OnFlushAwaiterTokenCancel()
@@ -2023,8 +2023,8 @@ internal void OnFlushAwaiterTokenCancel()
     while (true)
     {
         int oldV = _flushAwaiter._state;
-        if ((oldV & SpscAwaiter<FlushResult>.StateMask) != SpscAwaiter<FlushResult>.Pending) return;
-        int desired = oldV & ~SpscAwaiter<FlushResult>.StateMask;
+        if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) return;
+        int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
         if (Interlocked.CompareExchange(ref _flushAwaiter._state, desired, oldV) == oldV)
         {
             _flushAwaiter._core.SetException(new OperationCanceledException(_flushAwaiter._token));
@@ -2036,13 +2036,13 @@ internal void OnFlushAwaiterTokenCancel()
 
 - [ ] **Step 5: Add park/wake tests**
 
-Append to `SpscPipeReaderTests.cs`:
+Append to `PipeReaderTests.cs`:
 
 ```csharp
 [Fact]
 public async Task ReadAsync_ParksWhenNoData_ResumesOnFlush()
 {
-    using var pipe = new SpscPipe();
+    using var pipe = new Pipe();
     var readTask = pipe.Reader.ReadAsync().AsTask();
     Assert.False(readTask.IsCompleted);
 
@@ -2060,13 +2060,13 @@ public async Task ReadAsync_ParksWhenNoData_ResumesOnFlush()
 }
 ```
 
-Append to `SpscPipeWriterTests.cs`:
+Append to `PipeWriterTests.cs`:
 
 ```csharp
 [Fact]
 public async Task FlushAsync_ParksOnBackpressure_ResumesOnAdvance()
 {
-    using var pipe = new SpscPipe(new SpscPipeOptions(
+    using var pipe = new Pipe(new PipeOptions(
         pauseWriterThreshold: 100,
         resumeWriterThreshold: 50));
 
@@ -2095,8 +2095,8 @@ Run; expect PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/SpscPipelines/ tests/SpscPipe.Tests/
-git commit -m "SpscPipe: park paths + Pattern 2 signaler completion"
+git add src/Pipely/ tests/Pipe.Tests/
+git commit -m "Pipe: park paths + Pattern 2 signaler completion"
 ```
 
 ---
@@ -2106,18 +2106,18 @@ git commit -m "SpscPipe: park paths + Pattern 2 signaler completion"
 **Goal:** Implement `Reader.Complete(ex?)` and `Writer.Complete(ex?)` per Spec §6.
 
 **Files:**
-- Modify: `src/SpscPipelines/SpscPipe.Writer.cs`
-- Modify: `src/SpscPipelines/SpscPipe.Reader.cs`
-- Create: `tests/SpscPipe.Tests/SpscPipeLifecycleTests.cs`
+- Modify: `src/Pipely/Pipe.Writer.cs`
+- Modify: `src/Pipely/Pipe.Reader.cs`
+- Create: `tests/Pipe.Tests/PipeLifecycleTests.cs`
 
 - [ ] **Step 1: Implement `Writer.Complete`**
 
-Replace the `NotImplementedException` in `SpscPipe.Writer.cs`:
+Replace the `NotImplementedException` in `Pipe.Writer.cs`:
 
 ```csharp
 public override void Complete(Exception? exception = null)
 {
-    if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+    if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
     if (_pipe._writerCompleted) return;     // double-Complete coalesces
     _pipe._writerCompleted = true;
 
@@ -2143,7 +2143,7 @@ public override void Complete(Exception? exception = null)
 ```csharp
 public override void Complete(Exception? exception = null)
 {
-    if (_pipe._disposed) throw new ObjectDisposedException(nameof(SpscPipe));
+    if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
     if (_pipe._readerCompleted) return;
     _pipe._readerCompleted = true;
 
@@ -2165,20 +2165,20 @@ public override void Complete(Exception? exception = null)
 
 - [ ] **Step 3: Write lifecycle tests**
 
-Create `tests/SpscPipe.Tests/SpscPipeLifecycleTests.cs`:
+Create `tests/Pipe.Tests/PipeLifecycleTests.cs`:
 
 ```csharp
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
-public class SpscPipeLifecycleTests
+public class PipeLifecycleTests
 {
     [Fact]
     public async Task WriterCompleteNull_ReaderSeesIsCompletedAfterDrain()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var mem = pipe.Writer.GetMemory(5); mem.Span.Fill(0xAA); pipe.Writer.Advance(5);
         await pipe.Writer.FlushAsync();
         pipe.Writer.Complete();
@@ -2197,7 +2197,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public async Task WriterCompleteEx_EveryReadAsyncThrows()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var ex = new InvalidOperationException("writer error");
         pipe.Writer.Complete(ex);
 
@@ -2211,7 +2211,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public async Task ReaderComplete_WriterFlushReturnsIsCompleted()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         pipe.Reader.Complete();
 
         var r = await pipe.Writer.FlushAsync();
@@ -2221,7 +2221,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public async Task ReaderCompleteEx_WriterFlushThrows()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var ex = new InvalidOperationException("reader error");
         pipe.Reader.Complete(ex);
 
@@ -2232,7 +2232,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public void DoubleComplete_NoOp()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         pipe.Writer.Complete();
         pipe.Writer.Complete(new Exception("ignored"));         // no-op coalesce
         pipe.Reader.Complete();
@@ -2242,7 +2242,7 @@ public class SpscPipeLifecycleTests
     [Fact]
     public async Task ReaderComplete_AllChainSegmentsRecycledOnNextFlush()
     {
-        using var pipe = new SpscPipe(new SpscPipeOptions(minimumSegmentSize: 64));
+        using var pipe = new Pipe(new PipeOptions(minimumSegmentSize: 64));
         // Fill two segments.
         for (int i = 0; i < 2; i++)
         {
@@ -2263,14 +2263,14 @@ public class SpscPipeLifecycleTests
 - [ ] **Step 4: Run; expect PASS**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~SpscPipeLifecycleTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~PipeLifecycleTests"
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/SpscPipelines/ tests/SpscPipe.Tests/
-git commit -m "SpscPipe: Complete (both sides) + R7 throw + chain sweep on Reader.Complete"
+git add src/Pipely/ tests/Pipe.Tests/
+git commit -m "Pipe: Complete (both sides) + R7 throw + chain sweep on Reader.Complete"
 ```
 
 ---
@@ -2280,26 +2280,26 @@ git commit -m "SpscPipe: Complete (both sides) + R7 throw + chain sweep on Reade
 **Goal:** Implement cross-thread `CancelPendingRead`/`CancelPendingFlush` per Spec §5 (with R2-5 stash construction) and `Dispose` per Spec §3 (with R4-1 CTR cleanup).
 
 **Files:**
-- Modify: `src/SpscPipelines/SpscPipe.Reader.cs`
-- Modify: `src/SpscPipelines/SpscPipe.Writer.cs`
-- Modify: `src/SpscPipelines/SpscPipe.cs`
-- Create: `tests/SpscPipe.Tests/SpscPipeCancellationTests.cs`
-- Create: `tests/SpscPipe.Tests/SpscPipeDisposeTests.cs`
+- Modify: `src/Pipely/Pipe.Reader.cs`
+- Modify: `src/Pipely/Pipe.Writer.cs`
+- Modify: `src/Pipely/Pipe.cs`
+- Create: `tests/Pipe.Tests/PipeCancellationTests.cs`
+- Create: `tests/Pipe.Tests/PipeDisposeTests.cs`
 
 - [ ] **Step 1: Implement `CancelPendingRead`**
 
-In `SpscPipe.Reader.cs`:
+In `Pipe.Reader.cs`:
 
 ```csharp
 public override void CancelPendingRead()
 {
-    int oldV = Interlocked.Or(ref _pipe._readAwaiter._state, SpscAwaiter<ReadResult>.CancelFlag);
-    if ((oldV & SpscAwaiter<ReadResult>.StateMask) == SpscAwaiter<ReadResult>.Pending
+    int oldV = Interlocked.Or(ref _pipe._readAwaiter._state, PipelyAwaiter<ReadResult>.CancelFlag);
+    if ((oldV & PipelyAwaiter<ReadResult>.StateMask) == PipelyAwaiter<ReadResult>.Pending
         && Interlocked.CompareExchange(
                ref _pipe._readAwaiter._state,
-               SpscAwaiter<ReadResult>.Inactive,
-               SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag)
-           == (SpscAwaiter<ReadResult>.Pending | SpscAwaiter<ReadResult>.CancelFlag))
+               PipelyAwaiter<ReadResult>.Inactive,
+               PipelyAwaiter<ReadResult>.Pending | PipelyAwaiter<ReadResult>.CancelFlag)
+           == (PipelyAwaiter<ReadResult>.Pending | PipelyAwaiter<ReadResult>.CancelFlag))
     {
         _pipe._readAwaiter._ctr.Dispose();
 
@@ -2316,18 +2316,18 @@ public override void CancelPendingRead()
 
 - [ ] **Step 2: Implement `CancelPendingFlush`**
 
-In `SpscPipe.Writer.cs`:
+In `Pipe.Writer.cs`:
 
 ```csharp
 public override void CancelPendingFlush()
 {
-    int oldV = Interlocked.Or(ref _pipe._flushAwaiter._state, SpscAwaiter<FlushResult>.CancelFlag);
-    if ((oldV & SpscAwaiter<FlushResult>.StateMask) == SpscAwaiter<FlushResult>.Pending
+    int oldV = Interlocked.Or(ref _pipe._flushAwaiter._state, PipelyAwaiter<FlushResult>.CancelFlag);
+    if ((oldV & PipelyAwaiter<FlushResult>.StateMask) == PipelyAwaiter<FlushResult>.Pending
         && Interlocked.CompareExchange(
                ref _pipe._flushAwaiter._state,
-               SpscAwaiter<FlushResult>.Inactive,
-               SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag)
-           == (SpscAwaiter<FlushResult>.Pending | SpscAwaiter<FlushResult>.CancelFlag))
+               PipelyAwaiter<FlushResult>.Inactive,
+               PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag)
+           == (PipelyAwaiter<FlushResult>.Pending | PipelyAwaiter<FlushResult>.CancelFlag))
     {
         _pipe._flushAwaiter._ctr.Dispose();
         _pipe._flushAwaiter._core.SetResult(new FlushResult(isCanceled: true, isCompleted: false));
@@ -2337,7 +2337,7 @@ public override void CancelPendingFlush()
 
 - [ ] **Step 3: Implement full `Dispose` per R4-1**
 
-Replace the placeholder Dispose in `SpscPipe.cs`:
+Replace the placeholder Dispose in `Pipe.cs`:
 
 ```csharp
 public void Dispose()
@@ -2373,20 +2373,20 @@ public void Dispose()
 }
 ```
 
-- [ ] **Step 4: Write `SpscPipeCancellationTests.cs`**
+- [ ] **Step 4: Write `PipeCancellationTests.cs`**
 
 ```csharp
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
-public class SpscPipeCancellationTests
+public class PipeCancellationTests
 {
     [Fact]
     public async Task CancelPendingRead_WhileNotParked_NextReadReturnsCanceled()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         pipe.Reader.CancelPendingRead();
 
         var result = await pipe.Reader.ReadAsync();
@@ -2396,7 +2396,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task CancelPendingRead_WhileParked_DeliversCanceled()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var readTask = pipe.Reader.ReadAsync().AsTask();
 
         // No Task.Delay needed: ParkReadAwaiter CASes to Pending synchronously before returning,
@@ -2413,7 +2413,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task CancelPendingRead_FromThirdThread_DeliversStashBuffer()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var mem = pipe.Writer.GetMemory(3);
         mem.Span[0] = 1; mem.Span[1] = 2; mem.Span[2] = 3;
         pipe.Writer.Advance(3);
@@ -2440,7 +2440,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task ReadAsync_WithCanceledToken_Throws()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var cts = new CancellationTokenSource();
         cts.Cancel();
         await Assert.ThrowsAsync<OperationCanceledException>(async () => await pipe.Reader.ReadAsync(cts.Token));
@@ -2449,7 +2449,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task ReadAsync_TokenCancelsWhileParked_Throws()
     {
-        using var pipe = new SpscPipe();
+        using var pipe = new Pipe();
         var cts = new CancellationTokenSource();
         var readTask = pipe.Reader.ReadAsync(cts.Token).AsTask();
         Assert.False(readTask.IsCompleted);
@@ -2462,7 +2462,7 @@ public class SpscPipeCancellationTests
     [Fact]
     public async Task CancelPendingFlush_WhileParked_DeliversCanceled()
     {
-        using var pipe = new SpscPipe(new SpscPipeOptions(pauseWriterThreshold: 50, resumeWriterThreshold: 25));
+        using var pipe = new Pipe(new PipeOptions(pauseWriterThreshold: 50, resumeWriterThreshold: 25));
         pipe.Writer.GetMemory(100); pipe.Writer.Advance(100);
         var flushTask = pipe.Writer.FlushAsync().AsTask();
         Assert.False(flushTask.IsCompleted);
@@ -2475,27 +2475,27 @@ public class SpscPipeCancellationTests
 }
 ```
 
-- [ ] **Step 5: Write `SpscPipeDisposeTests.cs`**
+- [ ] **Step 5: Write `PipeDisposeTests.cs`**
 
 ```csharp
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
-public class SpscPipeDisposeTests
+public class PipeDisposeTests
 {
     [Fact]
     public void Dispose_NeverUsed_NoThrow()
     {
-        var pipe = new SpscPipe();
+        var pipe = new Pipe();
         pipe.Dispose();
     }
 
     [Fact]
     public void DoubleDispose_NoThrow()
     {
-        var pipe = new SpscPipe();
+        var pipe = new Pipe();
         pipe.Dispose();
         pipe.Dispose();
     }
@@ -2503,7 +2503,7 @@ public class SpscPipeDisposeTests
     [Fact]
     public async Task Dispose_AfterUse_ReleasesSegments()
     {
-        var pipe = new SpscPipe();
+        var pipe = new Pipe();
         pipe.Writer.GetMemory(100); pipe.Writer.Advance(100);
         await pipe.Writer.FlushAsync();
         var r = await pipe.Reader.ReadAsync();
@@ -2523,14 +2523,14 @@ public class SpscPipeDisposeTests
 - [ ] **Step 6: Run all cancellation + dispose tests; expect PASS**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~SpscPipeCancellationTests|FullyQualifiedName~SpscPipeDisposeTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~PipeCancellationTests|FullyQualifiedName~PipeDisposeTests"
 ```
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/SpscPipelines/ tests/SpscPipe.Tests/
-git commit -m "SpscPipe: CancelPending* + Dispose with CTR cleanup"
+git add src/Pipely/ tests/Pipe.Tests/
+git commit -m "Pipe: CancelPending* + Dispose with CTR cleanup"
 ```
 
 ---
@@ -2540,24 +2540,24 @@ git commit -m "SpscPipe: CancelPending* + Dispose with CTR cleanup"
 **Goal:** Build a stress harness that runs producer + consumer threads with PRNG-driven workloads, verifying byte-sequence integrity, no deadlocks, and conservation of bytes.
 
 **Files:**
-- Create: `tests/SpscPipe.Stress/SpscPipe.Stress.csproj`
-- Create: `tests/SpscPipe.Stress/ByteSequence.cs`
-- Create: `tests/SpscPipe.Stress/StressHarness.cs`
-- Create: `tests/SpscPipe.Stress/Program.cs`
+- Create: `tests/Pipe.Stress/Pipe.Stress.csproj`
+- Create: `tests/Pipe.Stress/ByteSequence.cs`
+- Create: `tests/Pipe.Stress/StressHarness.cs`
+- Create: `tests/Pipe.Stress/Program.cs`
 
 - [ ] **Step 1: Create stress project**
 
 ```bash
-mkdir -p tests/SpscPipe.Stress
-dotnet new console -n SpscPipe.Stress -o tests/SpscPipe.Stress --framework net10.0
-dotnet sln add tests/SpscPipe.Stress/SpscPipe.Stress.csproj
-dotnet add tests/SpscPipe.Stress/SpscPipe.Stress.csproj reference src/SpscPipelines/SpscPipelines.csproj
+mkdir -p tests/Pipe.Stress
+dotnet new console -n Pipe.Stress -o tests/Pipe.Stress --framework net10.0
+dotnet sln add tests/Pipe.Stress/Pipe.Stress.csproj
+dotnet add tests/Pipe.Stress/Pipe.Stress.csproj reference src/Pipely/Pipely.csproj
 ```
 
 - [ ] **Step 2: Write `ByteSequence.cs`**
 
 ```csharp
-namespace SpscPipe.Stress;
+namespace Pipe.Stress;
 
 internal static class ByteSequence
 {
@@ -2579,16 +2579,16 @@ internal static class ByteSequence
 - [ ] **Step 3: Write `StressHarness.cs`**
 
 ```csharp
-using SpscPipelines;
+using Pipely;
 
-namespace SpscPipe.Stress;
+namespace Pipe.Stress;
 
 internal sealed class StressHarness
 {
-    private readonly SpscPipeOptions _options;
+    private readonly PipeOptions _options;
     private readonly TimeSpan _duration;
 
-    public StressHarness(SpscPipeOptions options, TimeSpan duration)
+    public StressHarness(PipeOptions options, TimeSpan duration)
     {
         _options  = options;
         _duration = duration;
@@ -2596,7 +2596,7 @@ internal sealed class StressHarness
 
     public async Task<StressResult> RunOnce(int seed, long totalBytes, CancellationToken ct)
     {
-        using var pipe = new SpscPipe(_options);
+        using var pipe = new Pipe(_options);
         // Two independent RNGs for producer/consumer so timing/yielding decisions don't synchronize.
         var producerRng = new Random(seed);
         var consumerRng = new Random(seed ^ 0x5A5A_5A5A);
@@ -2695,13 +2695,13 @@ Note the partial-consume path: 25% of reads `AdvanceTo` a random prefix instead 
 - [ ] **Step 4: Write `Program.cs`**
 
 ```csharp
-using SpscPipelines;
-using SpscPipe.Stress;
+using Pipely;
+using Pipe.Stress;
 
 int seedCount = args.Length > 0 ? int.Parse(args[0]) : 10;
 long bytesPerSeed = args.Length > 1 ? long.Parse(args[1]) : 1L << 22;   // 4 MiB
 
-var harness = new StressHarness(SpscPipeOptions.Default, TimeSpan.FromSeconds(30));
+var harness = new StressHarness(PipeOptions.Default, TimeSpan.FromSeconds(30));
 int failures = 0;
 
 for (int i = 0; i < seedCount; i++)
@@ -2720,7 +2720,7 @@ return failures == 0 ? 0 : 1;
 - [ ] **Step 5: Run a smoke stress (10 seeds × 4 MiB)**
 
 ```bash
-dotnet run --project tests/SpscPipe.Stress -c Release -- 10 4194304
+dotnet run --project tests/Pipe.Stress -c Release -- 10 4194304
 ```
 
 Expected: 10/10 seeds pass, output looks like `seed=   1 status=ok ...`. If a seed fails, the harness prints the seed for reproduction.
@@ -2728,7 +2728,7 @@ Expected: 10/10 seeds pass, output looks like `seed=   1 status=ok ...`. If a se
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tests/SpscPipe.Stress/
+git add tests/Pipe.Stress/
 git commit -m "Stress harness: PRNG-driven byte-integrity + deadlock detection"
 ```
 
@@ -2739,22 +2739,22 @@ git commit -m "Stress harness: PRNG-driven byte-integrity + deadlock detection"
 **Goal:** Validate the documented divergences from BCL `Pipe` are exactly the documented set, and that everything else matches BCL exactly.
 
 **Files:**
-- Create: `tests/SpscPipe.Tests/BclParityTests.cs`
+- Create: `tests/Pipe.Tests/BclParityTests.cs`
 
 - [ ] **Step 1: Write `BclParityTests.cs`**
 
 ```csharp
 using System.IO.Pipelines;
-using SpscPipelines;
+using Pipely;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace Pipe.Tests;
 
-public enum PipeKind { Bcl, Spsc }
+public enum PipeKind { Bcl, Pipely }
 
 public class BclParityTests
 {
-    // Each parametrized test runs against both BCL Pipe and SpscPipe; verify outcomes match.
+    // Each parametrized test runs against both BCL Pipe and Pipe; verify outcomes match.
 
     private static (PipeReader Reader, PipeWriter Writer, IDisposable Disposer) CreatePipe(PipeKind kind, PipeOptions? bclOpts = null)
     {
@@ -2763,8 +2763,8 @@ public class BclParityTests
             case PipeKind.Bcl:
                 var bcl = new Pipe(bclOpts ?? PipeOptions.Default);
                 return (bcl.Reader, bcl.Writer, NoOpDisposable.Instance);
-            case PipeKind.Spsc:
-                var spsc = new SpscPipe();    // defaults match BCL defaults
+            case PipeKind.Pipely:
+                var spsc = new Pipe();    // defaults match BCL defaults
                 return (spsc.Reader, spsc.Writer, spsc);
             default:
                 throw new ArgumentOutOfRangeException(nameof(kind));
@@ -2779,7 +2779,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task WriterCompleteEx_NextReadAsyncThrows(PipeKind kind)
     {
         var (reader, writer, disp) = CreatePipe(kind);
@@ -2794,7 +2794,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task ReaderCompleteEx_NextFlushAsyncThrows(PipeKind kind)
     {
         var (reader, writer, disp) = CreatePipe(kind);
@@ -2809,7 +2809,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task BackpressureHysteresis_ParkAtPause_ResumeAtBelowResume(PipeKind kind)
     {
         // Both pipes use defaults (Pause=64K, Resume=32K).
@@ -2833,7 +2833,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task EmptyPipe_TryReadReturnsFalse_ReadAsyncParks(PipeKind kind)
     {
         var (reader, writer, disp) = CreatePipe(kind);
@@ -2850,7 +2850,7 @@ public class BclParityTests
 
     [Theory]
     [InlineData(PipeKind.Bcl)]
-    [InlineData(PipeKind.Spsc)]
+    [InlineData(PipeKind.Pipely)]
     public async Task RoundTripBytes_PreservesContent(PipeKind kind)
     {
         var (reader, writer, disp) = CreatePipe(kind);
@@ -2870,7 +2870,7 @@ public class BclParityTests
 
     // SPSC-only divergence: this test specifically validates that the documented divergence holds.
     [Fact]
-    public void DoubleComplete_SpscCoalesces_BclThrows()
+    public void DoubleComplete_PipelyCoalesces_BclThrows()
     {
         // BCL: throws on second Complete.
         var bcl = new Pipe();
@@ -2878,7 +2878,7 @@ public class BclParityTests
         Assert.Throws<InvalidOperationException>(() => bcl.Writer.Complete());
 
         // SPSC: coalesces.
-        using var spsc = new SpscPipe();
+        using var spsc = new Pipe();
         spsc.Writer.Complete();
         spsc.Writer.Complete();   // no throw
     }
@@ -2888,7 +2888,7 @@ public class BclParityTests
 - [ ] **Step 2: Run; expect PASS (with parity-divergence test passing on both pipes)**
 
 ```bash
-dotnet test tests/SpscPipe.Tests/ --filter "FullyQualifiedName~BclParityTests"
+dotnet test tests/Pipe.Tests/ --filter "FullyQualifiedName~BclParityTests"
 ```
 
 Expected: all tests pass. Some tests parametrize over both pipes (verifying parity); the `DoubleComplete` test validates the documented divergence holds.
@@ -2896,32 +2896,32 @@ Expected: all tests pass. Some tests parametrize over both pipes (verifying pari
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/SpscPipe.Tests/BclParityTests.cs
+git add tests/Pipe.Tests/BclParityTests.cs
 git commit -m "BCL parity tests: round-trip + completion + backpressure + documented divergences"
 ```
 
 ---
 
-## Task 13: Benchmark validation (SpscPipe vs BCL)
+## Task 13: Benchmark validation (Pipe vs BCL)
 
 **Goal:** Add an SPSC adapter to the benchmarks project, run head-to-head against BCL, validate the design's performance goals.
 
 **Files:**
-- Create: `tests/SpscPipe.Benchmarks/SpscPipeAdapter.cs`
-- Modify: `tests/SpscPipe.Benchmarks/ThroughputBenchmarks.cs`
+- Create: `tests/Pipe.Benchmarks/PipeAdapter.cs`
+- Modify: `tests/Pipe.Benchmarks/ThroughputBenchmarks.cs`
 
-- [ ] **Step 1: Write `SpscPipeAdapter.cs`**
+- [ ] **Step 1: Write `PipeAdapter.cs`**
 
 ```csharp
 using System.IO.Pipelines;
-using SpscPipelines;
+using Pipely;
 
-namespace SpscPipe.Benchmarks;
+namespace Pipe.Benchmarks;
 
-internal sealed class SpscPipeAdapter : IPipeAdapter
+internal sealed class PipeAdapter : IPipeAdapter
 {
-    private readonly SpscPipe _pipe;
-    public SpscPipeAdapter(SpscPipeOptions? options = null) => _pipe = new SpscPipe(options ?? SpscPipeOptions.Default);
+    private readonly Pipe _pipe;
+    public PipeAdapter(PipeOptions? options = null) => _pipe = new Pipe(options ?? PipeOptions.Default);
     public PipeReader Reader => _pipe.Reader;
     public PipeWriter Writer => _pipe.Writer;
     public void Dispose() => _pipe.Dispose();
@@ -2934,9 +2934,9 @@ Edit `ThroughputBenchmarks.cs`, add:
 
 ```csharp
 [Benchmark]
-public async Task SpscPipe_ProduceAndDrain()
+public async Task Pipe_ProduceAndDrain()
 {
-    using var adapter = new SpscPipeAdapter();
+    using var adapter = new PipeAdapter();
     await ProduceAndDrain(adapter);
 }
 
@@ -2977,14 +2977,14 @@ private static async Task ProduceAndDrain(IPipeAdapter adapter)
 - [ ] **Step 3: Run head-to-head benchmarks**
 
 ```bash
-dotnet run --project tests/SpscPipe.Benchmarks -c Release -- --filter "*ProduceAndDrain*"
+dotnet run --project tests/Pipe.Benchmarks -c Release -- --filter "*ProduceAndDrain*"
 ```
 
 Expected: BDN reports both BCL and SPSC results. SPSC should be materially faster (target: at least 2× under SPSC contention; pause to consider what "materially" means for this hardware if it's less).
 
 - [ ] **Step 4: Document the benchmark results**
 
-Create `tests/SpscPipe.Benchmarks/RESULTS.md`:
+Create `tests/Pipe.Benchmarks/RESULTS.md`:
 
 ```markdown
 # Benchmark Results
@@ -3011,8 +3011,8 @@ Create `tests/SpscPipe.Benchmarks/RESULTS.md`:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/SpscPipe.Benchmarks/
-git commit -m "Benchmarks: SpscPipe adapter + head-to-head + RESULTS.md"
+git add tests/Pipe.Benchmarks/
+git commit -m "Benchmarks: Pipe adapter + head-to-head + RESULTS.md"
 ```
 
 ---
@@ -3034,11 +3034,11 @@ Per the writing-plans skill, reviewing the plan against the spec:
 | §4 ReadAsync/TryRead | Tasks 6 (sync), 8 (park) |
 | §4 AdvanceTo (both overloads, throw-first, R8 validation) | Task 7 |
 | §4 BuildReadResult / BuildFlushResult | Tasks 5, 6 |
-| §5 SpscAwaiter<T> + Pattern 2 stash | Tasks 3, 8 |
+| §5 PipelyAwaiter<T> + Pattern 2 stash | Tasks 3, 8 |
 | §5 ParkReadAwaiter / SignalReadAwaiterIfPending / OnReadAwaiterTokenCancel | Task 8 |
 | §5 ParkFlushAwaiter / signaler split (gated + unconditional) | Tasks 7 (gated), 8 (parking), 9 (unconditional via Reader.Complete) |
 | §5 CancelPending* | Task 10 |
-| §6 SpscPipeOptions | Task 4 |
+| §6 PipeOptions | Task 4 |
 | §6 Writer.Complete / Reader.Complete | Task 9 |
 | §6 R7 throw integration | Tasks 5, 6, 8, 9 (entry guards + signaler exception path) |
 | §6 R4-1 Dispose CTR cleanup | Task 10 |
