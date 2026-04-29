@@ -43,7 +43,7 @@ internal sealed class StressHarness
                                 bytes[i] = ByteSequence.ByteAt(produced + i);
                             var owner = new StressOwner(bytes);
                             owners.Add(owner);
-                            pipe.Writer.Append(owner);
+                            pipe.Writer.Splice(owner);
                         }
                         else
                         {

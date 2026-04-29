@@ -25,7 +25,7 @@ internal sealed class BufferSegment : ReadOnlySequenceSegment<byte>
         IsDonated         = false;
     }
 
-    // Adopts a foreign IMemoryOwner<byte> for buffer-ownership transfer (Append).
+    // Adopts a foreign IMemoryOwner<byte> for buffer-ownership transfer (Splice).
     // Caller passes a pre-computed slice of `owner.Memory` so this method is allocation- and throw-free.
     // Preconditions (caller-validated):
     //   owner != null, slice.Length > 0, slice originates from owner.Memory.

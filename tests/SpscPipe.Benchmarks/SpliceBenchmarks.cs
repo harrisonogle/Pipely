@@ -5,8 +5,8 @@ using SpscPipelines;
 
 namespace SpscPipe.Benchmarks;
 
-// Benchmarks SpscPipeWriter.Append against GetSpan+Advance under the realistic scenario
-// Append was designed for: an upstream component (network RX, parser, reorder buffer, etc.)
+// Benchmarks SpscPipeWriter.Splice against GetSpan+Advance under the realistic scenario
+// Splice was designed for: an upstream component (network RX, parser, reorder buffer, etc.)
 // hands the producer an IMemoryOwner<byte> with data already written into it. The producer
 // must publish that data into a pipe. Per iteration, every variant:
 //
@@ -14,12 +14,12 @@ namespace SpscPipe.Benchmarks;
 //   2. Writes data to it (simulates the upstream fill we cannot avoid).
 //   3. Hands it off to the pipe.
 //        BCL Pipe / SpscPipe (GetSpan): GetSpan + CopyTo + Advance + Dispose source.
-//        SpscPipe (Append): Append(source) — ownership transferred; no CopyTo, no Dispose.
+//        SpscPipe (Splice): Splice(source) — ownership transferred; no CopyTo, no Dispose.
 //
 // Consumer drains identically across variants. Backpressure disabled. TotalBytes is fixed
 // at 1 MiB per iteration so wall-clock is comparable across configs.
 [MemoryDiagnoser]
-public class AppendBenchmarks
+public class SpliceBenchmarks
 {
     private const int TotalBytes = 1 << 20;     // 1 MiB per iteration
 
@@ -50,10 +50,10 @@ public class AppendBenchmarks
     }
 
     [Benchmark]
-    public Task SpscPipe_Append()
+    public Task SpscPipe_Splice()
     {
         var pipe = new SpscPipelines.SpscPipe(SpscOptions);
-        return RunAppend(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
+        return RunSplice(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
     }
 
     private async Task RunGetSpan(PipeWriter writer, PipeReader reader, Action completePipe)
@@ -83,7 +83,7 @@ public class AppendBenchmarks
         await DrainAndDispose(reader, producer, completePipe);
     }
 
-    private async Task RunAppend(SpscPipeWriter writer, PipeReader reader, Action completePipe)
+    private async Task RunSplice(SpscPipeWriter writer, PipeReader reader, Action completePipe)
     {
         int bufferSize = BufferSize;
         int flushEvery = BuffersBeforeFlush;
@@ -96,7 +96,7 @@ public class AppendBenchmarks
                 var source = MemoryPool<byte>.Shared.Rent(bufferSize);
                 source.Memory.Span.Slice(0, bufferSize).Fill(0x42);   // upstream fill
 
-                writer.Append(source, 0, bufferSize);                 // ownership transfer
+                writer.Splice(source, 0, bufferSize);                 // ownership transfer
 
                 if ((i + 1) % flushEvery == 0)
                     await writer.FlushAsync();

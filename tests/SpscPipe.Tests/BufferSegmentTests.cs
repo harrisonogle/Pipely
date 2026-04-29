@@ -154,7 +154,7 @@ public class BufferSegmentTests
     [Fact]
     public void Freeze_OnDonatedSegment_IsIdempotentOnEndAndMemory()
     {
-        // Pin the documented behavior in spec §2.2: when an Append splices a new tail past
+        // Pin the documented behavior in spec §2.2: when an Splice splices a new tail past
         // a previously-donated _writingHead, the call _writingHead.Freeze(filled, next)
         // re-writes End/base.Memory to the same values they already held; only Next changes.
         var owner = new TrackingMemoryOwner(64);

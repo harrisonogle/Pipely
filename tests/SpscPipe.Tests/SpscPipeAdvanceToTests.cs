@@ -93,7 +93,7 @@ public class SpscPipeAdvanceToTests
         using var pipe2 = new SpscPipelines.SpscPipe();
 
         var donatedOwner = new TrackingMemoryOwner(20);
-        pipe1.Writer.Append(donatedOwner);
+        pipe1.Writer.Splice(donatedOwner);
         await pipe1.Writer.FlushAsync();
         var r1 = await pipe1.Reader.ReadAsync();
 
