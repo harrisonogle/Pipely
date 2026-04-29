@@ -238,9 +238,14 @@ internal void RecycleDrainedSegments()
         _chainHead   = recycled.Next!;
 
         if (recycled.IsDonated)
-            recycled.DisposeOwned();         // foreign owner: release; drop the shell
+        {
+            recycled.DisposeOwned();              // foreign owner: release the IMemoryOwner
+            PushDonatedShellFreelist(recycled);   // shell pooled for re-use; over-cap drops to GC
+        }
         else
-            PushFreelist(recycled);          // existing pool-rented path (with cap-overflow handling inside)
+        {
+            PushFreelist(recycled);               // pool-rented path (with cap-overflow handling inside)
+        }
     }
 }
 ```
@@ -251,7 +256,51 @@ The walk predicate is unchanged — `IsDonated` only affects what happens after 
 
 The TripleBuffer slot-pinning caveat (§3 Nit-6 of base spec) carries over: a recycled donated segment may stay reachable via the unused `_writerTb` slot until the next publish overwrites that slot's `WriterState.HeadSegment`/`TailSegment` references. The foreign owner is alive slightly longer than the recycle moment, but never past the next publish. Same caveat as today's rented segments; not worth additional complexity.
 
-`SpscPipe.Dispose()` (`SpscPipe.cs:71-90`) walks both the chain and the freelist calling `DisposeOwned()` on each. The path is correct for donated segments without modification — `DisposeOwned` releases whichever `IMemoryOwner` the segment holds, regardless of how it was acquired.
+`SpscPipe.Dispose()` walks both the chain and the rented-segment freelist calling `DisposeOwned()` on each. The donated-shell freelist (introduced below) holds shells whose `IMemoryOwner` was already disposed in `RecycleDrainedSegments`, so `Dispose` simply nulls the donated-shell freelist's head — no per-shell action required.
+
+### 5.1 — Donated-shell freelist (rationale, separate from rented freelist)
+
+A donated `BufferSegment` shell, once `DisposeOwned` has released its foreign `IMemoryOwner`, is structurally identical to a freshly-allocated shell: its mutable fields (`_memoryOwner`, `AvailableMemory`, `End`, `Next`, `RunningIndex`, `OwnerToken`, `IsDonated`) are all overwritten by the next `AdoptFrom` call. So pooling shells across donations is straightforward: hold them in a writer-private LIFO stack; pop in `Append` before falling back to `new BufferSegment()`.
+
+We hold donated shells on a **separate** freelist from rented segments — `_donatedShellFreelistHead` / `_donatedShellFreelistCount`, alongside the existing `_freelistHead` / `_freelistCount`. Two reasons:
+
+**1. Different invariants.** The rented freelist holds segments whose `IMemoryOwner` is alive and whose `AvailableMemory.Length ≥ MinimumSegmentSize`. `PopFreelist(minSize)` consults `head.AvailableMemory.Length` and either pops, drops-and-disposes (size mismatch), or falls through. A donated shell post-`DisposeOwned` has `AvailableMemory.Length == 0`, so it would always fail the rented-freelist size check and immediately get disposed-and-discarded — defeating the pooling. Keeping the freelists physically separate avoids this interaction.
+
+**2. Different consumers.** `RentSegment` pops from the rented freelist; `Append` pops from the donated-shell freelist. They never compete and never need to inspect each other's state.
+
+**Cap.** Reuse `_options.MaxFreelistSegments` (default 256) for the donated-shell cap. A separate `MaxDonatedShellFreelistSegments` option could be added later if usage data motivates a different sizing, but a single cap is simpler and matches the rented freelist's cap.
+
+```csharp
+internal BufferSegment? _donatedShellFreelistHead;
+internal int            _donatedShellFreelistCount;
+
+internal void PushDonatedShellFreelist(BufferSegment shell)
+{
+    if (_donatedShellFreelistCount >= _options.MaxFreelistSegments)
+        return;     // cap exceeded; drop the shell to GC
+    shell.SetFreelistNext(_donatedShellFreelistHead);
+    _donatedShellFreelistHead = shell;
+    _donatedShellFreelistCount++;
+}
+
+internal BufferSegment? PopDonatedShellFreelist()
+{
+    var head = _donatedShellFreelistHead;
+    if (head == null) return null;
+    _donatedShellFreelistHead = head.Next;
+    head.SetFreelistNext(null);   // detach from the freelist link
+    _donatedShellFreelistCount--;
+    return head;
+}
+```
+
+`Append`'s allocation step:
+```csharp
+var shell = _pipe.PopDonatedShellFreelist() ?? new BufferSegment();
+shell.AdoptFrom(buffer, slice, runningIndex, pipeOwner: _pipe);
+```
+
+`AdoptFrom` overwrites every mutable field, so a recycled shell is functionally indistinguishable from a fresh one. No reset needed before the pop returns.
 
 ## Section 6 — Public API surface
 
@@ -348,7 +397,8 @@ A simpler "always-take-ownership-even-on-throw" alternative was considered and r
 | `GetMemory(N)` after `Append` | Forces transition (since `remaining == 0`). Rents a fresh tail. Freezes donated as a non-tail chain segment. |
 | `Advance(N>0)` after `Append` | Throws `ArgumentOutOfRangeException` via existing bounds check at `SpscPipe.Writer.cs:52`. |
 | `FlushAsync` after `Append` | Publishes new `WriterState` with `TailSegment == donated`, `TailWritten == donated.End`. Backpressure check sees boosted `_totalWritten`; parks if `unconsumed >= PauseWriterThreshold`. |
-| Reader drains past donated segment | `RecycleDrainedSegments` calls `donated.DisposeOwned()` (releasing the foreign `IMemoryOwner`); the `BufferSegment` shell is GC'd. Freelist count unchanged. |
+| Reader drains past donated segment | `RecycleDrainedSegments` calls `donated.DisposeOwned()` (releasing the foreign `IMemoryOwner`); the `BufferSegment` shell is pushed to the donated-shell freelist (capped at `MaxFreelistSegments`; over-cap shells drop to GC). Rented freelist count unchanged. |
+| Append after a recycle, donated-shell freelist non-empty | `Append` pops the shell instead of allocating; `AdoptFrom` overwrites all fields. Donated-shell freelist count decrements. |
 | `AdvanceTo` to a `SequencePosition` inside a donated segment of the same pipe | Passes pipe-identity check (`OwnerToken == pipe`). Standard `AdvanceTo` semantics apply. |
 | `AdvanceTo` to a `SequencePosition` from a *different* pipe's donated segment | Throws `InvalidOperationException` ("SequencePosition is from a different pipe.") via the existing R4-7 check. |
 | `SpscPipe.Dispose` with un-flushed donated segments in chain | Existing chain walk calls `DisposeOwned()` on every segment; works uniformly for donated. |
@@ -361,7 +411,7 @@ A simpler "always-take-ownership-even-on-throw" alternative was considered and r
 | §3 Ownership table | Add row: foreign `IMemoryOwner<byte>` (donated) — owned by writer, released on recycle (`DisposeOwned`) or `SpscPipe.Dispose`. |
 | §3 `BufferSegment` definition | Add `IsDonated` field, `AdoptFrom` initializer; clarify that `Freeze` on a donated segment is idempotent on `End`/`Memory`. |
 | §3 Allocation path | Reference new sibling subsection "Donation path" (this design's §4). |
-| §3 Recycling path | Update pseudocode to branch on `IsDonated`: dispose-and-drop vs `PushFreelist`. |
+| §3 Recycling path | Update pseudocode to branch on `IsDonated`: `DisposeOwned` + push to donated-shell freelist vs `PushFreelist`. |
 | §3 `MemoryPool` integration | Note: donated segments bypass `_options.Pool` and `MinimumSegmentSize`; donor-decided sizing. |
 | §3 `Memory<T>` torn-read note (Nit-5) | Note: donated segments are immune; `base.Memory` is not re-sliced post-adoption. |
 | §3 Lifecycle / Dispose | Note: `DisposeOwned` walk is uniform across donated and rented. |
@@ -414,7 +464,11 @@ Zero-length:
 - `AdvanceTo_PositionInsideDonatedSegment_Succeeds`.
 - `AdvanceTo_DonatedSegmentFromOtherPipe_Throws` — pipe-identity (R4-7) check fires for cross-pipe `SequencePosition`.
 - `Recycle_DonatedSegmentDisposesOwner` — after the reader drains past a donated segment and writer flushes again, the mock owner's `Dispose` count == 1.
-- `Recycle_DonatedSegmentNotPushedToFreelist` — freelist count unchanged across a donated drain.
+- `Recycle_DonatedSegmentNotPushedToRentedFreelist` — rented-freelist count unchanged across a donated drain.
+- `Recycle_DonatedSegmentPushedToShellFreelist` — `_donatedShellFreelistCount` increments by exactly 1 when a single donated segment is recycled.
+- `Append_AfterRecycle_ReusesShellFromFreelist` — `_donatedShellFreelistCount` decrements when `Append` is called after a recycle has populated the shell freelist; the reused shell has `IsDonated == true` and `OwnerToken == pipe` post-`AdoptFrom`.
+- `ShellFreelist_RespectsCap` — after more donated recycles than `MaxFreelistSegments`, `_donatedShellFreelistCount == MaxFreelistSegments` (over-cap shells dropped to GC); subsequent `Append`s still succeed (fall back to `new BufferSegment()` when the freelist eventually empties).
+- `Dispose_ClearsShellFreelist` — `SpscPipe.Dispose` nulls `_donatedShellFreelistHead` and resets count to 0. (No `IMemoryOwner.Dispose` to call — shells were dispose-cleaned in `RecycleDrainedSegments`.)
 - `Recycle_RentedSegmentStillFreelisted` — existing rented-recycle behavior preserved (regression guard).
 - `Dispose_WithMixedChain_DisposesAllOwners` — chain has `[rented, donated, rented, donated]`; `SpscPipe.Dispose` results in all four `DisposeOwned` calls.
 - `Backpressure_AppendDoesNotPark` — `Append(huge)` returns synchronously even when `huge >= PauseWriterThreshold`; subsequent `FlushAsync` parks.
@@ -428,4 +482,4 @@ One new scenario in `tests/SpscPipe.Stress/` that interleaves `Append` with `Get
 - A reader-side counterpart that "claims ownership" of a donated segment from the read sequence. Not currently motivated; would require `SpscPipeReader` to become public and `BufferSegment.IsDonated` to be exposed. Deferred until a concrete use case arises.
 - Helper extensions like `static class SpscPipeWriterExtensions { public static void Append(this SpscPipeWriter w, byte[] array) { ... } }` that wrap byte arrays into ad-hoc `IMemoryOwner`s. Easy to add later as nice-to-haves; not part of this design.
 - Diagnostic counters specifically for donated segments (e.g., `_donatedAppendCount`, `_donatedDisposeCount`). Could be added at implementation time if observability needs surface; not required by the design.
-- Pooling of `BufferSegment` shell objects allocated for donated segments. The `BufferSegment` object is small and donations are expected to be relatively infrequent compared to byte volume; pooling adds complexity without clear payoff. Deferred.
+- ~~Pooling of `BufferSegment` shell objects allocated for donated segments.~~ **Brought in scope post-2026-04-29 by AppendBenchmarks results.** A round of benchmark-driven analysis showed the per-Append `BufferSegment` allocation contributing ~9% of wall-clock at small buffer sizes (`BufferSize=256`, `BuffersBeforeFlush=1`) and consistently ~4× the BCL allocation rate at all sizes. Section 5.1 specifies the donated-shell freelist that addresses this.
