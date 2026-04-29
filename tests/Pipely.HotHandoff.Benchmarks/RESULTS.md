@@ -2,8 +2,8 @@
 
 **Compared:**
 
-- **Latency** (custom harness, P50/P90/P99 by sort): `tp-default` (SpscPipe with `ContinuationDispatcher = null`, i.e., `ThreadPoolContinuationDispatcher.Instance`) vs `hot-handoff` (SpscPipe with `HotHandoffContinuationDispatcher`).
-- **Throughput** (BenchmarkDotNet, 1 MiB / 4 KiB chunks): three-way head-to-head — `BclPipe` (BCL `System.IO.Pipelines.Pipe`, baseline), `SpscPipe_TpDefault`, `SpscPipe_HotHandoff` — all in the same BDN process invocation so their numbers are directly comparable.
+- **Latency** (custom harness, P50/P90/P99 by sort): `tp-default` (Pipe with `ContinuationDispatcher = null`, i.e., `ThreadPoolContinuationDispatcher.Instance`) vs `hot-handoff` (Pipe with `HotHandoffContinuationDispatcher`).
+- **Throughput** (BenchmarkDotNet, 1 MiB / 4 KiB chunks): three-way head-to-head — `BclPipe` (BCL `System.IO.Pipelines.Pipe`, baseline), `Pipe_TpDefault`, `Pipe_HotHandoff` — all in the same BDN process invocation so their numbers are directly comparable.
 
 **Spec reference:** `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` §8.
 
@@ -22,13 +22,13 @@ measurement that drove it.
 
 ## Methodology
 
-- Latency: `dotnet run -c Release --project tests/SpscPipelines.HotHandoff.Benchmarks -- latency --count 100000 --size 256 --trials 3 --warmup 1`
-- Throughput: `dotnet run -c Release --project tests/SpscPipelines.HotHandoff.Benchmarks -- --filter '*'`
+- Latency: `dotnet run -c Release --project tests/Pipely.HotHandoff.Benchmarks -- latency --count 100000 --size 256 --trials 3 --warmup 1`
+- Throughput: `dotnet run -c Release --project tests/Pipely.HotHandoff.Benchmarks -- --filter '*'`
 - Three latency trials per recorded run; warmup trial not recorded.
 - Hardware/build details captured at the top of each results section.
 - The hot-handoff worker thread sits at ~100% on its core during the busy-spin
   loop. Latency and throughput wins must be read against this CPU cost.
-- **Dispatcher amortization:** `SpscPipe_HotHandoff_ProduceAndDrain` constructs the dispatcher once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring `BclPipe`'s no-extra-state baseline and `SpscPipe_TpDefault`'s singleton-dispatcher baseline). Per-iteration cost for all three rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one dispatcher per recorded trial, not per message).
+- **Dispatcher amortization:** `Pipe_HotHandoff_ProduceAndDrain` constructs the dispatcher once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring `BclPipe`'s no-extra-state baseline and `Pipe_TpDefault`'s singleton-dispatcher baseline). Per-iteration cost for all three rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one dispatcher per recorded trial, not per message).
 
 ## Starting tunables
 
@@ -55,13 +55,13 @@ the prior baseline.
 | Method                              | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
 |-------------------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
 | `BclPipe_ProduceAndDrain`           | 105.09 us | 0.834 us | 0.780 us | 1.00  | 0.1221 |   7.03 KB |        1.00 |
-| `SpscPipe_TpDefault_ProduceAndDrain`|  70.34 us | 0.242 us | 0.215 us | 0.67  | 0.2441 |  11.03 KB |        1.57 |
-| `SpscPipe_HotHandoff_ProduceAndDrain`|  50.45 us | 0.185 us | 0.173 us | 0.48  | 0.2441 |   9.21 KB |        1.31 |
+| `Pipe_TpDefault_ProduceAndDrain`|  70.34 us | 0.242 us | 0.215 us | 0.67  | 0.2441 |  11.03 KB |        1.57 |
+| `Pipe_HotHandoff_ProduceAndDrain`|  50.45 us | 0.185 us | 0.173 us | 0.48  | 0.2441 |   9.21 KB |        1.31 |
 
 Reading:
-- `SpscPipe_TpDefault` is **1.50×** faster than BCL — consistent with `tests/SpscPipelines.Benchmarks/RESULTS.md`'s prior characterization of the SpscPipe-vs-BCL axis.
-- `SpscPipe_HotHandoff` is **1.39×** faster than `SpscPipe_TpDefault` (50.45 / 70.34) and **2.08×** faster than BCL.
-- `SpscPipe_HotHandoff` allocates **0.84×** the bytes of `SpscPipe_TpDefault` (9.21 / 11.03 KB) — the worker-thread invocation path doesn't allocate the per-event TP work-item objects.
+- `Pipe_TpDefault` is **1.50×** faster than BCL — consistent with `tests/Pipely.Benchmarks/RESULTS.md`'s prior characterization of the Pipe-vs-BCL axis.
+- `Pipe_HotHandoff` is **1.39×** faster than `Pipe_TpDefault` (50.45 / 70.34) and **2.08×** faster than BCL.
+- `Pipe_HotHandoff` allocates **0.84×** the bytes of `Pipe_TpDefault` (9.21 / 11.03 KB) — the worker-thread invocation path doesn't allocate the per-event TP work-item objects.
 
 ### Latency (ns) — 1 M messages × 256 B, 5 warmup + 10 recorded trials
 
@@ -85,7 +85,7 @@ Aggregate across the 10 recorded trials (each trial sorts 1 M samples and reads 
 
 The two measurements characterize the same dispatcher under two different kinds of workload, and the contrast is the design's central finding.
 
-**Throughput workload — HotHandoff wins decisively.** 1.39× over `SpscPipe_TpDefault`, 2.08× over BCL, with lower allocations. The 4 KiB-chunk workload's backpressure cycles produce idle windows long enough (>10 µs) for TP workers to exit their spin and actually sleep on the kernel semaphore. Each resume then pays a TP wake-gap on the order of multiple µs. HotHandoff's continuously-hot worker thread skips the kernel wake entirely. This is the workload pattern the dispatcher was designed for: streams where TP queues empty long enough that TP workers park between events.
+**Throughput workload — HotHandoff wins decisively.** 1.39× over `Pipe_TpDefault`, 2.08× over BCL, with lower allocations. The 4 KiB-chunk workload's backpressure cycles produce idle windows long enough (>10 µs) for TP workers to exit their spin and actually sleep on the kernel semaphore. Each resume then pays a TP wake-gap on the order of multiple µs. HotHandoff's continuously-hot worker thread skips the kernel wake entirely. This is the workload pattern the dispatcher was designed for: streams where TP queues empty long enough that TP workers park between events.
 
 **Latency workload — HotHandoff is comparable-to-slightly-worse.** P50 median 1.16× (worse), Mean median 1.19× (worse), tails (P99) effectively unchanged. The 256 B / 1 M-message workload sustains MHz event rates; idle windows between events are sub-µs, well inside TP's spin-then-sleep threshold. TP workers never actually park, so there is no kernel-wake cost for HotHandoff to escape. The dispatcher's per-event overhead (worker-thread `Interlocked` operations on the same cache line touched by the producer's signal path; cache contention without CPU pinning) shows up in the per-message latency without the wake-gap savings to offset it.
 

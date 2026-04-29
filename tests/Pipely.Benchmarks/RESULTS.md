@@ -24,7 +24,7 @@ AMD Ryzen 7 8700F 4.02GHz, 1 CPU, 16 logical and 8 physical cores
 | Method                   | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
 |------------------------- |----------:|---------:|---------:|------:|-------:|----------:|------------:|
 | BclPipe_ProduceAndDrain  | 110.34 us | 0.728 us | 0.681 us |  1.00 |      - |   6.87 KB |        1.00 |
-| SpscPipe_ProduceAndDrain |  73.69 us | 0.263 us | 0.220 us |  0.67 | 0.1221 |   8.44 KB |        1.23 |
+| Pipe_ProduceAndDrain |  73.69 us | 0.263 us | 0.220 us |  0.67 | 0.1221 |   8.44 KB |        1.23 |
 
 (Two SPSC outliers at 74.50 us and 75.00 us were trimmed by BDN; the 13 retained iterations are
 tightly clustered, StdDev = 0.22 us = 0.30% of mean.)
@@ -56,7 +56,7 @@ single-consumer hot path. A 1.50x speedup at this chunk size meets that bar.
 - **`ServerGarbageCollection` is on** (csproj). Workstation GC may give different absolute numbers
   but should not flip the ranking.
 - **Pause/resume thresholds match.** BCL's `PipeOptions.Default` pause/resume = 64K/32K; the
-  SPSC adapter passes `SpscPipeOptions.Default` which uses the same 64K/32K. So the comparison
+  SPSC adapter passes `PipeOptions.Default` which uses the same 64K/32K. So the comparison
   exercises identical backpressure points.
 
 ## Latency
@@ -74,22 +74,22 @@ Three independent runs:
 | BCL      |   1 | 210ns| 2,230ns| 4,950ns| 156,267ns| 6,209,599ns| 6,212,910ns| 21,898ns|
 | BCL      |   2 | 220ns| 2,350ns| 6,590ns|  28,079ns| 5,848,336ns| 5,850,656ns| 19,091ns|
 | BCL      |   3 | 230ns| 2,390ns| 5,880ns|  33,260ns| 5,094,158ns| 5,098,688ns| 15,938ns|
-| SpscPipe |   1 | 250ns|   680ns| 1,230ns|  14,400ns| 3,840,958ns| 3,850,797ns| 11,923ns|
-| SpscPipe |   2 | 210ns|   570ns|   940ns|   4,370ns| 3,476,284ns| 3,486,363ns| 10,646ns|
-| SpscPipe |   3 | 230ns|   680ns| 1,190ns|   9,080ns| 3,623,882ns| 3,633,742ns| 11,265ns|
+| Pipe |   1 | 250ns|   680ns| 1,230ns|  14,400ns| 3,840,958ns| 3,850,797ns| 11,923ns|
+| Pipe |   2 | 210ns|   570ns|   940ns|   4,370ns| 3,476,284ns| 3,486,363ns| 10,646ns|
+| Pipe |   3 | 230ns|   680ns| 1,190ns|   9,080ns| 3,623,882ns| 3,633,742ns| 11,265ns|
 
 ### Verdict
 
 - **Min** is essentially tied (~200-250 ns for both) — both pipes hit the same noise floor on the
   fastest path.
-- **P50:** SpscPipe ~600-700 ns vs BCL ~2.2-2.4 µs → **~3.4× lower median**.
-- **P90:** SpscPipe ~0.9-1.2 µs vs BCL ~5-6.5 µs → **~4-6× lower**.
-- **P99:** SpscPipe ~4-14 µs vs BCL ~28-156 µs → **~3-11× lower**, with BCL's P99 noticeably more
+- **P50:** Pipe ~600-700 ns vs BCL ~2.2-2.4 µs → **~3.4× lower median**.
+- **P90:** Pipe ~0.9-1.2 µs vs BCL ~5-6.5 µs → **~4-6× lower**.
+- **P99:** Pipe ~4-14 µs vs BCL ~28-156 µs → **~3-11× lower**, with BCL's P99 noticeably more
   variable run-to-run. This is the most striking gap and was completely hidden by the prior
   power-of-2 histogram (both reported the same 16,384 ns bucket label).
 - **P99.9 / Max:** Both ~3-6 ms. The tail is dominated by OS scheduling jitter and GC, not by pipe
   internals; lock-free vs locked doesn't change worst-case runtime behavior. Expected.
-- **Mean:** SpscPipe ~10-12 µs vs BCL ~16-22 µs → ~1.5-1.8× lower mean. The mean is dragged up
+- **Mean:** Pipe ~10-12 µs vs BCL ~16-22 µs → ~1.5-1.8× lower mean. The mean is dragged up
   for both by the millisecond-scale outliers, so percentile views are more informative.
 
 ### Notes / caveats
