@@ -3,7 +3,7 @@ using System.Threading.Tasks.Sources;
 using SpscPipelines;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace SpscPipelines.Tests;
 
 public class SpscPipeContinuationDispatcherTests
 {

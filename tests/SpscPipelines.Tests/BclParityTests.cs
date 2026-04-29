@@ -3,7 +3,7 @@ using System.IO.Pipelines;
 using SpscPipelines;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace SpscPipelines.Tests;
 
 public enum PipeKind { Bcl, Spsc }
 

@@ -1,6 +1,6 @@
 using BenchmarkDotNet.Attributes;
 
-namespace SpscPipe.Benchmarks;
+namespace SpscPipelines.Benchmarks;
 
 [MemoryDiagnoser]
 public class ThroughputBenchmarks

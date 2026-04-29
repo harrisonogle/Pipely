@@ -52,7 +52,7 @@ internal sealed class SpscAwaiter<T> : IValueTaskSource<T>
 
     // Diagnostic counters (Interlocked-incremented at each CAS resolution site). Cost ~5-10 ns
     // per increment, only on park/signal paths (off the synchronous hot path). Read by the
-    // benchmark project (`tests/SpscPipe.Benchmarks/SpscPipeAdapter.cs`) after a run completes;
+    // benchmark project (`tests/SpscPipelines.Benchmarks/SpscPipeAdapter.cs`) after a run completes;
     // unrelated to the EC-capture work.
     public long _parkCount;
     public long _signalWonCount;

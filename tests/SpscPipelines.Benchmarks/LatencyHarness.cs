@@ -5,7 +5,7 @@ using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace SpscPipe.Benchmarks;
+namespace SpscPipelines.Benchmarks;
 
 internal sealed record SampleStats(
     long Count,

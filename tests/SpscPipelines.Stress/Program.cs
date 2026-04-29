@@ -1,5 +1,5 @@
 using SpscPipelines;
-using SpscPipe.Stress;
+using SpscPipelines.Stress;
 
 int seedCount = args.Length > 0 ? int.Parse(args[0]) : 10;
 long bytesPerSeed = args.Length > 1 ? long.Parse(args[1]) : 1L << 22;   // 4 MiB

@@ -1,6 +1,6 @@
 using System.IO.Pipelines;
 
-namespace SpscPipe.Benchmarks;
+namespace SpscPipelines.Benchmarks;
 
 internal sealed class BclPipeAdapter : IPipeAdapter
 {

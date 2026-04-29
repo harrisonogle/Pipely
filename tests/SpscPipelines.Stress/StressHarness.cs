@@ -1,7 +1,7 @@
 using SpPipe = SpscPipelines.SpscPipe;
 using SpscPipelines;
 
-namespace SpscPipe.Stress;
+namespace SpscPipelines.Stress;
 
 internal sealed class StressHarness
 {

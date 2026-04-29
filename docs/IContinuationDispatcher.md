@@ -168,7 +168,7 @@ This is a deliberate contract choice, not an implementation accident. `SpscPipe`
 | Source-side EC capture (consumer-thread) | `src/SpscPipelines/SpscAwaiter.cs` (`OnCompleted` override; `_realContinuation` / `_realState` / `_capturedEC` fields) |
 | Source-side EC application (dispatcher-thread) | `src/SpscPipelines/SpscAwaiter.cs` (`s_dispatch`, `s_invokeWithEc`, `s_runContinuation` static delegates) |
 | Signal-path SetResult/SetException sites | All in `SpscPipe.cs`, `SpscPipe.Reader.cs`, `SpscPipe.Writer.cs` — direct `_core.SetResult` / `_core.SetException` calls; the dispatcher hop is encapsulated inside `SpscAwaiter`'s `OnCompleted` + `s_dispatch` flow |
-| Tests (EC flow, isolation, scheduler bypass, race) | `tests/SpscPipe.Tests/SpscPipeContinuationDispatcherTests.cs` |
+| Tests (EC flow, isolation, scheduler bypass, race) | `tests/SpscPipelines.Tests/SpscPipeContinuationDispatcherTests.cs` |
 
 ## Spec references
 

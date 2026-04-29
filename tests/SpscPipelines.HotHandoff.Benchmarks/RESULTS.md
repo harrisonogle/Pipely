@@ -59,7 +59,7 @@ the prior baseline.
 | `SpscPipe_HotHandoff_ProduceAndDrain`|  50.45 us | 0.185 us | 0.173 us | 0.48  | 0.2441 |   9.21 KB |        1.31 |
 
 Reading:
-- `SpscPipe_TpDefault` is **1.50×** faster than BCL — consistent with `tests/SpscPipe.Benchmarks/RESULTS.md`'s prior characterization of the SpscPipe-vs-BCL axis.
+- `SpscPipe_TpDefault` is **1.50×** faster than BCL — consistent with `tests/SpscPipelines.Benchmarks/RESULTS.md`'s prior characterization of the SpscPipe-vs-BCL axis.
 - `SpscPipe_HotHandoff` is **1.39×** faster than `SpscPipe_TpDefault` (50.45 / 70.34) and **2.08×** faster than BCL.
 - `SpscPipe_HotHandoff` allocates **0.84×** the bytes of `SpscPipe_TpDefault` (9.21 / 11.03 KB) — the worker-thread invocation path doesn't allocate the per-event TP work-item objects.
 

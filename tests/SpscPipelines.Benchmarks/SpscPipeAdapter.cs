@@ -2,7 +2,7 @@ using System.IO.Pipelines;
 using SpscPipelines;
 using SpPipe = SpscPipelines.SpscPipe;
 
-namespace SpscPipe.Benchmarks;
+namespace SpscPipelines.Benchmarks;
 
 internal sealed record AwaiterCounters(
     long ParkCount,

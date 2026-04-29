@@ -3,7 +3,7 @@ using System.IO.Pipelines;
 using BenchmarkDotNet.Attributes;
 using SpscPipelines;
 
-namespace SpscPipe.Benchmarks;
+namespace SpscPipelines.Benchmarks;
 
 // Benchmarks SpscPipeWriter.Splice against GetSpan+Advance under the realistic scenario
 // Splice was designed for: an upstream component (network RX, parser, reorder buffer, etc.)

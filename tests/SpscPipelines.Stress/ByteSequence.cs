@@ -1,4 +1,4 @@
-namespace SpscPipe.Stress;
+namespace SpscPipelines.Stress;
 
 internal static class ByteSequence
 {

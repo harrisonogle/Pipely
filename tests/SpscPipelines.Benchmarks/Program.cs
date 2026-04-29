@@ -1,5 +1,5 @@
 using BenchmarkDotNet.Running;
-using SpscPipe.Benchmarks;
+using SpscPipelines.Benchmarks;
 using System.CommandLine;
 
 if (args.Length == 0 || args[0] != "latency")

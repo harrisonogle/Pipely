@@ -7,7 +7,7 @@ using System.CommandLine;
 // like --filter / --job) is forwarded to BenchmarkSwitcher. FromAssembly
 // auto-discovers every public [Benchmark] class in the project, so adding a
 // second BDN class later requires no Program.cs edit (matches the pattern in
-// tests/SpscPipe.Benchmarks/Program.cs).
+// tests/SpscPipelines.Benchmarks/Program.cs).
 if (args.Length == 0 || args[0] != "latency")
 {
     BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);

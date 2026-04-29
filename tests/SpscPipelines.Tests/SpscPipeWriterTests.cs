@@ -1,7 +1,7 @@
 using SpscPipelines;
 using Xunit;
 
-namespace SpscPipe.Tests;
+namespace SpscPipelines.Tests;
 
 public class SpscPipeWriterTests
 {
@@ -43,7 +43,7 @@ public class SpscPipeWriterTests
     {
         using var pipe = new SpscPipelines.SpscPipe();
         // Manually set the internal flag to test the entry guard. Complete is wired in Task 9.
-        // SpscPipe.Tests has InternalsVisibleTo, so direct field access works.
+        // SpscPipelines.Tests has InternalsVisibleTo, so direct field access works.
         pipe._writerCompleted = true;
 
         Assert.Throws<InvalidOperationException>(() => pipe.Writer.GetMemory(0));

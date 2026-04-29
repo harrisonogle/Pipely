@@ -9,9 +9,9 @@
 
 
   <ItemGroup>
-    <InternalsVisibleTo Include="SpscPipe.Tests" />
-    <InternalsVisibleTo Include="SpscPipe.Stress" />
-    <InternalsVisibleTo Include="SpscPipe.Benchmarks" />
+    <InternalsVisibleTo Include="SpscPipelines.Tests" />
+    <InternalsVisibleTo Include="SpscPipelines.Stress" />
+    <InternalsVisibleTo Include="SpscPipelines.Benchmarks" />
   </ItemGroup>
 
 </Project>
