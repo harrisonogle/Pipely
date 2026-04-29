@@ -412,18 +412,20 @@ public class SpscPipeWriterAppendTests
     // ---------- Recycle path: donated -> DisposeOwned + drop; rented -> freelist (unchanged) ----------
 
     [Fact]
-    public async Task ReaderDrainsPastDonated_DisposesOwner_FreelistDoesNotAbsorbIt()
+    public async Task ReaderDrainsPastDonated_DisposesOwner_RentedFreelistUntouchedAndShellPooled()
     {
         // Use a donated-only chain (donated1 + donated2) so the freelist count assertion
-        // is exact: zero donated segments should land in the freelist regardless of the
-        // recycle path's behavior on rented segments.
+        // is exact: zero donated segments should land in the rented freelist regardless of
+        // the recycle path's behavior on rented segments. Donated shells go to the
+        // separate _donatedShellFreelist instead.
         using var pipe = new SpscPipelines.SpscPipe();
         var donated1 = new TrackingMemoryOwner(30);
         var donated2 = new TrackingMemoryOwner(20);
         pipe.Writer.Append(donated1);
         pipe.Writer.Append(donated2);
 
-        int freelistBefore = pipe._freelistCount;
+        int rentedFreelistBefore = pipe._freelistCount;
+        int shellFreelistBefore  = pipe._donatedShellFreelistCount;
 
         await pipe.Writer.FlushAsync();
         var rr = await pipe.Reader.ReadAsync();
@@ -433,9 +435,11 @@ public class SpscPipeWriterAppendTests
         // Next FlushAsync runs RecycleDrainedSegments and recycles donated1.
         await pipe.Writer.FlushAsync();
 
-        // donated1 is foreign-owner: must be Disposed, must NOT enter the freelist.
+        // donated1 is foreign-owner: must be Disposed, must NOT enter the rented freelist,
+        // must enter the donated-shell freelist.
         Assert.Equal(1, donated1.DisposeCount);
-        Assert.Equal(freelistBefore, pipe._freelistCount);
+        Assert.Equal(rentedFreelistBefore, pipe._freelistCount);
+        Assert.Equal(shellFreelistBefore + 1, pipe._donatedShellFreelistCount);
         // donated2 is still the active tail; not yet recycled.
         Assert.Equal(0, donated2.DisposeCount);
     }
@@ -492,6 +496,115 @@ public class SpscPipeWriterAppendTests
 
         Assert.Equal(1, donated1.DisposeCount);
         Assert.Equal(1, donated2.DisposeCount);
+    }
+
+    [Fact]
+    public async Task Append_AfterRecycle_ReusesShellFromFreelist()
+    {
+        // After a donated segment recycles into the shell freelist, the next Append
+        // pops that shell instead of allocating a new BufferSegment. The popped shell
+        // gets fully reinitialized via AdoptFrom — caller cannot distinguish from fresh.
+        using var pipe = new SpscPipelines.SpscPipe();
+        var donated1 = new TrackingMemoryOwner(30);
+        var donated2 = new TrackingMemoryOwner(20);
+        pipe.Writer.Append(donated1);
+        pipe.Writer.Append(donated2);
+
+        await pipe.Writer.FlushAsync();
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(30));
+        await pipe.Writer.FlushAsync();
+
+        // Now donated1's shell is on the shell freelist.
+        Assert.Equal(1, pipe._donatedShellFreelistCount);
+
+        // Append a third donation. The shell freelist should drain.
+        var donated3 = new TrackingMemoryOwner(15);
+        pipe.Writer.Append(donated3);
+
+        Assert.Equal(0, pipe._donatedShellFreelistCount);
+        // The new tail is donated and correctly initialized via AdoptFrom.
+        Assert.True(pipe._writingHead!.IsDonated);
+        Assert.Same(pipe, pipe._writingHead.OwnerToken);
+        Assert.Equal(15, pipe._writingHead.End);
+    }
+
+    [Fact]
+    public async Task ShellFreelist_RespectsCap()
+    {
+        // With MaxFreelistSegments = 2, only 2 shells should pool; the rest drop to GC.
+        // We don't have a public way to observe GC drops directly, but we can assert
+        // the freelist count never exceeds the cap.
+        var options = new SpscPipeOptions(maxFreelistSegments: 2);
+        using var pipe = new SpscPipelines.SpscPipe(options);
+
+        // Cycle: append + flush + drain + flush, repeated, with a final donated tail
+        // each cycle that doesn't get recycled (so the chain has > 2 recyclable donateds).
+        var owners = new List<TrackingMemoryOwner>();
+        for (int i = 0; i < 5; i++)
+        {
+            var o = new TrackingMemoryOwner(8);
+            owners.Add(o);
+            pipe.Writer.Append(o);
+        }
+        // Active tail (last Append) prevents recycle of the 5th; first 4 are recyclable.
+
+        await pipe.Writer.FlushAsync();
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(8 * 4));   // drain past first 4
+        await pipe.Writer.FlushAsync();
+
+        // 4 donated segments were recycled; only 2 fit in the shell freelist.
+        Assert.Equal(2, pipe._donatedShellFreelistCount);
+    }
+
+    [Fact]
+    public void Dispose_ClearsShellFreelist()
+    {
+        // After Dispose, the shell freelist is reset. No IMemoryOwners to dispose
+        // (those were released in RecycleDrainedSegments before pooling); just clear
+        // the head + count.
+        var pipe = new SpscPipelines.SpscPipe();
+        var donated1 = new TrackingMemoryOwner(8);
+        var donated2 = new TrackingMemoryOwner(8);
+        pipe.Writer.Append(donated1);
+        pipe.Writer.Append(donated2);
+        // Force at least one recycle so the shell freelist has an entry.
+        pipe.Writer.FlushAsync().GetAwaiter().GetResult();
+        var rr = pipe.Reader.ReadAsync().GetAwaiter().GetResult();
+        pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(8));
+        pipe.Writer.FlushAsync().GetAwaiter().GetResult();
+        Assert.Equal(1, pipe._donatedShellFreelistCount);
+
+        pipe.Dispose();
+
+        Assert.Null(pipe._donatedShellFreelistHead);
+        Assert.Equal(0, pipe._donatedShellFreelistCount);
+    }
+
+    [Fact]
+    public async Task ShellFreelist_PoppedShellHasIsDonatedTrue_AndNoStaleOwnerToken()
+    {
+        // Defensive regression guard: a popped shell goes through AdoptFrom which sets
+        // OwnerToken = pipe and IsDonated = true unconditionally. Even though the
+        // pre-pop shell already had IsDonated=true and OwnerToken=pipe (set by the
+        // previous AdoptFrom), this test pins the property so a future change to the
+        // pop logic (e.g., reset-on-pop) doesn't accidentally regress.
+        using var pipe = new SpscPipelines.SpscPipe();
+        var donated1 = new TrackingMemoryOwner(8);
+        pipe.Writer.Append(donated1);
+        await pipe.Writer.FlushAsync();
+        var rr = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr.Buffer.End);
+        await pipe.Writer.FlushAsync();
+        Assert.Equal(1, pipe._donatedShellFreelistCount);
+
+        var donated2 = new TrackingMemoryOwner(8);
+        pipe.Writer.Append(donated2);
+
+        var seg = pipe._writingHead!;
+        Assert.True(seg.IsDonated);
+        Assert.Same(pipe, seg.OwnerToken);
     }
 
     [Fact]
