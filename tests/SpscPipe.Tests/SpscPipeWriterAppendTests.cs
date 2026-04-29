@@ -590,17 +590,23 @@ public class SpscPipeWriterAppendTests
         // pre-pop shell already had IsDonated=true and OwnerToken=pipe (set by the
         // previous AdoptFrom), this test pins the property so a future change to the
         // pop logic (e.g., reset-on-pop) doesn't accidentally regress.
+        //
+        // Two segments are required to trigger a recycle: donated1 is frozen (no longer
+        // _writingHead) once donated2 is appended, so RecycleDrainedSegments can recycle it.
+        // With only one segment, _chainHead == _writingHead and the recycle loop never fires.
         using var pipe = new SpscPipelines.SpscPipe();
         var donated1 = new TrackingMemoryOwner(8);
+        var donated2 = new TrackingMemoryOwner(8);
         pipe.Writer.Append(donated1);
+        pipe.Writer.Append(donated2);
         await pipe.Writer.FlushAsync();
         var rr = await pipe.Reader.ReadAsync();
-        pipe.Reader.AdvanceTo(rr.Buffer.End);
+        pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(8));  // drain past donated1 only
         await pipe.Writer.FlushAsync();
         Assert.Equal(1, pipe._donatedShellFreelistCount);
 
-        var donated2 = new TrackingMemoryOwner(8);
-        pipe.Writer.Append(donated2);
+        var donated3 = new TrackingMemoryOwner(8);
+        pipe.Writer.Append(donated3);
 
         var seg = pipe._writingHead!;
         Assert.True(seg.IsDonated);

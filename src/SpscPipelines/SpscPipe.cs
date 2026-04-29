@@ -19,6 +19,8 @@ public sealed partial class SpscPipe : IDisposable
     internal long _totalWritten;
     internal BufferSegment? _freelistHead;
     internal int  _freelistCount;
+    internal BufferSegment? _donatedShellFreelistHead;
+    internal int  _donatedShellFreelistCount;
     internal WriterState _lastPublishedWriterState;
     internal ReaderState _lastAcquiredReaderState;
     internal bool _writerCompleted;
@@ -88,6 +90,11 @@ public sealed partial class SpscPipe : IDisposable
         }
         _freelistHead = null;
         _freelistCount = 0;
+
+        // Donated-shell freelist: shells have no IMemoryOwner (released in RecycleDrainedSegments
+        // before pooling). Just clear the head and count; nothing to dispose.
+        _donatedShellFreelistHead = null;
+        _donatedShellFreelistCount = 0;
     }
 
     internal BufferSegment RentSegment(int sizeHint, long runningIndex)
@@ -134,6 +141,25 @@ public sealed partial class SpscPipe : IDisposable
         s.SetFreelistNext(_freelistHead);
         _freelistHead = s;
         _freelistCount++;
+    }
+
+    internal void PushDonatedShellFreelist(BufferSegment shell)
+    {
+        if (_donatedShellFreelistCount >= _options.MaxFreelistSegments)
+            return;     // cap exceeded; drop the shell to GC
+        shell.SetFreelistNext(_donatedShellFreelistHead);
+        _donatedShellFreelistHead = shell;
+        _donatedShellFreelistCount++;
+    }
+
+    internal BufferSegment? PopDonatedShellFreelist()
+    {
+        var head = _donatedShellFreelistHead;
+        if (head == null) return null;
+        _donatedShellFreelistHead = head.Next;
+        head.SetFreelistNext(null);   // detach from the freelist link
+        _donatedShellFreelistCount--;
+        return head;
     }
 
     internal bool HasReadableProgress() => _lastAcquiredWriterState.TotalWritten > _totalExamined;
@@ -325,9 +351,14 @@ public sealed partial class SpscPipe : IDisposable
             _chainHead   = recycled.Next!;
 
             if (recycled.IsDonated)
-                recycled.DisposeOwned();      // foreign owner: release; drop the BufferSegment shell
+            {
+                recycled.DisposeOwned();              // foreign owner: release the IMemoryOwner
+                PushDonatedShellFreelist(recycled);   // shell pooled for re-use; over-cap drops to GC
+            }
             else
-                PushFreelist(recycled);       // pool-rented: existing freelist path (with cap-overflow handling)
+            {
+                PushFreelist(recycled);               // pool-rented: existing freelist path (with cap-overflow handling)
+            }
         }
     }
 }

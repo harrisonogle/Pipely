@@ -266,7 +266,7 @@ public sealed class SpscPipeWriter : PipeWriter
         // Bootstrap: pipe has no writing head yet.
         if (_pipe._writingHead == null)
         {
-            var donated = new BufferSegment();
+            var donated = _pipe.PopDonatedShellFreelist() ?? new BufferSegment();
             donated.AdoptFrom(buffer, slice, runningIndex: 0, pipeOwner: _pipe);
             _pipe._chainHead   = donated;
             _pipe._writingHead = donated;
@@ -282,7 +282,7 @@ public sealed class SpscPipeWriter : PipeWriter
         int filled = _pipe._writingHeadBytesBuffered;
         long newRI = _pipe._writingHead.RunningIndex + filled;
 
-        var newDonated = new BufferSegment();
+        var newDonated = _pipe.PopDonatedShellFreelist() ?? new BufferSegment();
         newDonated.AdoptFrom(buffer, slice, newRI, pipeOwner: _pipe);
 
         _pipe._writingHead.Freeze(filled, newDonated);
