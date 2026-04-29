@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.IO.Pipelines;
 using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Configs;
 using SpscPipelines;
 
 namespace SpscPipe.Benchmarks;
@@ -17,6 +18,7 @@ namespace SpscPipe.Benchmarks;
 // coordination. TotalBytes is fixed at 1 MiB per BDN iteration to keep the wall-clock unit consistent.
 [MemoryDiagnoser]
 [CategoriesColumn]
+[GroupBenchmarksBy(BenchmarkLogicalGroupRule.ByCategory)]
 public class AppendBenchmarks
 {
     private const int TotalBytes = 1 << 20;     // 1 MiB per iteration
@@ -58,7 +60,7 @@ public class AppendBenchmarks
 
     // ---------- Variant B — "copy" (zero-copy realistic) ----------
 
-    [Benchmark, BenchmarkCategory("copy")]
+    [Benchmark(Baseline = true), BenchmarkCategory("copy")]
     public Task BclPipe_GetSpan_Copy()
     {
         var pipe = new Pipe(BclOptions);
