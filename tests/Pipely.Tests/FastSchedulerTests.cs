@@ -3,16 +3,16 @@ using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Runtime.InteropServices;
 
-namespace Pipely.HotHandoff.Tests;
+namespace Pipely.Tests;
 
-public class HotHandoffContinuationDispatcherTests
+public class FastSchedulerTests
 {
     // ---------- Layer A: dispatcher in isolation (no Pipe) ----------
 
     [Fact]
     public void Dispatch_InvokesCallbackOnDedicatedThread()
     {
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var dispatcher = new FastScheduler();
         int? firstThreadId    = null;
         int? secondThreadId   = null;
         string? firstThreadName  = null;
@@ -45,15 +45,15 @@ public class HotHandoffContinuationDispatcherTests
         }
 
         Assert.NotEqual(Environment.CurrentManagedThreadId, firstThreadId);
-        Assert.Equal("Pipe HotHandoff", firstThreadName);
-        Assert.Equal("Pipe HotHandoff", secondThreadName);
+        Assert.Equal("Pipe FastScheduler", firstThreadName);
+        Assert.Equal("Pipe FastScheduler", secondThreadName);
         Assert.Equal(firstThreadId, secondThreadId);   // consistently same dedicated thread
     }
 
     [Fact]
     public void Dispatch_OverflowFallsBackToThreadPool()
     {
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var dispatcher = new FastScheduler();
         using var firstStarted = new ManualResetEventSlim(false);
         using var firstRelease = new ManualResetEventSlim(false);
         using var secondDone   = new ManualResetEventSlim(false);
@@ -87,7 +87,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public void Dispatch_InvokesEachCallbackExactlyOnce()
     {
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var dispatcher = new FastScheduler();
         const int totalDispatches = 10_000;
         int invocationCount = 0;
         var allDone = new CountdownEvent(totalDispatches);
@@ -110,7 +110,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public void Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem()
     {
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var dispatcher = new FastScheduler();
         const int totalDispatches = 5_000;
         int dispatchExceptions = 0;
 
@@ -134,7 +134,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public void ThrowingCallback_DoesNotKillDispatcherThread()
     {
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var dispatcher = new FastScheduler();
         using var firstDone  = new ManualResetEventSlim(false);
 
         // First slot-path dispatch throws.
@@ -154,7 +154,7 @@ public class HotHandoffContinuationDispatcherTests
         // 5-second deadline (deterministic, no Thread.Sleep).
         string? observedName = null;
         var deadline = Environment.TickCount64 + 5000;
-        while (observedName != "Pipe HotHandoff" && Environment.TickCount64 < deadline)
+        while (observedName != "Pipe FastScheduler" && Environment.TickCount64 < deadline)
         {
             using var probeDone = new ManualResetEventSlim(false);
             dispatcher.UnsafeQueueUserWorkItem(_ =>
@@ -165,7 +165,7 @@ public class HotHandoffContinuationDispatcherTests
             probeDone.Wait(TimeSpan.FromMilliseconds(200));
         }
 
-        Assert.Equal("Pipe HotHandoff", observedName);
+        Assert.Equal("Pipe FastScheduler", observedName);
     }
 
     [Fact]
@@ -177,7 +177,7 @@ public class HotHandoffContinuationDispatcherTests
 
         for (int trial = 0; trial < trials; trial++)
         {
-            var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+            var dispatcher = new FastScheduler();
             int invocationCount = 0;
             using var done = new ManualResetEventSlim(false);
 
@@ -203,7 +203,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public async Task Dispose_BlocksUntilInFlightCallbackCompletes()
     {
-        var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        var dispatcher = new FastScheduler();
         using var callbackStarted = new ManualResetEventSlim(false);
         using var callbackRelease = new ManualResetEventSlim(false);
         int callbackCompleted = 0;
@@ -234,7 +234,7 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public void Dispatch_AfterDispose_AlwaysRunsOnThreadPool()
     {
-        var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        var dispatcher = new FastScheduler();
         dispatcher.Dispose();
 
         const int total = 100;
@@ -269,7 +269,7 @@ public class HotHandoffContinuationDispatcherTests
         // (thread waiting for itself to exit). With the escape, Dispose returns
         // immediately; the worker thread terminates naturally once the cb
         // returns to the loop.
-        var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        var dispatcher = new FastScheduler();
         using var firstDone  = new ManualResetEventSlim(false);
         using var secondDone = new ManualResetEventSlim(false);
         bool secondOnTpThread = false;
@@ -302,11 +302,11 @@ public class HotHandoffContinuationDispatcherTests
     [Fact]
     public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
     {
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
-        using var pipeA = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
-        using var pipeB = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new FastScheduler();
+        using var pipeA = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipeB = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
-        static async Task Roundtrip(Pipely.Pipe pipe, int payloadBytes)
+        static async Task Roundtrip(Pipe pipe, int payloadBytes)
         {
             var readTask = pipe.Reader.ReadAsync().AsTask();
             await Task.Run(async () =>
@@ -329,10 +329,10 @@ public class HotHandoffContinuationDispatcherTests
     // ---------- Layer B: dispatcher integrated with Pipe ----------
 
     [Fact]
-    public async Task Pipe_WithHotHandoff_BasicReadFlush_RoundTrip()
+    public async Task Pipe_WithFastScheduler_BasicReadFlush_RoundTrip()
     {
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new FastScheduler();
+        using var pipe = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
         var readTask = pipe.Reader.ReadAsync().AsTask();
         Assert.False(readTask.IsCompleted, "Reader should park on the empty pipe.");
@@ -351,11 +351,11 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
-    public async Task Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation()
+    public async Task Pipe_WithFastScheduler_AsyncLocalFlowsToContinuation()
     {
         var asyncLocal = new AsyncLocal<int>();
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new FastScheduler();
+        using var pipe = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
         asyncLocal.Value = 42;
 
@@ -380,12 +380,12 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
-    public async Task Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation()
+    public async Task Pipe_WithFastScheduler_DispatcherThreadAsyncLocal_NotObservedInContinuation()
     {
         var consumerLocal   = new AsyncLocal<int>();
         var dispatcherLocal = new AsyncLocal<int>();
 
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var dispatcher = new FastScheduler();
 
         // Set dispatcherLocal on the worker thread by dispatching a one-shot through the slot.
         using var setupDone = new ManualResetEventSlim(false);
@@ -396,7 +396,7 @@ public class HotHandoffContinuationDispatcherTests
         }, null);
         Assert.True(setupDone.Wait(TimeSpan.FromSeconds(5)));
 
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
         consumerLocal.Value = 42;
 
@@ -421,10 +421,10 @@ public class HotHandoffContinuationDispatcherTests
     }
 
     [Fact]
-    public async Task Pipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch()
+    public async Task Pipe_WithFastScheduler_RapidParkResumeCycles_NoVersionMismatch()
     {
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new FastScheduler();
+        using var pipe = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
         const int totalCycles  = 1000;
         const int messageBytes = 8;
@@ -462,19 +462,19 @@ public class HotHandoffContinuationDispatcherTests
 
     /// <summary>
     /// Reproduces the BDN deadlock pattern outside of BDN to determine whether
-    /// it's a HotHandoff dispatcher bug or BDN-harness-specific.
+    /// it's a FastScheduler bug or BDN-harness-specific.
     ///
     /// Background: when the BDN throughput benchmark's consumer was modified
     /// to do per-message timestamp processing (CopyTo + MemoryMarshal.Read +
     /// Stopwatch.GetTimestamp + sample-write per chunk, mirroring the latency
     /// CLI's pattern), BDN's WorkloadJitting hung deterministically on the
-    /// HotHandoff benchmark — twice in a row, on commits 0d10225 and 032528f.
+    /// FastScheduler benchmark — twice in a row, on commits 0d10225 and 032528f.
     /// Reverting to a simple-drain consumer (commit 99293c1) cleared it. The
     /// latency CLI runs the same per-message consumer code happily, so the
     /// hypothesis was that the combination of (sustained back-to-back
     /// iterations sharing one dispatcher) + (per-message consumer that holds
     /// the slot longer via inline continuation processing) surfaces a
-    /// HotHandoff bug that the latency CLI's slower iteration cadence doesn't.
+    /// FastScheduler bug that the latency CLI's slower iteration cadence doesn't.
     ///
     /// This test reproduces that exact pattern outside of BDN, with all
     /// per-iteration state local (no shared <c>_samples</c> field) so we are
@@ -485,15 +485,15 @@ public class HotHandoffContinuationDispatcherTests
     /// <list type="bullet">
     /// <item>If this test passes within the timeout, the BDN deadlock is in
     ///       BDN's harness layer (or in the cross-iteration state we ruled
-    ///       out here), not in HotHandoff itself.</item>
-    /// <item>If this test hangs, HotHandoff has a real bug under this pattern;
+    ///       out here), not in FastScheduler itself.</item>
+    /// <item>If this test hangs, FastScheduler has a real bug under this pattern;
     ///       we have a reproducer to investigate further.</item>
     /// </list>
     /// </summary>
     [Fact]
-    public async Task Pipe_WithHotHandoff_RepeatedIteration_PerMessageConsumer_DoesNotHang()
+    public async Task Pipe_WithFastScheduler_RepeatedIteration_PerMessageConsumer_DoesNotHang()
     {
-        using var dispatcher = new Pipely.HotHandoff.HotHandoffContinuationDispatcher();
+        using var dispatcher = new FastScheduler();
         const int iterations   = 30;            // BDN's WorkloadJitting hung at op 16; 30 gives margin.
         const int messageCount = 1_000_000;     // Same as the BDN temp workload (commit c1ba6b9).
         const int chunkSize    = 256;           // Same as the BDN temp workload.
@@ -502,7 +502,7 @@ public class HotHandoffContinuationDispatcherTests
         {
             for (int iter = 0; iter < iterations; iter++)
             {
-                using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
+                using var pipe = new Pipe(new PipeOptions
                 {
                     ContinuationDispatcher = dispatcher,
                 });

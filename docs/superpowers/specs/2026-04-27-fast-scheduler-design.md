@@ -1,4 +1,4 @@
-# Hot-Handoff Continuation Dispatcher — Design
+# FastScheduler — Design
 
 **Date:** 2026-04-27
 **Status:** Spec (pre-implementation). The design described here covers the **fixed architecture** — state machine, contract, correctness argument, and tests. The **tunable surface** (spin count, backoff body, CPU pinning, mailbox depth) is explicitly open and will be closed by the benchmark project that ships alongside the implementation. The implementation is finalized only when measurements either justify a tuned configuration that beats the default `ThreadPool` dispatcher at the percentiles that matter, or demonstrate that no reasonable configuration does — at which point we either ship the measured configuration or do not ship the dispatcher at all.
@@ -10,13 +10,13 @@
 - Slot is single-occupancy: at most one continuation may be staged for the dedicated thread at any time. Concurrent Dispatchers race on a single CAS; losers fall through to TP. This bounds the dispatcher's memory and avoids any queue/mailbox machinery in the architecture.
 - Lifecycle is a three-state monotonic transition: `Vacant` → optional `Busy` → optional `ShutdownRequested` (terminal once slot empties). `Dispose` is `Or` + `Join`, and the four observable producer/disposer races are closed without a second sync variable.
 - The dispatcher upholds all five items of the `IContinuationDispatcher` contract: exactly-once invocation (race-checked), no `ExecutionContext` capture (structural), thread-safe (single-int CAS), never throws from `UnsafeQueueUserWorkItem`, and survives throwing continuations via `try`/`catch`.
-- Lives in a separate project, `src/Pipely.HotHandoff/`, with its own test project and its own benchmark project. `Pipely` itself gains zero new public API. Whether the dispatcher ships as a supported library type, ships as a sample, or doesn't ship at all is a deferred decision tied to the benchmark project's findings.
+- Lives in a separate project, `src/Pipely/`, with its own test project and its own benchmark project. `Pipely` itself gains zero new public API. Whether the dispatcher ships as a supported library type, ships as a sample, or doesn't ship at all is a deferred decision tied to the benchmark project's findings.
 
 ## Section 1 — Goal and motivation
 
 `Pipe` ships a pluggable `IContinuationDispatcher` (`docs/IContinuationDispatcher.md`, §6 of the SPSC pipe design spec). The default forwards to `ThreadPool.UnsafeQueueUserWorkItem`, which carries a fixed per-signal cost — typically a few hundred ns at P50, multi-µs at P99 — to dispatch the continuation onto a TP worker. For a single high-frequency producer/consumer stream this fixed cost is the worst case for the TP scheduler architecture: it does not amortize across multiple workloads, and it scales linearly with signal rate.
 
-The hot-handoff dispatcher is the canonical custom implementation that escapes this cost. It maintains one dedicated thread that busy-spins on a one-slot mailbox, ready to invoke the very next continuation without a kernel wake hop. When the dedicated thread is already running a continuation, subsequent continuations spill to the ThreadPool — i.e., the dispatcher degrades to the default behavior under burst, never refusing work and never violating the "callback invoked exactly once" contract item.
+The fast-scheduler dispatcher is the canonical custom implementation that escapes this cost. It maintains one dedicated thread that busy-spins on a one-slot mailbox, ready to invoke the very next continuation without a kernel wake hop. When the dedicated thread is already running a continuation, subsequent continuations spill to the ThreadPool — i.e., the dispatcher degrades to the default behavior under burst, never refusing work and never violating the "callback invoked exactly once" contract item.
 
 The design's purpose is to be the dispatcher we measure to determine whether the wake-gap escape hatch is worth providing as a supported component. The architecture in this spec is fixed; the implementation's tunable surface is closed by measurement (Section 7).
 
@@ -24,9 +24,9 @@ The design's purpose is to be the dispatcher we measure to determine whether the
 
 Three new projects under the existing `Pipe.slnx`:
 
-- `src/Pipely.HotHandoff/` — the dispatcher implementation. References `Pipely`. Public surface: exactly one type, `HotHandoffContinuationDispatcher`, implementing `IContinuationDispatcher` and `IDisposable`. No options class. No constructor parameters. No public knobs of any kind. Tunables live as `private const` adjacent to the loop body and are edited between benchmark runs.
-- `tests/Pipely.HotHandoff.Tests/` — unit and integration tests for the dispatcher. References `Pipely.HotHandoff` and `Pipely`. xUnit-based, conventions matching the existing `tests/Pipe.Tests/`.
-- `tests/Pipely.HotHandoff.Benchmarks/` — BenchmarkDotNet-based comparison harness measuring `HotHandoffContinuationDispatcher` against the default `ThreadPoolContinuationDispatcher` under identical workloads. Owns its own `RESULTS.md` so the existing `tests/Pipe.Benchmarks/RESULTS.md` (the Pipe-vs-BCL comparison) is not muddied with a different axis.
+- `src/Pipely/` — the dispatcher implementation. References `Pipely`. Public surface: exactly one type, `FastScheduler`, implementing `IContinuationDispatcher` and `IDisposable`. No options class. No constructor parameters. No public knobs of any kind. Tunables live as `private const` adjacent to the loop body and are edited between benchmark runs.
+- `tests/Pipely.Tests/` — unit and integration tests for the dispatcher. References `Pipely` and `Pipely`. xUnit-based, conventions matching the existing `tests/Pipe.Tests/`.
+- `tests/Pipely.Benchmarks/` — BenchmarkDotNet-based comparison harness measuring `FastScheduler` against the default `ThreadPoolContinuationDispatcher` under identical workloads. Owns its own `RESULTS.md` so the existing `tests/Pipe.Benchmarks/RESULTS.md` (the Pipe-vs-BCL comparison) is not muddied with a different axis.
 
 `Pipely.csproj` is unchanged. The dispatcher plugs in via the existing `PipeOptions.ContinuationDispatcher` slot.
 
@@ -37,14 +37,14 @@ The dispatcher is one type with the following internal state:
 - `_state : int` — packed bit-flags. **The sole synchronizing field.** Bit 0 is `Busy`; bit 1 is `ShutdownRequested`. Reachable values: 0 (Vacant), 1 (Busy), 2 (ShutdownRequested + Vacant — terminal), 3 (ShutdownRequested + Busy — transient, drains to 2). All transitions go through `Interlocked.{CompareExchange, Or, And}` on this field.
 - `_pending : Action<object?>?` — the slot's callback while `Busy`. Atomically published by the producing Dispatcher via `Interlocked.Exchange`; atomically claimed by the loop via `Interlocked.Exchange` (read-and-clear).
 - `_pendingState : object?` — the callback's `state` argument. Plain reads/writes; visibility is anchored by the `Interlocked.Exchange` on `_pending`. The Dispatcher writes `_pendingState` before publishing `_pending`; the loop reads `_pendingState` after observing a non-null `_pending`. The full-fence semantics of `Interlocked.Exchange` guarantee the Dispatcher's `_pendingState` write is visible whenever the loop observes a non-null `_pending`.
-- `_thread : Thread` — the dedicated worker. `IsBackground = true`, `Name = "Pipe HotHandoff"`. Started in the dispatcher's constructor; joined in `Dispose`.
+- `_thread : Thread` — the dedicated worker. `IsBackground = true`, `Name = "Pipe FastScheduler"`. Started in the dispatcher's constructor; joined in `Dispose`.
 
 Public surface, exhaustively:
 
 ```csharp
-public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, IDisposable
+public sealed class FastScheduler : IContinuationDispatcher, IDisposable
 {
-    public HotHandoffContinuationDispatcher();
+    public FastScheduler();
     public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state);
     public void Dispose();
 }
@@ -201,7 +201,7 @@ The `IContinuationDispatcher` contract item #2 forbids EC capture in the dispatc
 
 Both paths satisfy contract item #2 without dispatcher-side EC manipulation. EC correctness — including cross-tenant isolation when `FlowExecutionContext` is suppressed — is the responsibility of `PipelyAwaiter<T>` (the source) per the source-side EC-capture spec; the dispatcher's role is purely to route work items to threads.
 
-The existing tests in `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs` (specifically `CustomDispatcher_AsyncLocalFlowsToContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_RestoredAfterContinuation`, `MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle`, `SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly`) pin the EC behavior at the Pipe level for any conforming dispatcher; the corresponding tests in this project (`Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation`, `Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation`) pin it specifically through `HotHandoffContinuationDispatcher`.
+The existing tests in `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs` (specifically `CustomDispatcher_AsyncLocalFlowsToContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_RestoredAfterContinuation`, `MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle`, `SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly`) pin the EC behavior at the Pipe level for any conforming dispatcher; the corresponding tests in this project (`Pipe_WithFastScheduler_AsyncLocalFlowsToContinuation`, `Pipe_WithFastScheduler_DispatcherThreadAsyncLocal_NotObservedInContinuation`) pin it specifically through `FastScheduler`.
 
 ## Section 7 — Required test surface
 
@@ -217,7 +217,7 @@ Tests pin observable behavior, not internal sequencing. Two layers:
 - A.6 If a Dispatch CAS-wins concurrent with a Dispose call, the callback is invoked exactly once (either on the dedicated thread before its loop terminates, or via TP if the Dispose `Or` won the race). This pins Race 1, 2, and 4 from Section 5.
 - A.7 Dispose blocks the disposing thread until any slot-path callback in flight has completed (verified by an in-callback gate).
 - A.8 After Dispose returns, every subsequent Dispatch's callback runs on a `ThreadPool` thread. This pins Race 3 from Section 5.
-- A.9 A single `HotHandoffContinuationDispatcher` instance, configured into multiple `Pipe` instances simultaneously, services every pipe's awaiter completions correctly. This pins contract item #3 (thread-safety across pipes).
+- A.9 A single `FastScheduler` instance, configured into multiple `Pipe` instances simultaneously, services every pipe's awaiter completions correctly. This pins contract item #3 (thread-safety across pipes).
 - A.10 A callback that calls `dispatcher.Dispose()` from inside its body (i.e., `Dispose` invoked on the worker thread itself) must not deadlock; the callback must return cleanly and every subsequent Dispatch on the same dispatcher must route to TP. This pins the self-Dispose contract added to I7 / R4 / §3.4.
 
 **Layer B — Dispatcher through `Pipe`** (plugged into `PipeOptions.ContinuationDispatcher`):
@@ -231,14 +231,14 @@ Tests use deterministic synchronization primitives (e.g., `ManualResetEventSlim`
 
 ## Section 8 — Benchmark methodology and design-completion criterion
 
-`tests/Pipely.HotHandoff.Benchmarks/` is a first-class part of the design — it is what closes the open tunables in Section 9.
+`tests/Pipely.Benchmarks/` is a first-class part of the design — it is what closes the open tunables in Section 9.
 
 ### Section 8.1 — Comparison configurations
 
 Two configurations, identical in everything else:
 
 - **`tp-default`** — `PipeOptions.ContinuationDispatcher` is `null`; the pipe uses the internal `ThreadPoolContinuationDispatcher.Instance`.
-- **`hot-handoff`** — `PipeOptions.ContinuationDispatcher` is a fresh `HotHandoffContinuationDispatcher` per pipe.
+- **`fast-scheduler`** — `PipeOptions.ContinuationDispatcher` is a fresh `FastScheduler` per pipe.
 
 Same chunk size, same total bytes, same hardware/build/runtime, same Server GC, same `MemoryDiagnoser`. Only the dispatcher differs.
 
@@ -246,7 +246,7 @@ Same chunk size, same total bytes, same hardware/build/runtime, same Server GC, 
 
 - **Latency:** producer→consumer hand-off latency under sustained throughput, recorded into a flat `long[]` and read by exact percentile rank (the same method the existing `tests/Pipe.Benchmarks/LatencyHarness.cs` uses). Reported: Min, P50, P90, P99, P99.9, Max, Mean. Three independent runs per configuration; run-to-run variance reported honestly.
 - **Throughput:** sustained 1 MiB / 4 KiB-chunk ProduceAndDrain via BenchmarkDotNet, with `MemoryDiagnoser`. Reported: mean, error, std-dev, allocations-per-op.
-- **CPU cost context:** the hot-handoff dispatcher's worker thread sits at ~100% on its core during the busy-spin loop. `RESULTS.md` calls this out so that any latency win is read against the cost: hot-handoff can buy lower wake gap *at the cost of one continuously hot core*.
+- **CPU cost context:** the fast-scheduler dispatcher's worker thread sits at ~100% on its core during the busy-spin loop. `RESULTS.md` calls this out so that any latency win is read against the cost: fast-scheduler can buy lower wake gap *at the cost of one continuously hot core*.
 
 ### Section 8.3 — Design-completion criterion
 
@@ -277,6 +277,6 @@ The starting configuration is not "v1." It is the first measurement point. Each 
 ## Section 11 — Spec references
 
 - `docs/superpowers/specs/2026-04-28-spsc-awaiter-source-side-ec-capture-design.md` — source-side EC capture spec. Section 6 above is consistent with that spec's §3.4; the four-races argument in §5 remains unaffected (EC handling is orthogonal to the slot/dispatch-state synchronization).
-- `docs/IContinuationDispatcher.md` — public-surface description of `IContinuationDispatcher`, the canonical hot-handoff sketch, the EC contract, and the doc's enumeration of "production-grade enhancements." This spec inherits the contract verbatim and corrects a Dispose race in the doc's sketch (the loop in the doc-sketch can drop a pending callback if `_shutdown` is set between the slot CAS and the loop's next iteration; this design closes that race via the single-int state machine in Section 5).
+- `docs/IContinuationDispatcher.md` — public-surface description of `IContinuationDispatcher`, the canonical fast-scheduler sketch, the EC contract, and the doc's enumeration of "production-grade enhancements." This spec inherits the contract verbatim and corrects a Dispose race in the doc's sketch (the loop in the doc-sketch can drop a pending callback if `_shutdown` is set between the slot CAS and the loop's next iteration; this design closes that race via the single-int state machine in Section 5).
 - `docs/superpowers/specs/2026-04-25-spsc-pipe-tripleBuffer-design.md` — §5 "Continuation dispatch," I16 (EC discipline), R10 (continuation dispatch protocol), §6 (`IContinuationDispatcher` public contract). This spec implements the public contract that document specifies.
-- `docs/superpowers/plans/2026-04-27-pluggable-continuation-dispatch.md` — implementation plan for the `IContinuationDispatcher` mechanism in Pipe itself; this spec is the implementation of the canonical custom dispatcher described in that plan's "User-side example" section, with the open question "should we expose a built-in `HotHandoffContinuationDispatcher` in the `Pipely` package?" answered by the project layout in Section 2 (separate project, ship-decision deferred to benchmark findings).
+- `docs/superpowers/plans/2026-04-27-pluggable-continuation-dispatch.md` — implementation plan for the `IContinuationDispatcher` mechanism in Pipe itself; this spec is the implementation of the canonical custom dispatcher described in that plan's "User-side example" section, with the open question "should we expose a built-in `FastScheduler` in the `Pipely` package?" answered by the project layout in Section 2 (separate project, ship-decision deferred to benchmark findings).

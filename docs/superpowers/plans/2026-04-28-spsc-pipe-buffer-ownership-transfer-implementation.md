@@ -20,7 +20,7 @@
 **Working directory for all commands:** `/home/harrison/src/worktrees/Pipe/buffer-transfer/` (already a dedicated worktree on branch `buffer-transfer`).
 
 **Pre-work invariants this plan preserves:**
-- All existing tests in `tests/Pipe.Tests/`, `tests/Pipe.Stress/`, and `tests/Pipely.HotHandoff.Tests/` continue to pass without modification.
+- All existing tests in `tests/Pipe.Tests/`, `tests/Pipe.Stress/`, and `tests/Pipely.Tests/` continue to pass without modification.
 - The benign-torn-read property of `Memory<T>` (Spec §3 Nit-5) is unaffected — donated segments don't trigger it; rented segments behave exactly as before.
 - The TripleBuffer-mediated SPSC contract is untouched.
 

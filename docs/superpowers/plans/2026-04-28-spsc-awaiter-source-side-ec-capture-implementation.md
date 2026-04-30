@@ -11,13 +11,13 @@
 **Reference docs (engineer should re-read before starting):**
 - `docs/superpowers/specs/2026-04-28-spsc-awaiter-source-side-ec-capture-design.md` — this plan's spec.
 - `docs/superpowers/specs/2026-04-25-spsc-pipe-tripleBuffer-design.md` — Pipe design; §5 awaiter coordination + continuation dispatch protocol; revised in Task 9.
-- `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` — HotHandoff dispatcher spec; §6 EC contract revised in Task 10.
+- `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md` — FastScheduler dispatcher spec; §6 EC contract revised in Task 10.
 - `docs/IContinuationDispatcher.md` — public-facing dispatcher contract; revised in Task 8.
 - `src/Pipely/PipelyAwaiter.cs` — the type whose fields and methods this plan changes (Task 2).
 - `src/Pipely/Pipe.cs`, `src/Pipely/Pipe.Reader.cs`, `src/Pipely/Pipe.Writer.cs` — files containing the 12 signal sites and the 4 obsolete `s_dispatch*` delegates (Task 2).
 - `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs` — existing dispatcher tests that establish the `DedicatedThreadDispatcher` / `ForwardingDispatcher` test helpers and the EC-flow test patterns; new tests in Tasks 2-7 append to this file.
 
-**Working directory for all commands:** `/home/harrison/src/worktrees/Pipe/hot-handoff/`
+**Working directory for all commands:** `/home/harrison/src/worktrees/Pipe/fast-scheduler/`
 
 **Spec/contract guarantees this implementation pins:**
 - Per-await `ExecutionContext` propagates to the continuation, **provided `FlowExecutionContext` was set at `OnCompleted` time** (the default).
@@ -28,19 +28,19 @@
 
 ---
 
-## Task 1: Pre-flight — revert TEMP HotHandoff benchmark commits
+## Task 1: Pre-flight — revert TEMP FastScheduler benchmark commits
 
-The spec explicitly puts this in the implementation plan rather than the design (§7 "Out of scope"). Three TEMP commits — `c1ba6b9`, `99293c1`, `02a6dd1` — replaced the throughput-shape benchmark workload with the latency-CLI MHz-rate workload while diagnosing Mechanism A. The original 1 MiB / 4 KiB-chunk / pre-allocated-byte-array workload must be restored before the new wiring can be measured against the established 50.45 µs / 70.34 µs / 105.09 µs HotHandoff / TpDefault / BCL baseline.
+The spec explicitly puts this in the implementation plan rather than the design (§7 "Out of scope"). Three TEMP commits — `c1ba6b9`, `99293c1`, `02a6dd1` — replaced the throughput-shape benchmark workload with the latency-CLI MHz-rate workload while diagnosing Mechanism A. The original 1 MiB / 4 KiB-chunk / pre-allocated-byte-array workload must be restored before the new wiring can be measured against the established 50.45 µs / 70.34 µs / 105.09 µs FastScheduler / TpDefault / BCL baseline.
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs`
+- Modify: `tests/Pipely.Benchmarks/DispatcherThroughputBench.cs`
 
 - [ ] **Step 1: Restore the benchmark file from before the TEMP commits**
 
 Run:
 
 ```bash
-git checkout c1ba6b9^ -- tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs
+git checkout c1ba6b9^ -- tests/Pipely.Benchmarks/DispatcherThroughputBench.cs
 ```
 
 Expected: file replaced with its pre-TEMP form.
@@ -50,7 +50,7 @@ Expected: file replaced with its pre-TEMP form.
 Run:
 
 ```bash
-grep -E 'TotalBytes|ChunkSize|chunk\.CopyTo|new byte\[ChunkSize\]' tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs
+grep -E 'TotalBytes|ChunkSize|chunk\.CopyTo|new byte\[ChunkSize\]' tests/Pipely.Benchmarks/DispatcherThroughputBench.cs
 ```
 
 Expected output (any order):
@@ -75,9 +75,9 @@ Expected: 6 projects build, 0 warnings, 0 errors.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs
+git add tests/Pipely.Benchmarks/DispatcherThroughputBench.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff bench: revert TEMP commits c1ba6b9 / 99293c1 / 02a6dd1
+FastScheduler bench: revert TEMP commits c1ba6b9 / 99293c1 / 02a6dd1
 
 Restores the original 1 MiB / 4 KiB-chunk / pre-allocated-byte-array
 throughput-shape workload. The TEMP commits replaced this with the
@@ -86,7 +86,7 @@ diagnosis is now closed by the spec at
 docs/superpowers/specs/2026-04-28-spsc-awaiter-source-side-ec-capture-design.md
 and the throughput-shape benchmark must be in its original form for
 the post-implementation measurement pass against the established
-50.45 us / 70.34 us / 105.09 us HotHandoff / TpDefault / BCL baseline.
+50.45 us / 70.34 us / 105.09 us FastScheduler / TpDefault / BCL baseline.
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
@@ -309,7 +309,7 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
         awaiter._dispatcher.UnsafeQueueUserWorkItem(s_invokeWithEc, awaiter);
     };
 
-    // Invoked by the dispatcher's chosen thread (HotHandoff worker, TP worker for overflow, or
+    // Invoked by the dispatcher's chosen thread (FastScheduler worker, TP worker for overflow, or
     // TP for ThreadPoolContinuationDispatcher). Reads the awaiter's fields, clears them, applies
     // the consumer-captured EC if any, and invokes the continuation.
     private static readonly Action<object?> s_invokeWithEc = static state =>
@@ -924,7 +924,7 @@ dotnet test Pipe.slnx --nologo
 Expected: ALL tests pass, including:
 - The new `MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle` from step 1.
 - The existing `CustomDispatcher_AsyncLocalFlowsToContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_RestoredAfterContinuation`, `CustomDispatcher_BadImpl_CapturingEC_IsDetectable` (the last one with its docstring updated in step 9 to reflect the new mechanism).
-- The HotHandoff tests including the `RepeatedIteration_PerMessageConsumer_DoesNotHang` BDN-pattern stress test — which was the live regression smoke for Mechanism A.
+- The FastScheduler tests including the `RepeatedIteration_PerMessageConsumer_DoesNotHang` BDN-pattern stress test — which was the live regression smoke for Mechanism A.
 - All `BclParityTests`, `PipeAdvanceToTests`, `PipeCancellationTests`, `PipeDisposeTests`, `PipeLifecycleTests`, `PipeReaderTests`, `PipeReadInProgressTests`, `PipeWriterTests`, `PipelyAwaiterTests`, `BufferSegmentTests`.
 
 If a test fails, do NOT proceed — diagnose. The existing tests pin observable behavior; a failure means the new wiring broke the contract somewhere.
@@ -965,7 +965,7 @@ Implementation
   _core.SetResult / _core.SetException calls. The four old
   s_dispatch* delegates and the DispatchVia helper are deleted.
 - IContinuationDispatcher implementations require ZERO source changes.
-  HotHandoffContinuationDispatcher and ThreadPoolContinuationDispatcher
+  FastScheduler and ThreadPoolContinuationDispatcher
   remain as-is; the dispatcher is now genuinely a thread router that
   takes (Action<object?>, object?) work items.
 
@@ -976,7 +976,7 @@ Tests
   to reflect new mechanism (source-side capture beats the bad
   dispatcher to the punch); same observable assertions.
 - Existing tests pass unchanged (the Pipe-level EC tests, the
-  HotHandoff dispatcher tests including the BDN-pattern stress
+  FastScheduler dispatcher tests including the BDN-pattern stress
   RepeatedIteration_PerMessageConsumer_DoesNotHang, the cancellation/
   lifecycle/AdvanceTo tests, the BCL parity tests, and the PipelyAwaiter
   unit tests with constructor parameter adjusted).
@@ -1584,7 +1584,7 @@ When the producer signals (`_core.SetResult` / `_core.SetException`), `MRVTSC` i
 2. If `_capturedEC` is non-null, calls `ExecutionContext.Run(_capturedEC, s_runContinuation, awaiter)` — applying the consumer's captured EC for the duration of the continuation invocation; the dispatcher thread's pre-call EC is automatically saved and restored by `ExecutionContext.Run`.
 3. If `_capturedEC` is null (consumer suppressed flow), invokes the continuation directly on the dispatcher's chosen thread — the consumer explicitly opted out of EC propagation and accepts whatever EC that thread has.
 
-The EC isolation guarantee `Pipe` gives the consumer is therefore: **regardless of the `IContinuationDispatcher` configured, your `await pipe.Reader.ReadAsync()` continuation runs under the `ExecutionContext` your code had at the `await` — same as standard `Task.Run` / `await` semantics — provided `FlowExecutionContext` was set at `OnCompleted` (the default). This guarantee is robust against worker-thread-EC drift in dispatchers with long-lived worker threads (e.g., `HotHandoffContinuationDispatcher`).**
+The EC isolation guarantee `Pipe` gives the consumer is therefore: **regardless of the `IContinuationDispatcher` configured, your `await pipe.Reader.ReadAsync()` continuation runs under the `ExecutionContext` your code had at the `await` — same as standard `Task.Run` / `await` semantics — provided `FlowExecutionContext` was set at `OnCompleted` (the default). This guarantee is robust against worker-thread-EC drift in dispatchers with long-lived worker threads (e.g., `FastScheduler`).**
 
 A dispatcher that captures EC itself (e.g., uses the EC-capturing `ThreadPool.QueueUserWorkItem` instead of the recommended `UnsafeQueueUserWorkItem`) does NOT break the consumer's EC guarantee — `s_invokeWithEc` applies the consumer-captured EC after the dispatcher's hop — but it DOES introduce wasteful capture/apply overhead and violates contract item #2.
 
@@ -1873,12 +1873,12 @@ EOF
 
 ---
 
-## Task 10: Update HotHandoff dispatcher spec — §6 EC contract
+## Task 10: Update FastScheduler dispatcher spec — §6 EC contract
 
-Per spec §3.4: the HotHandoff dispatcher spec's §6 "EC contract" needs revision to match the new flow. The HotHandoff dispatcher does not directly capture or apply EC (this remains true); the EC is now stored on the work item (passed via `awaiter` as `state`) and applied by the dispatcher's chosen thread when invoking `s_invokeWithEc`. The four-races correctness argument (§5) is unaffected — it concerns slot/dispatch-state synchronization, not EC.
+Per spec §3.4: the FastScheduler dispatcher spec's §6 "EC contract" needs revision to match the new flow. The FastScheduler dispatcher does not directly capture or apply EC (this remains true); the EC is now stored on the work item (passed via `awaiter` as `state`) and applied by the dispatcher's chosen thread when invoking `s_invokeWithEc`. The four-races correctness argument (§5) is unaffected — it concerns slot/dispatch-state synchronization, not EC.
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md`
+- Modify: `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md`
 
 - [ ] **Step 1: Replace §6 in full**
 
@@ -1896,7 +1896,7 @@ The `IContinuationDispatcher` contract item #2 forbids EC capture in the dispatc
 
 Both paths satisfy contract item #2 without dispatcher-side EC manipulation. EC correctness — including cross-tenant isolation when `FlowExecutionContext` is suppressed — is the responsibility of `PipelyAwaiter<T>` (the source) per the source-side EC-capture spec; the dispatcher's role is purely to route work items to threads.
 
-The existing tests in `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs` (specifically `CustomDispatcher_AsyncLocalFlowsToContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_RestoredAfterContinuation`, `MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle`, `SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly`) pin the EC behavior at the Pipe level for any conforming dispatcher; the corresponding tests in this project (`Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation`, `Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation`) pin it specifically through `HotHandoffContinuationDispatcher`.
+The existing tests in `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs` (specifically `CustomDispatcher_AsyncLocalFlowsToContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation`, `CustomDispatcher_DispatcherThreadAsyncLocal_RestoredAfterContinuation`, `MultiCycle_PerCycleEcCapture_AppliesCorrectEcEachCycle`, `SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly`) pin the EC behavior at the Pipe level for any conforming dispatcher; the corresponding tests in this project (`Pipe_WithFastScheduler_AsyncLocalFlowsToContinuation`, `Pipe_WithFastScheduler_DispatcherThreadAsyncLocal_NotObservedInContinuation`) pin it specifically through `FastScheduler`.
 ```
 
 - [ ] **Step 2: Update Section 11 spec references — add cross-reference to the new spec**
@@ -1912,7 +1912,7 @@ Find the `## Section 11 — Spec references` section (around line 275). Add a ne
 Run:
 
 ```bash
-grep -n 'RunInternal\|MRVTSC.*restor\|MRVTSC.*captures\|MRVTSC.*applies' docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md
+grep -n 'RunInternal\|MRVTSC.*restor\|MRVTSC.*captures\|MRVTSC.*applies' docs/superpowers/specs/2026-04-27-fast-scheduler-design.md
 ```
 
 If any matches exist that describe `MRVTSC.RunInternal` as the EC mechanism in any section (other than as historical context), edit them to point to the source-side EC-capture flow.
@@ -1920,11 +1920,11 @@ If any matches exist that describe `MRVTSC.RunInternal` as the EC mechanism in a
 - [ ] **Step 4: Commit**
 
 ```bash
-git add docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md
+git add docs/superpowers/specs/2026-04-27-fast-scheduler-design.md
 git commit -m "$(cat <<'EOF'
-HotHandoff spec: revise §6 EC contract for source-side capture
+FastScheduler spec: revise §6 EC contract for source-side capture
 
-The HotHandoff dispatcher's EC contract is unchanged in spirit — it
+The FastScheduler dispatcher's EC contract is unchanged in spirit — it
 still does NOT capture or apply EC itself — but the description of
 WHY the contract holds was outdated: it referenced MRVTSC.RunInternal
 applying the consumer's captured EC, which is no longer what happens.
@@ -1999,7 +1999,7 @@ Run:
 grep -RIn '_dispatchResult\|_dispatchException\|s_dispatchReadSetResult\|s_dispatchReadSetException\|s_dispatchFlushSetResult\|s_dispatchFlushSetException\|DispatchVia' src/ tests/ docs/
 ```
 
-Expected: no matches in source/tests/docs (the old delegates / helper / fields have no leftover references). Some matches MAY remain in `docs/superpowers/plans/2026-04-27-hot-handoff-dispatcher-implementation.md` (a historical plan document; do not modify) and in old commit messages — those are expected and not regressions.
+Expected: no matches in source/tests/docs (the old delegates / helper / fields have no leftover references). Some matches MAY remain in `docs/superpowers/plans/2026-04-27-fast-scheduler-implementation.md` (a historical plan document; do not modify) and in old commit messages — those are expected and not regressions.
 
 - [ ] **Step 4: Confirm key new pieces are present**
 
@@ -2035,12 +2035,12 @@ grep -nE 'flags & ~suppressed|UseSchedulingContext' src/Pipely/PipelyAwaiter.cs
 
 Expected: at least 2 matches showing the `UseSchedulingContext` flag stripping in `OnCompleted`.
 
-- [ ] **Step 5: Confirm the HotHandoff benchmark file is in its restored throughput-shape**
+- [ ] **Step 5: Confirm the FastScheduler benchmark file is in its restored throughput-shape**
 
 Run:
 
 ```bash
-grep -E 'TotalBytes|ChunkSize|chunk\.CopyTo|new byte\[ChunkSize\]' tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs
+grep -E 'TotalBytes|ChunkSize|chunk\.CopyTo|new byte\[ChunkSize\]' tests/Pipely.Benchmarks/DispatcherThroughputBench.cs
 ```
 
 Expected output:
@@ -2075,7 +2075,7 @@ git log --oneline -15
 Expected: shows the chain of plan-implementing commits (one per task), most recent first:
 
 ```
-<sha> HotHandoff spec: revise §6 EC contract for source-side capture
+<sha> FastScheduler spec: revise §6 EC contract for source-side capture
 <sha> Pipe spec: revise §5 / §6 / I16 / R10 for source-side EC capture
 <sha> docs: revise IContinuationDispatcher contract for source-side EC capture
 <sha> PipelyAwaiter tests: E.1 — SetResult-fires-first race (N-iteration stress)
@@ -2084,7 +2084,7 @@ Expected: shows the chain of plan-implementing commits (one per task), most rece
 <sha> PipelyAwaiter tests: D.1 — SynchronizationContext capture bypassed
 <sha> PipelyAwaiter tests: C.3 — FlowExecutionContext suppression branch
 <sha> PipelyAwaiter: source-side EC capture (OpenTcp pattern)
-<sha> HotHandoff bench: revert TEMP commits c1ba6b9 / 99293c1 / 02a6dd1
+<sha> FastScheduler bench: revert TEMP commits c1ba6b9 / 99293c1 / 02a6dd1
 <earlier history>
 ```
 

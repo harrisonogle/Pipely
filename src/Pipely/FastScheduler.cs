@@ -1,8 +1,8 @@
 
-namespace Pipely.HotHandoff;
+namespace Pipely;
 
 /// <summary>
-/// <see cref="Pipely.IContinuationDispatcher"/> implementation that routes the first hop of
+/// <see cref="IContinuationDispatcher"/> implementation that routes the first hop of
 /// each Pipe continuation to a dedicated busy-spinning thread, with ThreadPool
 /// overflow when the dedicated thread is already invoking another continuation.
 ///
@@ -19,11 +19,11 @@ namespace Pipely.HotHandoff;
 /// <para>
 /// State 2 (<c>ShutdownRequested</c> set, <c>Busy</c> clear — i.e., Vacant + ShutdownRequested)
 /// is terminal: no Dispatch can claim, the loop exits, no callback is dropped. See
-/// <c>docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md</c> for the
+/// <c>docs/superpowers/specs/2026-04-27-fast-scheduler-design.md</c> for the
 /// full spec and four-races correctness argument.
 /// </para>
 /// </summary>
-public sealed class HotHandoffContinuationDispatcher : Pipely.IContinuationDispatcher, IDisposable
+public sealed class FastScheduler : IContinuationDispatcher, IDisposable
 {
     private const int Vacant            = 0;
     private const int Busy              = 1;
@@ -56,12 +56,12 @@ public sealed class HotHandoffContinuationDispatcher : Pipely.IContinuationDispa
     /// </summary>
     internal long TpOverflowedCount => Interlocked.Read(ref _tpOverflowedCount);
 
-    public HotHandoffContinuationDispatcher()
+    public FastScheduler()
     {
         _thread = new Thread(Loop)
         {
             IsBackground = true,
-            Name = "Pipe HotHandoff",
+            Name = "Pipe FastScheduler",
         };
         _thread.Start();
     }
@@ -78,7 +78,7 @@ public sealed class HotHandoffContinuationDispatcher : Pipely.IContinuationDispa
         }
 
         // Slot busy or shutdown — fall through to TP. UnsafeQueueUserWorkItem
-        // (not QueueUserWorkItem or Task.Run) — Pipely.IContinuationDispatcher contract item #2.
+        // (not QueueUserWorkItem or Task.Run) — IContinuationDispatcher contract item #2.
         ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
         Interlocked.Increment(ref _tpOverflowedCount);        // diagnostic — see §10 / TpOverflowedCount
     }

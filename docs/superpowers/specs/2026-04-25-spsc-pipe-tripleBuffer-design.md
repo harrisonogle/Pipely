@@ -1318,7 +1318,7 @@ public sealed class Pipe : IDisposable
 
 ### `IContinuationDispatcher`
 
-`Pipe` parks awaiters when the wake condition is unmet (no published data for `ReadAsync`, backpressure unrelieved for `FlushAsync`). When a producer subsequently signals the parked side, the *continuation* registered on that awaiter must run somewhere. By default that "somewhere" is the .NET ThreadPool, via `ThreadPool.UnsafeQueueUserWorkItem`. The pluggable `IContinuationDispatcher` interface lets a user supply a different routing — most commonly, a hot-handoff to a dedicated busy-spinning thread on a pinned core, escaping the TP wake-gap latency (~390-500 ns at P50, multi-µs at P99) for high-frequency single-stream workloads.
+`Pipe` parks awaiters when the wake condition is unmet (no published data for `ReadAsync`, backpressure unrelieved for `FlushAsync`). When a producer subsequently signals the parked side, the *continuation* registered on that awaiter must run somewhere. By default that "somewhere" is the .NET ThreadPool, via `ThreadPool.UnsafeQueueUserWorkItem`. The pluggable `IContinuationDispatcher` interface lets a user supply a different routing — most commonly, a fast-scheduler to a dedicated busy-spinning thread on a pinned core, escaping the TP wake-gap latency (~390-500 ns at P50, multi-µs at P99) for high-frequency single-stream workloads.
 
 ```csharp
 namespace Pipely;
@@ -1482,7 +1482,7 @@ If a sticky `CancelPending*` is consumed on a post-`Writer.Complete(null)` read,
 - `IsCanceled` and `IsCompleted` flags are independent in `ReadResult` for `Writer.Complete(null)` cases; for `Writer.Complete(ex)` the throw fires first and cancel is dropped.
 - Five documented divergences from BCL (see top-level takeaways): no `Reset`; `IDisposable` added; `AdvanceTo` no buffer-specific upper-bound check; cancel-from-third-thread `IsCompleted=false` lag; cancel-while-parked stash-time buffer.
 - `Dispose()` releases segment + freelist memory; precondition is no in-flight ops AND no outstanding buffer refs.
-- `PipeOptions.ContinuationDispatcher` is `init`-only and defaults to null (TP). User-supplied dispatchers must obey the five-item contract on `IContinuationDispatcher.UnsafeQueueUserWorkItem`; primary use case is hot-handoff to a dedicated thread for sub-µs continuation latency.
+- `PipeOptions.ContinuationDispatcher` is `init`-only and defaults to null (TP). User-supplied dispatchers must obey the five-item contract on `IContinuationDispatcher.UnsafeQueueUserWorkItem`; primary use case is fast-scheduler to a dedicated thread for sub-µs continuation latency.
 
 ## Section 7 — Verifiability
 

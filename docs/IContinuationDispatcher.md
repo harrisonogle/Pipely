@@ -45,12 +45,12 @@ The method is named `UnsafeQueueUserWorkItem` deliberately — it mirrors `Threa
 
 If `PipeOptions.ContinuationDispatcher` is `null` (default), Pipe uses an internal `ThreadPoolContinuationDispatcher` that forwards every callback to `ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false)`. This preserves the observable behavior of prior Pipe versions: continuations run on TP worker threads. There is no measurable performance regression vs. the prior `MRVTSC.RunContinuationsAsynchronously = true` path (one extra virtual call, ~1-2 ns per signal).
 
-## Usage: hot-handoff dispatcher
+## Usage: fast-scheduler dispatcher
 
 The canonical custom dispatcher routes the FIRST hop of each continuation to a dedicated thread (kept hot via busy-spin or adaptive backoff), with TP fallback when the dedicated thread is already running another continuation. This avoids the TP wake-gap for the common case while preserving correctness under burst.
 
 ```csharp
-public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, IDisposable
+public sealed class FastScheduler : IContinuationDispatcher, IDisposable
 {
     private const int Vacant = 0;
     private const int Busy = 1;
@@ -60,9 +60,9 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
     private readonly Thread _thread;
     private volatile bool _shutdown;
 
-    public HotHandoffContinuationDispatcher()
+    public FastScheduler()
     {
-        _thread = new Thread(Loop) { IsBackground = true, Name = "Pipe HotHandoff" };
+        _thread = new Thread(Loop) { IsBackground = true, Name = "Pipe FastScheduler" };
         _thread.Start();
     }
 
@@ -110,7 +110,7 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
 }
 
 // Usage:
-using var dispatcher = new HotHandoffContinuationDispatcher();
+using var dispatcher = new FastScheduler();
 using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 ```
 
@@ -146,7 +146,7 @@ When the producer signals (`_core.SetResult` / `_core.SetException`), `MRVTSC` i
 2. If `_capturedEC` is non-null, calls `ExecutionContext.Run(_capturedEC, s_runContinuation, awaiter)` — applying the consumer's captured EC for the duration of the continuation invocation; the dispatcher thread's pre-call EC is automatically saved and restored by `ExecutionContext.Run`.
 3. If `_capturedEC` is null (consumer suppressed flow), invokes the continuation directly on the dispatcher's chosen thread — the consumer explicitly opted out of EC propagation and accepts whatever EC that thread has.
 
-The EC isolation guarantee `Pipe` gives the consumer is therefore: **regardless of the `IContinuationDispatcher` configured, your `await pipe.Reader.ReadAsync()` continuation runs under the `ExecutionContext` your code had at the `await` — same as standard `Task.Run` / `await` semantics — provided `FlowExecutionContext` was set at `OnCompleted` (the default). This guarantee is robust against worker-thread-EC drift in dispatchers with long-lived worker threads (e.g., `HotHandoffContinuationDispatcher`).**
+The EC isolation guarantee `Pipe` gives the consumer is therefore: **regardless of the `IContinuationDispatcher` configured, your `await pipe.Reader.ReadAsync()` continuation runs under the `ExecutionContext` your code had at the `await` — same as standard `Task.Run` / `await` semantics — provided `FlowExecutionContext` was set at `OnCompleted` (the default). This guarantee is robust against worker-thread-EC drift in dispatchers with long-lived worker threads (e.g., `FastScheduler`).**
 
 A dispatcher that captures EC itself (e.g., uses the EC-capturing `ThreadPool.QueueUserWorkItem` instead of the recommended `UnsafeQueueUserWorkItem`) does NOT break the consumer's EC guarantee — `s_invokeWithEc` applies the consumer-captured EC after the dispatcher's hop — but it DOES introduce wasteful capture/apply overhead and violates contract item #2.
 

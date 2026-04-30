@@ -9,13 +9,13 @@
 - Fixes two distinct manifestations of "dispatcher ambient state leak" with one mechanism:
   - **Mechanism A** — consumer-side `SynchronizationContext` / `TaskScheduler` capture by `await pipe.Reader.ReadAsync()` silently overrides the dispatcher's chosen routing; in BDN's harness this manifested as a deadlock + 3.5× perf regression that `ConfigureAwait(false)` masked.
   - **Mechanism B** — when the consumer's awaiter has no captured `ExecutionContext` (e.g., `FlowExecutionContext` was suppressed at the consumer's `OnCompleted` time), `MRVTSC.SetResult` skips its `RunInternal` and invokes the continuation under whatever EC the calling thread has — which on a long-lived dispatcher worker thread is the EC drifted by prior continuations' AsyncLocal mutations. Worst-case consequence: cross-tenant `AsyncLocal<T>` leak in a request path.
-- `IContinuationDispatcher` contract item #2 ("MUST NOT capture EC") stays literally true. EC handling moves entirely into `PipelyAwaiter`. The dispatcher is genuinely a thread router that takes `(Action<object?>, object?)` work items and delivers them. Existing dispatcher implementations (`HotHandoffContinuationDispatcher`, `ThreadPoolContinuationDispatcher`) require **no source changes**.
+- `IContinuationDispatcher` contract item #2 ("MUST NOT capture EC") stays literally true. EC handling moves entirely into `PipelyAwaiter`. The dispatcher is genuinely a thread router that takes `(Action<object?>, object?)` work items and delivers them. Existing dispatcher implementations (`FastScheduler`, `ThreadPoolContinuationDispatcher`) require **no source changes**.
 - The packed-`int` state machine, `ParkStash`, the four-races correctness argument, R5/R5b CAS protocols, version/token invariants, the cycle-protocol — all unchanged.
 - Net effect on `Pipe.cs` / `Pipe.Reader.cs` / `Pipe.Writer.cs`: signal sites *simplify*. The four `s_dispatch*` static delegates and the `DispatchVia` helper are deleted. Signal sites call `_core.SetResult(...)` / `_core.SetException(...)` directly on the producer thread. The dispatcher hop is encapsulated inside `PipelyAwaiter`'s `OnCompleted` + `s_dispatch` flow rather than spread across signal sites.
 
 ## Section 1 — Background and motivation
 
-A multi-day investigation in the `hot-handoff` branch surfaced two distinct correctness gaps in the `IContinuationDispatcher` contract as currently specified:
+A multi-day investigation in the `fast-scheduler` branch surfaced two distinct correctness gaps in the `IContinuationDispatcher` contract as currently specified:
 
 **Mechanism A (perf cliff + deadlock).** The current dispatcher contract item #2 says the dispatcher must not capture `ExecutionContext` because `MRVTSC` handles EC restoration via the consumer-captured EC at `OnCompleted` time. That is true for `EC`. But `SynchronizationContext` and `TaskScheduler` are captured *separately* by the consumer's `await` (via `ValueTaskSourceOnCompletedFlags.UseSchedulingContext`), stored in `MRVTSC`'s awaiter, and applied at `SetResult` time — overriding whichever thread the dispatcher chose. In BDN's harness, the captured scheduler tied continuations back to a thread blocked on `Task.GetResult()`: classic sync-over-async deadlock when the per-message-processing consumer was added; with simple-drain consumer, a 3.5× iteration-time inflation that disappeared when `ConfigureAwait(false)` was added to the awaits. The dispatcher's stated purpose ("control where continuations run") is silently overridden by ambient `SynchronizationContext` / `TaskScheduler`. This is a real contract gap: the dispatcher promises something it cannot deliver under standard `IValueTaskSource` semantics.
 
@@ -93,7 +93,7 @@ private static readonly Action<object?> s_dispatch = static state =>
     dispatcher.UnsafeQueueUserWorkItem(s_invokeWithEc, awaiter);
 };
 
-// Invoked by the dispatcher's chosen thread (HotHandoff worker, TP
+// Invoked by the dispatcher's chosen thread (FastScheduler worker, TP
 // worker for overflow, or TP for ThreadPoolContinuationDispatcher).
 // Reads the awaiter's fields, applies the consumer-captured EC if any,
 // and invokes the continuation.
@@ -169,7 +169,7 @@ Note: `RunContinuationsAsynchronously = false` controls only the `OnCompleted`-f
 
 The current section explains how `MRVTSC.RunInternal` handles EC. Update to explain the new flow (source-side capture, dispatcher-side application) and remove the now-obsolete discussion of `MRVTSC`'s internal EC flow.
 
-The EC isolation guarantee Pipe gives the consumer is now: "regardless of the `IContinuationDispatcher` configured, your `await pipe.Reader.ReadAsync()` continuation runs under the `ExecutionContext` your code had at the `await` — same as standard `Task.Run` / `await` semantics — provided `FlowExecutionContext` was set at `OnCompleted` (the default). This guarantee is robust against worker-thread-EC drift in dispatchers with long-lived worker threads (e.g., `HotHandoffContinuationDispatcher`)."
+The EC isolation guarantee Pipe gives the consumer is now: "regardless of the `IContinuationDispatcher` configured, your `await pipe.Reader.ReadAsync()` continuation runs under the `ExecutionContext` your code had at the `await` — same as standard `Task.Run` / `await` semantics — provided `FlowExecutionContext` was set at `OnCompleted` (the default). This guarantee is robust against worker-thread-EC drift in dispatchers with long-lived worker threads (e.g., `FastScheduler`)."
 
 ### Section 3.3 — `Pipe` public contract — scheduler / TaskScheduler
 
@@ -181,9 +181,9 @@ This is a deliberate contract choice, not an implementation accident. `Pipe` is 
 
 The spec for `IContinuationDispatcher` (`docs/IContinuationDispatcher.md`) should cross-reference this clause.
 
-### Section 3.4 — Existing dispatcher spec (`2026-04-27-hot-handoff-dispatcher-design.md`)
+### Section 3.4 — Existing dispatcher spec (`2026-04-27-fast-scheduler-design.md`)
 
-§6 "EC contract" needs revision to match the new flow. `HotHandoffContinuationDispatcher` does not directly capture or apply EC; the EC is stored on the work item (passed via `awaiter` as state) and applied by the dispatcher's chosen thread when invoking `s_invokeWithEc`. The four-races correctness argument (§5) is unaffected — it concerns slot/dispatch-state synchronization, not EC.
+§6 "EC contract" needs revision to match the new flow. `FastScheduler` does not directly capture or apply EC; the EC is stored on the work item (passed via `awaiter` as state) and applied by the dispatcher's chosen thread when invoking `s_invokeWithEc`. The four-races correctness argument (§5) is unaffected — it concerns slot/dispatch-state synchronization, not EC.
 
 ## Section 4 — Publication ordering for the `SetResult`-fires-first race
 
@@ -214,10 +214,10 @@ Tests pin observable behavior, not internal sequencing. Categorized by what they
 
 **EC propagation correctness:**
 
-- C.1 — Per-await `ExecutionContext` is propagated to the continuation. Set `AsyncLocal<int>` to 42 before `await pipe.Reader.ReadAsync()`; assert `AsyncLocal<int>.Value == 42` in the continuation. (Mirrors existing `Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation`; the new wiring must preserve this.)
+- C.1 — Per-await `ExecutionContext` is propagated to the continuation. Set `AsyncLocal<int>` to 42 before `await pipe.Reader.ReadAsync()`; assert `AsyncLocal<int>.Value == 42` in the continuation. (Mirrors existing `Pipe_WithFastScheduler_AsyncLocalFlowsToContinuation`; the new wiring must preserve this.)
 - C.2 — Cross-cycle isolation: cycle 1's `AsyncLocal<int>` mutation does NOT leak to cycle 2's continuation. Set `AsyncLocal<int>` to 42 → first `await` → continuation mutates to 999 → second `await` (different cycle) → assert `AsyncLocal<int>.Value == 42` (or whatever the consumer's then-current value is; not 999).
 - C.3 — `FlowExecutionContext` suppression: surround the `await` in an `ExecutionContext.SuppressFlow()` block. Continuation runs (no `ExecutionContext.Run` because `_capturedEC == null`); no AsyncLocal pollution from prior cb leaks in. (This is the Mechanism B regression test.)
-- C.4 — Worker-thread `AsyncLocal` not observed in continuation: existing `Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation` test pattern, must still pass under the new wiring.
+- C.4 — Worker-thread `AsyncLocal` not observed in continuation: existing `Pipe_WithFastScheduler_DispatcherThreadAsyncLocal_NotObservedInContinuation` test pattern, must still pass under the new wiring.
 
 **Scheduler bypass:**
 
@@ -233,14 +233,14 @@ Tests pin observable behavior, not internal sequencing. Categorized by what they
 
 ## Section 7 — Out of scope
 
-- **Dispatcher implementation changes.** `HotHandoffContinuationDispatcher` and `ThreadPoolContinuationDispatcher` require zero source changes for this design. The dispatcher's role is unchanged: deliver a `(callback, state)` pair to its chosen thread.
+- **Dispatcher implementation changes.** `FastScheduler` and `ThreadPoolContinuationDispatcher` require zero source changes for this design. The dispatcher's role is unchanged: deliver a `(callback, state)` pair to its chosen thread.
 - **`IContinuationDispatcher` interface signature.** Stays `void UnsafeQueueUserWorkItem(Action<object?>, object?)`. Work item carrying EC is passed via `state` (the awaiter), not as a richer signature.
 - **The benchmark project's TEMP commits** (`c1ba6b9` / `99293c1` / `02a6dd1`). Reverting and restoring the throughput-shape benchmark belongs in the implementation plan, not this spec.
 - **Performance characterization of the new wiring.** Pre-ship benchmark pass measures the impact; not part of the design.
 
 ## Section 8 — Spec references
 
-- `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` — existing dispatcher spec. §5 (four-races correctness) unaffected; §6 (EC contract) needs the revision sketched in §3.4 above.
+- `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md` — existing dispatcher spec. §5 (four-races correctness) unaffected; §6 (EC contract) needs the revision sketched in §3.4 above.
 - `docs/superpowers/specs/2026-04-25-spsc-pipe-tripleBuffer-design.md` — `Pipe` design. §5 (awaiter state machine) needs the `_dispatchResult`/`_dispatchException` field references replaced with the new `_realContinuation`/`_realState`/`_capturedEC` triple. §6 (`IContinuationDispatcher` public contract) gets the §3.3 scheduler-bypass clause added.
 - `docs/IContinuationDispatcher.md` — public-facing dispatcher contract. Item #2 and "EC contract" section revised per §3.1 / §3.2.
 - OpenTcp's `DispatchedValueTaskSource<T>` — design pattern source. The `internal sealed`-with-explicit-contract argument from that design's commentary applies here: `PipelyAwaiter` is internal to `Pipely`; the public-facing `await pipe.Reader.ReadAsync()` is what consumers see, and the new public contract clause (§3.3) defines its semantics.

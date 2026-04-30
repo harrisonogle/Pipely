@@ -1,39 +1,39 @@
-# HotHandoffContinuationDispatcher Implementation Plan
+# FastScheduler Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement `HotHandoffContinuationDispatcher` — a custom `IContinuationDispatcher` that routes `Pipe`'s parked-awaiter continuations to a dedicated busy-spinning thread, with `ThreadPool` overflow — in a separate project, with full test coverage and a benchmark project that measures it against the default TP dispatcher.
+**Goal:** Implement `FastScheduler` — a custom `IContinuationDispatcher` that routes `Pipe`'s parked-awaiter continuations to a dedicated busy-spinning thread, with `ThreadPool` overflow — in a separate project, with full test coverage and a benchmark project that measures it against the default TP dispatcher.
 
-**Architecture:** Single packed `int _state` with two bit flags (`Busy=1`, `ShutdownRequested=2`). All cross-thread synchronization through `Interlocked.{CompareExchange, Or, And, Exchange}` on this one word. One slot (`_pending` callback + `_pendingState` payload). One dedicated worker thread. Dispose via `Or` + `Join`. See `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` for the full spec, including the four-races correctness argument.
+**Architecture:** Single packed `int _state` with two bit flags (`Busy=1`, `ShutdownRequested=2`). All cross-thread synchronization through `Interlocked.{CompareExchange, Or, And, Exchange}` on this one word. One slot (`_pending` callback + `_pendingState` payload). One dedicated worker thread. Dispose via `Or` + `Join`. See `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md` for the full spec, including the four-races correctness argument.
 
 **Tech Stack:** C# / .NET 10, `Interlocked` (no `Volatile`, no `volatile` keyword), xUnit 2.9.3, BenchmarkDotNet 0.15.8.
 
 **Reference docs (engineer should re-read before starting):**
-- `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` — spec (architecture, invariants, correctness argument).
+- `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md` — spec (architecture, invariants, correctness argument).
 - `docs/IContinuationDispatcher.md` — public-surface description and contract items.
 - `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs` — existing dispatcher tests at the Pipe level (useful patterns for AsyncLocal flow tests in tasks 14-16).
 - `src/Pipely/IContinuationDispatcher.cs` — the interface this implementation realizes.
 - `src/Pipely/PipeOptions.cs` — the `ContinuationDispatcher` option that pipes use to plug us in.
 
-**Working directory for all commands:** `/home/harrison/src/worktrees/Pipe/hot-handoff/`
+**Working directory for all commands:** `/home/harrison/src/worktrees/Pipe/fast-scheduler/`
 
 ---
 
-## Task 1: Create the Pipely.HotHandoff project skeleton
+## Task 1: Create the Pipely project skeleton
 
 **Files:**
-- Create: `src/Pipely.HotHandoff/Pipely.HotHandoff.csproj`
-- Create: `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs` (stub — full impl comes in Task 5)
+- Create: `src/Pipely/Pipely.csproj`
+- Create: `src/Pipely/FastScheduler.cs` (stub — full impl comes in Task 5)
 
 - [ ] **Step 1: Create the directory**
 
 ```bash
-mkdir -p src/Pipely.HotHandoff
+mkdir -p src/Pipely
 ```
 
 - [ ] **Step 2: Create the csproj**
 
-Write `src/Pipely.HotHandoff/Pipely.HotHandoff.csproj`:
+Write `src/Pipely/Pipely.csproj`:
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
@@ -54,14 +54,14 @@ Write `src/Pipely.HotHandoff/Pipely.HotHandoff.csproj`:
 
 - [ ] **Step 3: Create a stub for the type so the project compiles**
 
-Write `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs`:
+Write `src/Pipely/FastScheduler.cs`:
 
 ```csharp
 using Pipely;
 
-namespace Pipely.HotHandoff;
+namespace Pipely;
 
-public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, IDisposable
+public sealed class FastScheduler : IContinuationDispatcher, IDisposable
 {
     public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
         => throw new NotImplementedException();
@@ -72,17 +72,17 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
 
 - [ ] **Step 4: Verify project compiles**
 
-Run: `dotnet build src/Pipely.HotHandoff/Pipely.HotHandoff.csproj`
+Run: `dotnet build src/Pipely/Pipely.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/Pipely.HotHandoff
+git add src/Pipely
 git commit -m "$(cat <<'EOF'
-HotHandoff: scaffold Pipely.HotHandoff project
+FastScheduler: scaffold Pipely project
 
-Empty project + stub HotHandoffContinuationDispatcher type. Real
+Empty project + stub FastScheduler type. Real
 implementation lands in the next-task TDD step driven by test A.1.
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
@@ -92,21 +92,21 @@ EOF
 
 ---
 
-## Task 2: Create the Pipely.HotHandoff.Tests project skeleton
+## Task 2: Create the Pipely.Tests project skeleton
 
 **Files:**
-- Create: `tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj`
-- Create: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs` (empty test class)
+- Create: `tests/Pipely.Tests/Pipely.Tests.csproj`
+- Create: `tests/Pipely.Tests/FastSchedulerTests.cs` (empty test class)
 
 - [ ] **Step 1: Create the directory**
 
 ```bash
-mkdir -p tests/Pipely.HotHandoff.Tests
+mkdir -p tests/Pipely.Tests
 ```
 
 - [ ] **Step 2: Create the csproj**
 
-Write `tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj`:
+Write `tests/Pipely.Tests/Pipely.Tests.csproj`:
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
@@ -131,7 +131,7 @@ Write `tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj`:
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Pipely\Pipely.csproj" />
-    <ProjectReference Include="..\..\src\Pipely.HotHandoff\Pipely.HotHandoff.csproj" />
+    <ProjectReference Include="..\..\src\Pipely\Pipely.csproj" />
   </ItemGroup>
 
 </Project>
@@ -139,14 +139,14 @@ Write `tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj`:
 
 - [ ] **Step 3: Create the empty test class**
 
-Write `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`:
+Write `tests/Pipely.Tests/FastSchedulerTests.cs`:
 
 ```csharp
-using Pipely.HotHandoff;
+using Pipely;
 
-namespace Pipely.HotHandoff.Tests;
+namespace Pipely.Tests;
 
-public class HotHandoffContinuationDispatcherTests
+public class FastSchedulerTests
 {
     // Tests added in subsequent tasks.
 }
@@ -154,15 +154,15 @@ public class HotHandoffContinuationDispatcherTests
 
 - [ ] **Step 4: Verify the test project compiles**
 
-Run: `dotnet build tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj`
+Run: `dotnet build tests/Pipely.Tests/Pipely.Tests.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests
+git add tests/Pipely.Tests
 git commit -m "$(cat <<'EOF'
-HotHandoff: scaffold Pipely.HotHandoff.Tests project
+FastScheduler: scaffold Pipely.Tests project
 
 xUnit-based test project; empty test class. Tests added per-task in
 subsequent steps following the spec's required test surface (§7).
@@ -205,13 +205,13 @@ Replace its contents with:
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/Pipely/Pipely.csproj" />
-    <Project Path="src/Pipely.HotHandoff/Pipely.HotHandoff.csproj" />
+    <Project Path="src/Pipely/Pipely.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj" />
     <Project Path="tests/Pipe.Stress/Pipe.Stress.csproj" />
     <Project Path="tests/Pipe.Tests/Pipe.Tests.csproj" />
-    <Project Path="tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj" />
+    <Project Path="tests/Pipely.Tests/Pipely.Tests.csproj" />
   </Folder>
 </Solution>
 ```
@@ -219,21 +219,21 @@ Replace its contents with:
 - [ ] **Step 3: Build the whole solution**
 
 Run: `dotnet build Pipe.slnx`
-Expected: all 5 projects build (the original 4 + the new 2 visible to the solution; the new Tests project depends on the new HotHandoff project, so both must compile clean).
+Expected: all 5 projects build (the original 4 + the new 2 visible to the solution; the new Tests project depends on the new FastScheduler project, so both must compile clean).
 
 - [ ] **Step 4: Run all tests, verify the new test project is discovered**
 
 Run: `dotnet test Pipe.slnx --nologo`
-Expected: all existing tests pass; the new `Pipely.HotHandoff.Tests` project shows "0 tests run" (no tests yet).
+Expected: all existing tests pass; the new `Pipely.Tests` project shows "0 tests run" (no tests yet).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add Pipe.slnx
 git commit -m "$(cat <<'EOF'
-HotHandoff: add new projects to Pipe.slnx
+FastScheduler: add new projects to Pipe.slnx
 
-Solution now references Pipely.HotHandoff and its test project.
+Solution now references Pipely and its test project.
 dotnet build and dotnet test both green.
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
@@ -245,21 +245,21 @@ EOF
 
 ## Task 4: Test A.1 + full state-machine implementation (TDD)
 
-This is the architecture-establishing task. Write test A.1 (callback runs on dedicated thread), watch it fail, then implement the full state machine per `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` §3 in one go.
+This is the architecture-establishing task. Write test A.1 (callback runs on dedicated thread), watch it fail, then implement the full state machine per `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md` §3 in one go.
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
-- Modify: `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
+- Modify: `src/Pipely/FastScheduler.cs`
 
 - [ ] **Step 1: Write the failing test**
 
-Add this test method to `HotHandoffContinuationDispatcherTests`:
+Add this test method to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
 public void Dispatch_InvokesCallbackOnDedicatedThread()
 {
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
     int? observedThreadId = null;
     string? observedThreadName = null;
     using var done = new ManualResetEventSlim(false);
@@ -274,23 +274,23 @@ public void Dispatch_InvokesCallbackOnDedicatedThread()
     Assert.True(done.Wait(TimeSpan.FromSeconds(5)),
         "Callback was not invoked within 5 seconds.");
     Assert.NotEqual(Environment.CurrentManagedThreadId, observedThreadId);
-    Assert.Equal("Pipe HotHandoff", observedThreadName);
+    Assert.Equal("Pipe FastScheduler", observedThreadName);
 }
 ```
 
 - [ ] **Step 2: Run the test — expect it to throw `NotImplementedException`**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_InvokesCallbackOnDedicatedThread"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Dispatch_InvokesCallbackOnDedicatedThread"`
 Expected: test fails — `UnsafeQueueUserWorkItem` throws `NotImplementedException`.
 
 - [ ] **Step 3: Implement the full state machine per spec §3**
 
-Replace the contents of `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs` with:
+Replace the contents of `src/Pipely/FastScheduler.cs` with:
 
 ```csharp
 using Pipely;
 
-namespace Pipely.HotHandoff;
+namespace Pipely;
 
 /// <summary>
 /// <see cref="IContinuationDispatcher"/> implementation that routes the first hop of
@@ -310,11 +310,11 @@ namespace Pipely.HotHandoff;
 /// <para>
 /// State <c>Busy | ShutdownRequested</c> = 2 (Vacant + ShutdownRequested) is terminal:
 /// no Dispatch can claim, the loop exits, no callback is dropped. See
-/// <c>docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md</c> for the
+/// <c>docs/superpowers/specs/2026-04-27-fast-scheduler-design.md</c> for the
 /// full spec and four-races correctness argument.
 /// </para>
 /// </summary>
-public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, IDisposable
+public sealed class FastScheduler : IContinuationDispatcher, IDisposable
 {
     private const int Busy              = 1;
     private const int ShutdownRequested = 2;
@@ -327,12 +327,12 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
     private object? _pendingState;
     private readonly Thread _thread;
 
-    public HotHandoffContinuationDispatcher()
+    public FastScheduler()
     {
         _thread = new Thread(Loop)
         {
             IsBackground = true,
-            Name = "Pipe HotHandoff",
+            Name = "Pipe FastScheduler",
         };
         _thread.Start();
     }
@@ -388,18 +388,18 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
 
 - [ ] **Step 4: Run the test — expect it to pass**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_InvokesCallbackOnDedicatedThread"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Dispatch_InvokesCallbackOnDedicatedThread"`
 Expected: 1 test passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs \
-        tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add src/Pipely/FastScheduler.cs \
+        tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff: implement state-machine + first dispatched-thread test
+FastScheduler: implement state-machine + first dispatched-thread test
 
-Implements the full HotHandoffContinuationDispatcher per spec §3:
+Implements the full FastScheduler per spec §3:
 single-int _state with Busy/ShutdownRequested bits, atomic slot
 publication via Interlocked.Exchange, Loop drains and terminalizes
 on state 2, Dispose Ors the bit and Joins. SpinIterations = 10
@@ -418,17 +418,17 @@ EOF
 ## Task 5: Test A.2 — overflow falls back to ThreadPool
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
 public void Dispatch_OverflowFallsBackToThreadPool()
 {
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
     using var firstStarted = new ManualResetEventSlim(false);
     using var firstRelease = new ManualResetEventSlim(false);
     using var secondDone   = new ManualResetEventSlim(false);
@@ -462,17 +462,17 @@ public void Dispatch_OverflowFallsBackToThreadPool()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_OverflowFallsBackToThreadPool"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Dispatch_OverflowFallsBackToThreadPool"`
 Expected: PASS — the implementation from Task 4 already covers this.
 
-If the test fails, debug: a CAS-loss in `UnsafeQueueUserWorkItem` should fall through to `ThreadPool.UnsafeQueueUserWorkItem(...)`. Re-read `HotHandoffContinuationDispatcher.UnsafeQueueUserWorkItem`.
+If the test fails, debug: a CAS-loss in `UnsafeQueueUserWorkItem` should fall through to `ThreadPool.UnsafeQueueUserWorkItem(...)`. Re-read `FastScheduler.UnsafeQueueUserWorkItem`.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: A.2 — overflow falls back to ThreadPool
+FastScheduler tests: A.2 — overflow falls back to ThreadPool
 
 Holds the slot via a slow first callback; second concurrent Dispatch
 must run on a TP thread (slot was Busy → CAS lost → TP fallback path).
@@ -487,17 +487,17 @@ EOF
 ## Task 6: Test A.3 — exactly-once invocation under stress
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
 public void Dispatch_InvokesEachCallbackExactlyOnce()
 {
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
     const int totalDispatches = 10_000;
     int invocationCount = 0;
     var allDone = new CountdownEvent(totalDispatches);
@@ -522,15 +522,15 @@ Note: `Volatile.Read` on the assert is only used in the *test* — it's the conv
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_InvokesEachCallbackExactlyOnce"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Dispatch_InvokesEachCallbackExactlyOnce"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: A.3 — every callback invoked exactly once under stress
+FastScheduler tests: A.3 — every callback invoked exactly once under stress
 
 10k Dispatches from Parallel.For; sum of invocation counter == 10k.
 Mix of slot-path and TP-overflow paths under contention.
@@ -545,17 +545,17 @@ EOF
 ## Task 7: Test A.4 — UnsafeQueueUserWorkItem never throws
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
 public void Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem()
 {
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
     const int totalDispatches = 5_000;
     int dispatchExceptions = 0;
     var allDispatched = new CountdownEvent(totalDispatches);
@@ -583,15 +583,15 @@ public void Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: A.4 — UnsafeQueueUserWorkItem never throws
+FastScheduler tests: A.4 — UnsafeQueueUserWorkItem never throws
 
 5k concurrent dispatches; assert no exception ever escapes
 UnsafeQueueUserWorkItem (contract item #4). Failure mode would be
@@ -607,17 +607,17 @@ EOF
 ## Task 8: Test A.5 — throwing callback doesn't kill the dispatcher thread
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
 public void ThrowingCallback_DoesNotKillDispatcherThread()
 {
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
     using var firstDone  = new ManualResetEventSlim(false);
     using var secondDone = new ManualResetEventSlim(false);
     string? secondThreadName = null;
@@ -645,21 +645,21 @@ public void ThrowingCallback_DoesNotKillDispatcherThread()
 
     Assert.True(secondDone.Wait(TimeSpan.FromSeconds(5)),
         "Second callback after throwing first never ran — dispatcher thread may have died.");
-    Assert.Equal("Pipe HotHandoff", secondThreadName);
+    Assert.Equal("Pipe FastScheduler", secondThreadName);
 }
 ```
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "ThrowingCallback_DoesNotKillDispatcherThread"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "ThrowingCallback_DoesNotKillDispatcherThread"`
 Expected: PASS — the `try { cb(st); } catch { }` in `Loop` swallows the exception (contract item #5).
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: A.5 — throwing callback doesn't kill dispatcher thread
+FastScheduler tests: A.5 — throwing callback doesn't kill dispatcher thread
 
 First slot-path callback throws; second slot-path callback still runs
 on the same named dedicated thread. Validates the try/catch in Loop
@@ -675,11 +675,11 @@ EOF
 ## Task 9: Test A.6 — Dispatch races Dispose, callback still invoked exactly once
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
@@ -691,7 +691,7 @@ public void Dispatch_RacingDispose_InvokesCallbackExactlyOnce()
 
     for (int trial = 0; trial < trials; trial++)
     {
-        var dispatcher = new HotHandoffContinuationDispatcher();
+        var dispatcher = new FastScheduler();
         int invocationCount = 0;
         using var done = new ManualResetEventSlim(false);
 
@@ -717,17 +717,17 @@ public void Dispatch_RacingDispose_InvokesCallbackExactlyOnce()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_RacingDispose_InvokesCallbackExactlyOnce"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Dispatch_RacingDispose_InvokesCallbackExactlyOnce"`
 Expected: PASS — pins the spec's Race 1, 2, 4 closure.
 
-If this test fails intermittently, that is a critical correctness bug. Debug starting from `HotHandoffContinuationDispatcher.UnsafeQueueUserWorkItem` and `Loop` — the four-races argument is in spec §5.
+If this test fails intermittently, that is a critical correctness bug. Debug starting from `FastScheduler.UnsafeQueueUserWorkItem` and `Loop` — the four-races argument is in spec §5.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: A.6 — Dispatch racing Dispose invokes callback exactly once
+FastScheduler tests: A.6 — Dispatch racing Dispose invokes callback exactly once
 
 200 trials of concurrent UnsafeQueueUserWorkItem + Dispose on fresh
 dispatchers; assert callback ran exactly once in every trial. Pins
@@ -743,17 +743,17 @@ EOF
 ## Task 10: Test A.7 — Dispose blocks until in-flight callback completes
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
 public void Dispose_BlocksUntilInFlightCallbackCompletes()
 {
-    var dispatcher = new HotHandoffContinuationDispatcher();
+    var dispatcher = new FastScheduler();
     using var callbackStarted = new ManualResetEventSlim(false);
     using var callbackRelease = new ManualResetEventSlim(false);
     int callbackCompleted = 0;
@@ -785,15 +785,15 @@ public void Dispose_BlocksUntilInFlightCallbackCompletes()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispose_BlocksUntilInFlightCallbackCompletes"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Dispose_BlocksUntilInFlightCallbackCompletes"`
 Expected: PASS — `Thread.Join` in Dispose waits for Loop to exit, which only happens after the callback finishes and the Loop terminalizes.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: A.7 — Dispose blocks until in-flight callback completes
+FastScheduler tests: A.7 — Dispose blocks until in-flight callback completes
 
 Slot-path callback gated on a release event; Dispose must not return
 until after the callback's gate is released. Pins the Thread.Join
@@ -809,17 +809,17 @@ EOF
 ## Task 11: Test A.8 — Dispatch after Dispose always goes to ThreadPool
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
 public void Dispatch_AfterDispose_AlwaysRunsOnThreadPool()
 {
-    var dispatcher = new HotHandoffContinuationDispatcher();
+    var dispatcher = new FastScheduler();
     dispatcher.Dispose();
 
     const int total = 100;
@@ -847,15 +847,15 @@ public void Dispatch_AfterDispose_AlwaysRunsOnThreadPool()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Dispatch_AfterDispose_AlwaysRunsOnThreadPool"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Dispatch_AfterDispose_AlwaysRunsOnThreadPool"`
 Expected: PASS — after Dispose, `_state` is 2 (ShutdownRequested + Vacant), so every Dispatcher CAS expecting 0 fails and falls through to TP.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: A.8 — Dispatch after Dispose runs on ThreadPool
+FastScheduler tests: A.8 — Dispatch after Dispose runs on ThreadPool
 
 100 dispatches after Dispose; every callback runs on a TP thread
 (state == ShutdownRequested + Vacant; Dispatcher CAS always fails;
@@ -871,17 +871,17 @@ EOF
 ## Task 12: Test A.9 — one dispatcher serves multiple Pipes correctly
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
 public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
 {
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
     using var pipeA = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
     using var pipeB = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
@@ -908,17 +908,17 @@ public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters"`
 Expected: PASS — the dispatcher's CAS on `_state` is per-instance, not per-pipe; concurrent producers from different pipes contest the same slot, with overflow to TP.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: A.9 — one dispatcher serves multiple pipes correctly
+FastScheduler tests: A.9 — one dispatcher serves multiple pipes correctly
 
-Two Pipes share one HotHandoffContinuationDispatcher; concurrent
+Two Pipes share one FastScheduler; concurrent
 ReadAsync/FlushAsync round-trips on both pipes complete. Pins contract
 item #3 (thread-safety across pipes).
 
@@ -932,17 +932,17 @@ EOF
 ## Task 13: Test B.1 — Pipe round-trip via the dispatcher
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
-public async Task Pipe_WithHotHandoff_BasicReadFlush_RoundTrip()
+public async Task Pipe_WithFastScheduler_BasicReadFlush_RoundTrip()
 {
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
     using var pipe = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
     var readTask = pipe.Reader.ReadAsync().AsTask();
@@ -964,18 +964,18 @@ public async Task Pipe_WithHotHandoff_BasicReadFlush_RoundTrip()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Pipe_WithHotHandoff_BasicReadFlush_RoundTrip"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Pipe_WithFastScheduler_BasicReadFlush_RoundTrip"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: B.1 — Pipe golden-path round-trip via dispatcher
+FastScheduler tests: B.1 — Pipe golden-path round-trip via dispatcher
 
 Reader parks on empty pipe; Writer flushes; Read completes through the
-hot-handoff dispatcher. Validates the dispatcher integrates cleanly
+fast-scheduler dispatcher. Validates the dispatcher integrates cleanly
 with PipeOptions.ContinuationDispatcher.
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
@@ -988,18 +988,18 @@ EOF
 ## Task 14: Test B.2 — consumer's AsyncLocal flows to continuation
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
-public async Task Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation()
+public async Task Pipe_WithFastScheduler_AsyncLocalFlowsToContinuation()
 {
     var asyncLocal = new AsyncLocal<int>();
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
     using var pipe = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
     asyncLocal.Value = 42;
@@ -1027,15 +1027,15 @@ public async Task Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Pipe_WithHotHandoff_AsyncLocalFlowsToContinuation"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Pipe_WithFastScheduler_AsyncLocalFlowsToContinuation"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: B.2 — consumer's AsyncLocal flows to the continuation
+FastScheduler tests: B.2 — consumer's AsyncLocal flows to the continuation
 
 AsyncLocal set before await pipe.Reader.ReadAsync(); after the
 continuation runs (on the dispatcher's worker thread), the value is
@@ -1052,22 +1052,22 @@ EOF
 ## Task 15: Test B.3 — dispatcher thread's AsyncLocal does NOT leak into continuation
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-The test pattern follows the existing `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs::CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation` test. We replicate it through `HotHandoffContinuationDispatcher` directly. Because that dispatcher's worker thread does not expose a "set this AsyncLocal on the worker thread" hook, we use a one-shot dispatch to set the AsyncLocal *on* the worker thread before the parked-await scenario runs.
+The test pattern follows the existing `tests/Pipe.Tests/PipeContinuationDispatcherTests.cs::CustomDispatcher_DispatcherThreadAsyncLocal_NotObservedInContinuation` test. We replicate it through `FastScheduler` directly. Because that dispatcher's worker thread does not expose a "set this AsyncLocal on the worker thread" hook, we use a one-shot dispatch to set the AsyncLocal *on* the worker thread before the parked-await scenario runs.
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
-public async Task Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation()
+public async Task Pipe_WithFastScheduler_DispatcherThreadAsyncLocal_NotObservedInContinuation()
 {
     var consumerLocal   = new AsyncLocal<int>();
     var dispatcherLocal = new AsyncLocal<int>();
 
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
 
     // Set dispatcherLocal on the worker thread by dispatching a one-shot through the slot.
     using var setupDone = new ManualResetEventSlim(false);
@@ -1105,15 +1105,15 @@ public async Task Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInCo
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Pipe_WithHotHandoff_DispatcherThreadAsyncLocal_NotObservedInContinuation"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Pipe_WithFastScheduler_DispatcherThreadAsyncLocal_NotObservedInContinuation"`
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: B.3 — dispatcher's AsyncLocal does not leak into continuation
+FastScheduler tests: B.3 — dispatcher's AsyncLocal does not leak into continuation
 
 The worker thread's own AsyncLocal value (set via a one-shot dispatch)
 is NOT observed by the continuation that resumes the consumer's await.
@@ -1130,17 +1130,17 @@ EOF
 ## Task 16: Test B.4 — rapid park/resume cycles, no version mismatch
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs`
+- Modify: `tests/Pipely.Tests/FastSchedulerTests.cs`
 
 - [ ] **Step 1: Add the test**
 
-Append to `HotHandoffContinuationDispatcherTests`:
+Append to `FastSchedulerTests`:
 
 ```csharp
 [Fact]
-public async Task Pipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch()
+public async Task Pipe_WithFastScheduler_RapidParkResumeCycles_NoVersionMismatch()
 {
-    using var dispatcher = new HotHandoffContinuationDispatcher();
+    using var dispatcher = new FastScheduler();
     using var pipe = new Pipely.Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
 
     const int totalCycles  = 1000;
@@ -1178,17 +1178,17 @@ public async Task Pipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch()
 
 - [ ] **Step 2: Run the test**
 
-Run: `dotnet test tests/Pipely.HotHandoff.Tests --nologo --filter "Pipe_WithHotHandoff_RapidParkResumeCycles_NoVersionMismatch"`
+Run: `dotnet test tests/Pipely.Tests --nologo --filter "Pipe_WithFastScheduler_RapidParkResumeCycles_NoVersionMismatch"`
 Expected: PASS — completes within timeout, no exception thrown.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs
+git add tests/Pipely.Tests/FastSchedulerTests.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff tests: B.4 — rapid park/resume cycles, no version mismatch
+FastScheduler tests: B.4 — rapid park/resume cycles, no version mismatch
 
-1000 producer flush + consumer ReadAsync cycles via the hot-handoff
+1000 producer flush + consumer ReadAsync cycles via the fast-scheduler
 dispatcher; assert no version-mismatch exceptions and completion within
 30s. Stress test against the dispatch hop allowing stale awaiter
 version observations.
@@ -1230,25 +1230,25 @@ Each failing test maps to a contract item or invariant from spec §4 / §5. Use 
 ## Task 18: Create the benchmark project skeleton
 
 **Files:**
-- Create: `tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
-- Create: `tests/Pipely.HotHandoff.Benchmarks/Program.cs` (stub)
+- Create: `tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj`
+- Create: `tests/Pipely.Benchmarks/Program.cs` (stub)
 
 - [ ] **Step 1: Create the directory**
 
 ```bash
-mkdir -p tests/Pipely.HotHandoff.Benchmarks
+mkdir -p tests/Pipely.Benchmarks
 ```
 
 - [ ] **Step 2: Create the csproj**
 
-Write `tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`:
+Write `tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj`:
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Pipely\Pipely.csproj" />
-    <ProjectReference Include="..\..\src\Pipely.HotHandoff\Pipely.HotHandoff.csproj" />
+    <ProjectReference Include="..\..\src\Pipely\Pipely.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -1271,27 +1271,27 @@ Write `tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`:
 
 - [ ] **Step 3: Create a placeholder Program.cs**
 
-Write `tests/Pipely.HotHandoff.Benchmarks/Program.cs`:
+Write `tests/Pipely.Benchmarks/Program.cs`:
 
 ```csharp
 // CLI dispatch added in a later task. Sub-commands:
 //   latency    — DispatcherLatencyHarness.Run
 //   throughput — BenchmarkSwitcher → DispatcherThroughputBench
-Console.WriteLine("Pipely.HotHandoff.Benchmarks — pass `latency` or `throughput`.");
+Console.WriteLine("Pipely.Benchmarks — pass `latency` or `throughput`.");
 return 0;
 ```
 
 - [ ] **Step 4: Verify it compiles**
 
-Run: `dotnet build tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
+Run: `dotnet build tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Benchmarks
+git add tests/Pipely.Benchmarks
 git commit -m "$(cat <<'EOF'
-HotHandoff: scaffold Pipely.HotHandoff.Benchmarks project
+FastScheduler: scaffold Pipely.Benchmarks project
 
 BDN + System.CommandLine, Server+Concurrent GC, Exe output. Latency
 harness and throughput benchmark added in subsequent tasks.
@@ -1316,14 +1316,14 @@ Add the benchmark project under the `/tests/` folder. The full file should be:
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/Pipely/Pipely.csproj" />
-    <Project Path="src/Pipely.HotHandoff/Pipely.HotHandoff.csproj" />
+    <Project Path="src/Pipely/Pipely.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Pipe.Benchmarks/Pipe.Benchmarks.csproj" />
     <Project Path="tests/Pipe.Stress/Pipe.Stress.csproj" />
     <Project Path="tests/Pipe.Tests/Pipe.Tests.csproj" />
-    <Project Path="tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj" />
-    <Project Path="tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj" />
+    <Project Path="tests/Pipely.Tests/Pipely.Tests.csproj" />
+    <Project Path="tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj" />
   </Folder>
 </Solution>
 ```
@@ -1338,7 +1338,7 @@ Expected: all projects build.
 ```bash
 git add Pipe.slnx
 git commit -m "$(cat <<'EOF'
-HotHandoff: add benchmarks project to Pipe.slnx
+FastScheduler: add benchmarks project to Pipe.slnx
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 EOF
@@ -1350,13 +1350,13 @@ EOF
 ## Task 20: Implement the dispatcher latency harness
 
 **Files:**
-- Create: `tests/Pipely.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs`
+- Create: `tests/Pipely.Benchmarks/DispatcherLatencyHarness.cs`
 
 The harness measures producer→consumer message latency under sustained throughput, parameterized by an optional `IContinuationDispatcher`. Mirrors the percentile-by-sort approach of `tests/Pipe.Benchmarks/LatencyHarness.cs` but is leaner — no wake-gap traces, no TP correlation, no awaiter counters. Just message latency for the dispatcher comparison.
 
 - [ ] **Step 1: Write the harness**
 
-Write `tests/Pipely.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs`:
+Write `tests/Pipely.Benchmarks/DispatcherLatencyHarness.cs`:
 
 ```csharp
 using System.Diagnostics;
@@ -1364,7 +1364,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using Pipely;
 
-namespace Pipely.HotHandoff.Benchmarks;
+namespace Pipely.Benchmarks;
 
 internal sealed record LatencyStats(
     long Count,
@@ -1462,7 +1462,7 @@ internal static class DispatcherLatencyHarness
     {
         Console.WriteLine();
         Console.WriteLine($"=== {label} ===");
-        Console.WriteLine($"| {"Stat",-8} | {"tp-default",12} | {"hot-handoff",12} |  Ratio |");
+        Console.WriteLine($"| {"Stat",-8} | {"tp-default",12} | {"fast-scheduler",12} |  Ratio |");
         Console.WriteLine($"|:---------|-------------:|-------------:|-------:|");
         PrintRow("Count", baseline.Count,  compare.Count);
         PrintRow("Min",   baseline.MinNs,  compare.MinNs);
@@ -1494,15 +1494,15 @@ internal static class DispatcherLatencyHarness
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `dotnet build tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
+Run: `dotnet build tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs
+git add tests/Pipely.Benchmarks/DispatcherLatencyHarness.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff bench: implement DispatcherLatencyHarness
+FastScheduler bench: implement DispatcherLatencyHarness
 
 Producer→consumer message-latency harness, parameterized by an optional
 IContinuationDispatcher. Records exact percentiles by sort-and-index.
@@ -1519,17 +1519,17 @@ EOF
 ## Task 21: Implement the dispatcher throughput benchmark
 
 **Files:**
-- Create: `tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs`
+- Create: `tests/Pipely.Benchmarks/DispatcherThroughputBench.cs`
 
 - [ ] **Step 1: Write the BDN benchmark class**
 
-Write `tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs`:
+Write `tests/Pipely.Benchmarks/DispatcherThroughputBench.cs`:
 
 ```csharp
 using BenchmarkDotNet.Attributes;
 using Pipely;
 
-namespace Pipely.HotHandoff.Benchmarks;
+namespace Pipely.Benchmarks;
 
 [MemoryDiagnoser]
 public class DispatcherThroughputBench
@@ -1548,9 +1548,9 @@ public class DispatcherThroughputBench
     }
 
     [Benchmark]
-    public async Task HotHandoff_ProduceAndDrain()
+    public async Task FastScheduler_ProduceAndDrain()
     {
-        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var dispatcher = new FastScheduler();
         using var pipe = new Pipely.Pipe(new PipeOptions
         {
             ContinuationDispatcher = dispatcher,
@@ -1593,18 +1593,18 @@ public class DispatcherThroughputBench
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `dotnet build tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
+Run: `dotnet build tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Benchmarks/DispatcherThroughputBench.cs
+git add tests/Pipely.Benchmarks/DispatcherThroughputBench.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff bench: implement DispatcherThroughputBench
+FastScheduler bench: implement DispatcherThroughputBench
 
 BDN + MemoryDiagnoser; two configurations (tp-default baseline vs
-hot-handoff). 1 MiB ProduceAndDrain at 4 KiB chunks — same workload
+fast-scheduler). 1 MiB ProduceAndDrain at 4 KiB chunks — same workload
 as tests/Pipe.Benchmarks/ThroughputBenchmarks.cs.
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
@@ -1617,18 +1617,18 @@ EOF
 ## Task 22: Wire the Program.cs CLI
 
 **Files:**
-- Modify: `tests/Pipely.HotHandoff.Benchmarks/Program.cs`
+- Modify: `tests/Pipely.Benchmarks/Program.cs`
 
 Pattern matches `tests/Pipe.Benchmarks/Program.cs`: when `args[0] == "latency"`, run our latency harness with System.CommandLine-parsed options; otherwise pass all args to BDN's `BenchmarkSwitcher` (which handles `--filter`, `--job`, etc., for the throughput benchmark).
 
 - [ ] **Step 1: Replace Program.cs**
 
-Write `tests/Pipely.HotHandoff.Benchmarks/Program.cs`:
+Write `tests/Pipely.Benchmarks/Program.cs`:
 
 ```csharp
 using BenchmarkDotNet.Running;
-using Pipely.HotHandoff;
-using Pipely.HotHandoff.Benchmarks;
+using Pipely;
+using Pipely.Benchmarks;
 using System.CommandLine;
 
 // Anything that isn't the latency sub-command (including no args, or BDN args
@@ -1663,7 +1663,7 @@ var warmupOption = new Option<int>("--warmup")
     DefaultValueFactory = _ => 1,
 };
 
-var latencyCommand = new Command("latency", "Run the latency comparison (tp-default vs hot-handoff)")
+var latencyCommand = new Command("latency", "Run the latency comparison (tp-default vs fast-scheduler)")
 {
     countOption, sizeOption, trialsOption, warmupOption,
 };
@@ -1677,7 +1677,7 @@ latencyCommand.SetAction(async parseResult =>
     return 0;
 });
 
-var rootCommand = new RootCommand("Pipely.HotHandoff benchmark harness")
+var rootCommand = new RootCommand("Pipely benchmark harness")
 {
     latencyCommand,
 };
@@ -1692,7 +1692,7 @@ static async Task RunLatency(int count, int size, int trials, int warmup)
     {
         Console.WriteLine($"  Warmup trial {w + 1}/{warmup} (not recorded)");
         _ = await DispatcherLatencyHarness.Run(null, count, size);
-        using var dispatcher = new HotHandoffContinuationDispatcher();
+        using var dispatcher = new FastScheduler();
         _ = await DispatcherLatencyHarness.Run(dispatcher, count, size);
     }
 
@@ -1704,7 +1704,7 @@ static async Task RunLatency(int count, int size, int trials, int warmup)
         var tpStats = await DispatcherLatencyHarness.Run(null, count, size);
 
         LatencyStats hhStats;
-        using (var dispatcher = new HotHandoffContinuationDispatcher())
+        using (var dispatcher = new FastScheduler())
             hhStats = await DispatcherLatencyHarness.Run(dispatcher, count, size);
 
         DispatcherLatencyHarness.PrintComparison("Message latency (ns)", tpStats, hhStats);
@@ -1714,15 +1714,15 @@ static async Task RunLatency(int count, int size, int trials, int warmup)
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `dotnet build tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj`
+Run: `dotnet build tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj`
 Expected: build succeeds with 0 warnings.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Benchmarks/Program.cs
+git add tests/Pipely.Benchmarks/Program.cs
 git commit -m "$(cat <<'EOF'
-HotHandoff bench: wire Program.cs CLI (latency + throughput sub-commands)
+FastScheduler bench: wire Program.cs CLI (latency + throughput sub-commands)
 
 `latency` runs DispatcherLatencyHarness for both configurations N times
 with M warmup trials. `throughput` defers to BenchmarkSwitcher.
@@ -1740,13 +1740,13 @@ A quick run to confirm both sub-commands launch and produce output. We are not c
 
 - [ ] **Step 1: Smoke-test the latency sub-command (Debug, small count)**
 
-Run: `dotnet run --project tests/Pipely.HotHandoff.Benchmarks -- latency --count 1000 --trials 1 --warmup 0`
-Expected: prints a "=== Trial 1/1 ===" header followed by a "Message latency (ns)" comparison table with `tp-default`, `hot-handoff`, and a Ratio column. No exceptions.
+Run: `dotnet run --project tests/Pipely.Benchmarks -- latency --count 1000 --trials 1 --warmup 0`
+Expected: prints a "=== Trial 1/1 ===" header followed by a "Message latency (ns)" comparison table with `tp-default`, `fast-scheduler`, and a Ratio column. No exceptions.
 
 - [ ] **Step 2: Smoke-test the throughput benchmark (Release)**
 
-Run: `dotnet run --project tests/Pipely.HotHandoff.Benchmarks -c Release -- --filter '*'`
-Expected: BDN prints its job header and begins running both `TpDefault_ProduceAndDrain` and `HotHandoff_ProduceAndDrain`. You can Ctrl+C after seeing both benchmarks appear in BDN's "Found benchmarks" / running output — this step only verifies that the binary launches, BDN discovers the two benchmarks, and they begin executing without error. A full BDN run is part of the post-implementation measurement loop.
+Run: `dotnet run --project tests/Pipely.Benchmarks -c Release -- --filter '*'`
+Expected: BDN prints its job header and begins running both `TpDefault_ProduceAndDrain` and `FastScheduler_ProduceAndDrain`. You can Ctrl+C after seeing both benchmarks appear in BDN's "Found benchmarks" / running output — this step only verifies that the binary launches, BDN discovers the two benchmarks, and they begin executing without error. A full BDN run is part of the post-implementation measurement loop.
 
 BDN refuses to run Debug builds; the `-c Release` flag is required.
 
@@ -1757,22 +1757,22 @@ BDN refuses to run Debug builds; the `-c Release` flag is required.
 ## Task 24: Write the RESULTS.md scaffold
 
 **Files:**
-- Create: `tests/Pipely.HotHandoff.Benchmarks/RESULTS.md`
+- Create: `tests/Pipely.Benchmarks/RESULTS.md`
 
 This file documents the methodology, the comparison context, and the design-completion criterion from spec §8.3. Measurement rows are blank — they are filled in as the benchmark loop runs (see post-implementation steps below).
 
 - [ ] **Step 1: Write the scaffold**
 
-Write `tests/Pipely.HotHandoff.Benchmarks/RESULTS.md`:
+Write `tests/Pipely.Benchmarks/RESULTS.md`:
 
 ```markdown
-# HotHandoff Dispatcher Benchmark Results
+# FastScheduler Dispatcher Benchmark Results
 
 **Compared:** `tp-default` (no `ContinuationDispatcher` set; Pipe uses
-`ThreadPoolContinuationDispatcher.Instance`) vs `hot-handoff`
-(`Pipely.HotHandoff.HotHandoffContinuationDispatcher`).
+`ThreadPoolContinuationDispatcher.Instance`) vs `fast-scheduler`
+(`Pipely.FastScheduler`).
 
-**Spec reference:** `docs/superpowers/specs/2026-04-27-hot-handoff-dispatcher-design.md` §8.
+**Spec reference:** `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md` §8.
 
 ## Design-completion criterion
 
@@ -1789,11 +1789,11 @@ measurement that drove it.
 
 ## Methodology
 
-- Latency: `dotnet run -c Release --project tests/Pipely.HotHandoff.Benchmarks -- latency --count 100000 --size 256 --trials 3 --warmup 1`
-- Throughput: `dotnet run -c Release --project tests/Pipely.HotHandoff.Benchmarks -- --filter '*'`
+- Latency: `dotnet run -c Release --project tests/Pipely.Benchmarks -- latency --count 100000 --size 256 --trials 3 --warmup 1`
+- Throughput: `dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter '*'`
 - Three latency trials per recorded run; warmup trial not recorded.
 - Hardware/build details captured at the top of each results section.
-- The hot-handoff worker thread sits at ~100% on its core during the busy-spin
+- The fast-scheduler worker thread sits at ~100% on its core during the busy-spin
   loop. Latency wins must be read against this CPU cost.
 
 ## Starting tunables
@@ -1803,7 +1803,7 @@ the prior baseline.
 
 | Tunable | Starting value | Notes |
 |---|---|---|
-| `SpinIterations` | 10 | `private const int` in `HotHandoffContinuationDispatcher.cs` |
+| `SpinIterations` | 10 | `private const int` in `FastScheduler.cs` |
 | Backoff body | `Thread.SpinWait(SpinIterations)` | The entire idle-loop body |
 | CPU pinning | none | Worker thread is unpinned in the starting configuration |
 | Mailbox depth | 1 | Single-slot with TP overflow on contention |
@@ -1826,7 +1826,7 @@ _(Paste the BDN summary table from `dotnet run ... throughput` here.)_
 
 ### Observations
 
-_(Brief honest read of the data. Did hot-handoff win at P50/P90/P99? At what
+_(Brief honest read of the data. Did fast-scheduler win at P50/P90/P99? At what
 CPU cost? Any anomalies? This section commits to a numerical conclusion;
 subsequent runs document tuning iterations.)_
 
@@ -1845,9 +1845,9 @@ not finalized until either:
 - [ ] **Step 2: Commit**
 
 ```bash
-git add tests/Pipely.HotHandoff.Benchmarks/RESULTS.md
+git add tests/Pipely.Benchmarks/RESULTS.md
 git commit -m "$(cat <<'EOF'
-HotHandoff bench: scaffold RESULTS.md
+FastScheduler bench: scaffold RESULTS.md
 
 Methodology, design-completion criterion (spec §8.3), and starting tunables
 table. Measurement sections are blank — filled in by Release-build runs
@@ -1884,6 +1884,6 @@ The plan above produces an implementation paired with a benchmark project; it do
 **Suggested first iteration** (not part of this plan, listed here for orientation):
 
 1. Run `latency` and `throughput` commands on the target hardware in Release with no source changes; record results in `RESULTS.md` "Run 1 — starting configuration".
-2. Read the data: does `hot-handoff` beat `tp-default` at P50/P90/P99 under reasonable CPU cost? If yes, evaluate whether further tuning is worth it. If no, identify the bottleneck (TP overflow rate too high? worker thread spinning too cold? cache-line contention?) and pick one open tunable from spec §9 to vary.
+2. Read the data: does `fast-scheduler` beat `tp-default` at P50/P90/P99 under reasonable CPU cost? If yes, evaluate whether further tuning is worth it. If no, identify the bottleneck (TP overflow rate too high? worker thread spinning too cold? cache-line contention?) and pick one open tunable from spec §9 to vary.
 3. Edit the source to vary the tunable; re-run; record in "Run 2 — ...". Commit the source change with the measurement output as the commit body.
 4. Repeat until either the criterion closes positively (configuration justified) or negatively (reasonable variants exhausted).

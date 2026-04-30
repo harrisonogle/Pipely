@@ -5,7 +5,7 @@
 
 ## Goal
 
-Let users configure where async continuations run when `Pipe`'s parked awaiters are signaled. Default = ThreadPool (preserves current behavior). Optional override = user-supplied dispatcher (e.g., hot-handoff to a dedicated thread on a pinned core, with TP fallback when busy).
+Let users configure where async continuations run when `Pipe`'s parked awaiters are signaled. Default = ThreadPool (preserves current behavior). Optional override = user-supplied dispatcher (e.g., fast-scheduler to a dedicated thread on a pinned core, with TP fallback when busy).
 
 Primary use case: custom Kestrel transports where the producer side is owned by the user but the consumer side (Kestrel) uses async/await on TP and is sensitive to wake-gap latency.
 
@@ -190,7 +190,7 @@ The only difference vs today's RCA=true path: there's one extra `IContinuationDi
 
 3. **EC contract guard:** a dispatcher implementation that incorrectly captures EC (uses `ThreadPool.QueueUserWorkItem` instead of `UnsafeQueueUserWorkItem`) is detectable — write a test where the producer thread sets a sentinel `AsyncLocal` value and the continuation asserts it is absent. Failing implementations would surface here.
 
-4. **Exception in continuation:** dispatcher's worker thread survives a throwing continuation (verify hot-handoff dispatcher implementation specifically).
+4. **Exception in continuation:** dispatcher's worker thread survives a throwing continuation (verify fast-scheduler dispatcher implementation specifically).
 
 5. **Version safety under rapid park/resume:** loop awaiting + processing many cycles with a custom dispatcher; assert no version-mismatch exceptions (validates dispatch hop doesn't allow stale version observations).
 
@@ -218,7 +218,7 @@ Probably a single PR ~30-50 lines of spec changes, alongside the code change.
 
 ## Open questions
 
-1. **Should we expose a built-in `HotHandoffContinuationDispatcher` in the `Pipely` package?** Tempting (it's the canonical use case) but it has its own lifecycle (thread start/stop), tuning concerns (spin intensity), and exception handling. Better as a documentation example than a library type — keeps Pipe's public surface minimal. Users implementing the interface get full control.
+1. **Should we expose a built-in `FastScheduler` in the `Pipely` package?** Tempting (it's the canonical use case) but it has its own lifecycle (thread start/stop), tuning concerns (spin intensity), and exception handling. Better as a documentation example than a library type — keeps Pipe's public surface minimal. Users implementing the interface get full control.
 
 2. **Should the default dispatcher be a singleton (`Instance`) or instantiated per pipe?** Singleton is fine — it's stateless. Cheaper than per-pipe construction.
 
@@ -234,12 +234,12 @@ Probably a single PR ~30-50 lines of spec changes, alongside the code change.
 
 4. **EC contract enforcement is convention, not enforcement.** A buggy custom dispatcher that captures EC won't be caught by the type system. Mitigated by: clear contract docs, EC guard test (#3 above), and documentation pointing users at `UnsafeQueueUserWorkItem` as the canonical implementation primitive.
 
-## User-side example: hot-handoff dispatcher
+## User-side example: fast-scheduler dispatcher
 
-For reference, what a user implementing the canonical "hot-handoff with TP fallback" dispatcher might look like:
+For reference, what a user implementing the canonical "fast-scheduler with TP fallback" dispatcher might look like:
 
 ```csharp
-public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, IDisposable
+public sealed class FastScheduler : IContinuationDispatcher, IDisposable
 {
     private const int Vacant = 0;
     private const int Busy = 1;
@@ -249,9 +249,9 @@ public sealed class HotHandoffContinuationDispatcher : IContinuationDispatcher, 
     private readonly Thread _thread;
     private volatile bool _shutdown;
 
-    public HotHandoffContinuationDispatcher()
+    public FastScheduler()
     {
-        _thread = new Thread(Loop) { IsBackground = true, Name = "Pipe HotHandoff" };
+        _thread = new Thread(Loop) { IsBackground = true, Name = "Pipe FastScheduler" };
         _thread.Start();
     }
 

@@ -106,7 +106,7 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
         awaiter._dispatcher.UnsafeQueueUserWorkItem(s_invokeWithEc!, awaiter);
     };
 
-    // Invoked by the dispatcher's chosen thread (HotHandoff worker, TP worker for overflow, or
+    // Invoked by the dispatcher's chosen thread (FastScheduler worker, TP worker for overflow, or
     // TP for ThreadPoolContinuationDispatcher). Reads the awaiter's fields, clears them, applies
     // the consumer-captured EC if any, and invokes the continuation.
     private static readonly Action<object?> s_invokeWithEc = static state =>

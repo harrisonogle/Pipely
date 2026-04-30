@@ -3,9 +3,9 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 
-namespace Pipely.HotHandoff.Benchmarks;
+namespace Pipely.Benchmarks;
 
-internal sealed record LatencyStats(
+internal sealed record DispatcherLatencyStats(
     long   Count,
     double MinNs,
     double P50Ns,
@@ -32,11 +32,11 @@ internal static class DispatcherLatencyHarness
     // DispatcherThroughputBench.ProduceAndDrain's `chunk.CopyTo(memory)` pattern.
     // Use with --count 256 --size 4096 for apples-to-apples with the BDN
     // throughput row.
-    public static async Task<LatencyStats> Run(Pipely.IContinuationDispatcher? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
+    public static async Task<DispatcherLatencyStats> Run(IContinuationDispatcher? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (timestamp prefix)");
 
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
+        using var pipe = new Pipe(new PipeOptions
         {
             ContinuationDispatcher = dispatcher,
         });
@@ -100,7 +100,7 @@ internal static class DispatcherLatencyHarness
         for (int i = 0; i < span.Length; i++) meanTicks += span[i];
         meanTicks /= span.Length;
 
-        return new LatencyStats(
+        return new DispatcherLatencyStats(
             Count:  span.Length,
             MinNs:  TicksToNs(span[0],                 freq),
             P50Ns:  TicksToNs(Percentile(span, 0.50),  freq),
@@ -111,12 +111,12 @@ internal static class DispatcherLatencyHarness
             MeanNs: TicksToNs(meanTicks,               freq));
     }
 
-    public static void PrintComparison(string label, LatencyStats baseline, LatencyStats compare)
+    public static void PrintComparison(string label, DispatcherLatencyStats baseline, DispatcherLatencyStats compare)
     {
         Console.WriteLine();
         Console.WriteLine($"=== {label} ===");
-        Console.WriteLine($"| {"Stat",-8} | {"tp-default",12} | {"hot-handoff",12} |  Ratio |");
-        Console.WriteLine($"|:---------|-------------:|-------------:|-------:|");
+        Console.WriteLine($"| {"Stat",-8} | {"tp-default",12} | {"fast-scheduler",14} |  Ratio |");
+        Console.WriteLine($"|:---------|-------------:|---------------:|-------:|");
         PrintRow("Count", baseline.Count,  compare.Count);
         PrintRow("Min",   baseline.MinNs,  compare.MinNs);
         PrintRow("P50",   baseline.P50Ns,  compare.P50Ns);
@@ -131,7 +131,7 @@ internal static class DispatcherLatencyHarness
     {
         string ratio = baseline <= 0 ? "N/A" :
             string.Format(CultureInfo.InvariantCulture, "{0,6:F2}", compare / baseline);
-        Console.WriteLine($"| {label,-8} | {baseline,11:N0}  | {compare,11:N0}  | {ratio} |");
+        Console.WriteLine($"| {label,-8} | {baseline,11:N0}  | {compare,13:N0}  | {ratio} |");
     }
 
     private static long Percentile(Span<long> sorted, double p)

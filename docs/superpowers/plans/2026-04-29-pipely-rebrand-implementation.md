@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rebrand the library from `SpscPipelines` to `Pipely` — namespace, assembly, project, type, file, and folder names — while preserving public behavior. Lift the Reader to top-level public to mirror Writer (so future Pipely-specific reader extensions don't require a breaking change). Adopt the documented consumer convention in tests and the HotHandoff companion project.
+**Goal:** Rebrand the library from `SpscPipelines` to `Pipely` — namespace, assembly, project, type, file, and folder names — while preserving public behavior. Lift the Reader to top-level public to mirror Writer (so future Pipely-specific reader extensions don't require a breaking change). Adopt the documented consumer convention in tests and the FastScheduler companion project.
 
 **Architecture:** Rename refactor plus one structural change (Reader visibility). No behavior change. The brand `Pipely` is intended to act as a *qualifier*, not an imported namespace, so the BCL types `System.IO.Pipelines.PipeWriter`/`PipeReader` and the Pipely subclasses `Pipely.PipeWriter`/`PipeReader` coexist in consumer code under a single `using System.IO.Pipelines;` import. After this change, both `Pipely.PipeWriter` and `Pipely.PipeReader` are top-level public types in the `Pipely` namespace, and `Pipe.Reader` returns the concrete `Pipely.PipeReader` (parallel to `Pipe.Writer` returning the concrete `Pipely.PipeWriter`).
 
@@ -16,7 +16,7 @@ Apply in this order. Order matters: more-specific tokens first so that later sub
 
 | # | From | To | Notes |
 |---|---|---|---|
-| 1 | `SpscPipelines.HotHandoff` | `Pipely.HotHandoff` | Catches `.HotHandoff.Tests`, `.HotHandoff.Benchmarks` namespaces and folder/file paths |
+| 1 | `SpscPipelines.FastScheduler` | `Pipely` | Catches `.FastScheduler.Tests`, `.FastScheduler.Benchmarks` namespaces and folder/file paths |
 | 2 | `SpscPipelines.Tests` | `Pipely.Tests` | |
 | 3 | `SpscPipelines.Stress` | `Pipely.Stress` | |
 | 4 | `SpscPipelines.Benchmarks` | `Pipely.Benchmarks` | |
@@ -46,8 +46,8 @@ After step 5, the only remaining `Spsc*` tokens are type identifiers; steps 6–
 | `src/SpscPipelines/WriterState.cs` | `src/Pipely/WriterState.cs` (move only) |
 | `src/SpscPipelines/TripleBuffer.cs` | `src/Pipely/TripleBuffer.cs` (move only) |
 | `src/SpscPipelines/SpscPipelines.csproj` | `src/Pipely/Pipely.csproj` |
-| `src/SpscPipelines.HotHandoff/HotHandoffContinuationDispatcher.cs` | `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs` (move only) |
-| `src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj` | `src/Pipely.HotHandoff/Pipely.HotHandoff.csproj` |
+| `src/SpscPipelines.FastScheduler/FastScheduler.cs` | `src/Pipely/FastScheduler.cs` (move only) |
+| `src/SpscPipelines.FastScheduler/SpscPipelines.FastScheduler.csproj` | `src/Pipely/Pipely.csproj` |
 
 ### Test files
 
@@ -72,10 +72,10 @@ After step 5, the only remaining `Spsc*` tokens are type identifiers; steps 6–
 | `tests/SpscPipelines.Benchmarks/SpscPipeAdapter.cs` | `tests/Pipely.Benchmarks/PipeAdapter.cs` |
 | `tests/SpscPipelines.Benchmarks/*.cs` (others) | `tests/Pipely.Benchmarks/*.cs` (move only) |
 | `tests/SpscPipelines.Benchmarks/SpscPipelines.Benchmarks.csproj` | `tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj` |
-| `tests/SpscPipelines.HotHandoff.Tests/*.cs` | `tests/Pipely.HotHandoff.Tests/*.cs` (move only) |
-| `tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.csproj` | `tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj` |
-| `tests/SpscPipelines.HotHandoff.Benchmarks/*.cs` | `tests/Pipely.HotHandoff.Benchmarks/*.cs` (move only) |
-| `tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj` | `tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj` |
+| `tests/SpscPipelines.FastScheduler.Tests/*.cs` | `tests/Pipely.Tests/*.cs` (move only) |
+| `tests/SpscPipelines.FastScheduler.Tests/SpscPipelines.FastScheduler.Tests.csproj` | `tests/Pipely.Tests/Pipely.Tests.csproj` |
+| `tests/SpscPipelines.FastScheduler.Benchmarks/*.cs` | `tests/Pipely.Benchmarks/*.cs` (move only) |
+| `tests/SpscPipelines.FastScheduler.Benchmarks/SpscPipelines.FastScheduler.Benchmarks.csproj` | `tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj` |
 
 ### Solution
 
@@ -87,10 +87,10 @@ After step 5, the only remaining `Spsc*` tokens are type identifiers; steps 6–
 
 ## Consumer convention rules (for Task 8)
 
-Apply to every file outside the main `Pipely` library: `src/Pipely.HotHandoff/**`, `tests/Pipely.Tests/**`, `tests/Pipely.Stress/**`, `tests/Pipely.Benchmarks/**`, `tests/Pipely.HotHandoff.Tests/**`, `tests/Pipely.HotHandoff.Benchmarks/**`.
+Apply to every file outside the main `Pipely` library: `src/Pipely/**`, `tests/Pipely.Tests/**`, `tests/Pipely.Stress/**`, `tests/Pipely.Benchmarks/**`, `tests/Pipely.Tests/**`, `tests/Pipely.Benchmarks/**`.
 
-1. **No `using Pipely;` or `using Pipely.HotHandoff;`.** Drop these. Keep `using System.IO.Pipelines;` where present (and add it if needed).
-2. **Construction sites use `Pipely.X` qualified inline.** Always `new Pipely.Pipe(...)`, `new Pipely.PipeOptions { ... }`, `new Pipely.HotHandoff.HotHandoffContinuationDispatcher()`.
+1. **No `using Pipely;` or `using Pipely;`.** Drop these. Keep `using System.IO.Pipelines;` where present (and add it if needed).
+2. **Construction sites use `Pipely.X` qualified inline.** Always `new Pipely.Pipe(...)`, `new Pipely.PipeOptions { ... }`, `new Pipely.FastScheduler()`.
 3. **Variable / parameter / return types prefer the BCL abstract type when the extended surface isn't used.** `PipeWriter writer = pipe.Writer;` is preferred over `Pipely.PipeWriter writer = pipe.Writer;` *unless* the test exercises a Pipely-only method (e.g. `Splice`).
 4. **Always qualify Pipely-only types.** `Pipely.IContinuationDispatcher`, `Pipely.PipelyAwaiter<T>`, `Pipely.PipeOptions` (the BCL type with the same name is a different class — qualifying disambiguates).
 5. **Inside the main `Pipely` library** (`src/Pipely/**`): code is in `namespace Pipely;` already — no qualification needed for own types. Base classes that share a name with the derived class must be fully qualified (see Task 6).
@@ -141,7 +141,7 @@ Run the following from the repo root:
 files=$(find src tests -type f \( -name '*.cs' -o -name '*.csproj' \); find . -maxdepth 1 -name '*.slnx')
 
 sed -i \
-  -e 's/SpscPipelines\.HotHandoff/Pipely.HotHandoff/g' \
+  -e 's/SpscPipelines\.FastScheduler/Pipely/g' \
   -e 's/SpscPipelines\.Tests/Pipely.Tests/g' \
   -e 's/SpscPipelines\.Stress/Pipely.Stress/g' \
   -e 's/SpscPipelines\.Benchmarks/Pipely.Benchmarks/g' \
@@ -223,24 +223,24 @@ Expected: empty output. (Folders still have `Spsc*` names — Task 4 fixes that.
 
 ```bash
 git mv src/SpscPipelines/SpscPipelines.csproj                          src/SpscPipelines/Pipely.csproj
-git mv src/SpscPipelines.HotHandoff/SpscPipelines.HotHandoff.csproj    src/SpscPipelines.HotHandoff/Pipely.HotHandoff.csproj
+git mv src/SpscPipelines.FastScheduler/SpscPipelines.FastScheduler.csproj    src/SpscPipelines.FastScheduler/Pipely.csproj
 git mv tests/SpscPipelines.Tests/SpscPipelines.Tests.csproj                   tests/SpscPipelines.Tests/Pipely.Tests.csproj
 git mv tests/SpscPipelines.Stress/SpscPipelines.Stress.csproj                 tests/SpscPipelines.Stress/Pipely.Stress.csproj
 git mv tests/SpscPipelines.Benchmarks/SpscPipelines.Benchmarks.csproj         tests/SpscPipelines.Benchmarks/Pipely.Benchmarks.csproj
-git mv tests/SpscPipelines.HotHandoff.Tests/SpscPipelines.HotHandoff.Tests.csproj             tests/SpscPipelines.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj
-git mv tests/SpscPipelines.HotHandoff.Benchmarks/SpscPipelines.HotHandoff.Benchmarks.csproj   tests/SpscPipelines.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj
+git mv tests/SpscPipelines.FastScheduler.Tests/SpscPipelines.FastScheduler.Tests.csproj             tests/SpscPipelines.FastScheduler.Tests/Pipely.Tests.csproj
+git mv tests/SpscPipelines.FastScheduler.Benchmarks/SpscPipelines.FastScheduler.Benchmarks.csproj   tests/SpscPipelines.FastScheduler.Benchmarks/Pipely.Benchmarks.csproj
 ```
 
 - [ ] **Step 2: Rename folders**
 
 ```bash
 git mv src/SpscPipelines                          src/Pipely
-git mv src/SpscPipelines.HotHandoff               src/Pipely.HotHandoff
+git mv src/SpscPipelines.FastScheduler               src/Pipely
 git mv tests/SpscPipelines.Tests                  tests/Pipely.Tests
 git mv tests/SpscPipelines.Stress                 tests/Pipely.Stress
 git mv tests/SpscPipelines.Benchmarks             tests/Pipely.Benchmarks
-git mv tests/SpscPipelines.HotHandoff.Tests       tests/Pipely.HotHandoff.Tests
-git mv tests/SpscPipelines.HotHandoff.Benchmarks  tests/Pipely.HotHandoff.Benchmarks
+git mv tests/SpscPipelines.FastScheduler.Tests       tests/Pipely.Tests
+git mv tests/SpscPipelines.FastScheduler.Benchmarks  tests/Pipely.Benchmarks
 ```
 
 - [ ] **Step 3: Rename the solution file**
@@ -256,7 +256,7 @@ ls src tests
 find . -maxdepth 2 -name '*.slnx'
 ```
 
-Expected: only `Pipely`, `Pipely.HotHandoff`, `Pipely.Tests`, `Pipely.Stress`, `Pipely.Benchmarks`, `Pipely.HotHandoff.Tests`, `Pipely.HotHandoff.Benchmarks` directories; only `Pipely.slnx` at root. No `Spsc*` paths anywhere.
+Expected: only `Pipely`, `Pipely`, `Pipely.Tests`, `Pipely.Stress`, `Pipely.Benchmarks`, `Pipely.Tests`, `Pipely.Benchmarks` directories; only `Pipely.slnx` at root. No `Spsc*` paths anywhere.
 
 ```bash
 find . -path './docs' -prune -o -type f -name '*Spsc*' -print
@@ -271,7 +271,7 @@ Expected: empty output (the `-prune` skips `docs/`, which Task 11 handles).
 **Files:**
 - Read-check: `Pipely.slnx`, all 7 csprojs
 
-After Tasks 2 and 4, the `<ProjectReference>` paths and the `.slnx` `Project Path="..."` entries should already point to `src/Pipely/Pipely.csproj`, `src/Pipely.HotHandoff/Pipely.HotHandoff.csproj`, etc. — Task 2's substitution updated the path strings; Task 4 made the paths real. Verify.
+After Tasks 2 and 4, the `<ProjectReference>` paths and the `.slnx` `Project Path="..."` entries should already point to `src/Pipely/Pipely.csproj`, `src/Pipely/Pipely.csproj`, etc. — Task 2's substitution updated the path strings; Task 4 made the paths real. Verify.
 
 - [ ] **Step 1: Verify slnx contents**
 
@@ -285,14 +285,14 @@ Expected:
 <Solution>
   <Folder Name="/src/">
     <Project Path="src/Pipely/Pipely.csproj" />
-    <Project Path="src/Pipely.HotHandoff/Pipely.HotHandoff.csproj" />
+    <Project Path="src/Pipely/Pipely.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj" />
     <Project Path="tests/Pipely.Stress/Pipely.Stress.csproj" />
     <Project Path="tests/Pipely.Tests/Pipely.Tests.csproj" />
-    <Project Path="tests/Pipely.HotHandoff.Tests/Pipely.HotHandoff.Tests.csproj" />
-    <Project Path="tests/Pipely.HotHandoff.Benchmarks/Pipely.HotHandoff.Benchmarks.csproj" />
+    <Project Path="tests/Pipely.Tests/Pipely.Tests.csproj" />
+    <Project Path="tests/Pipely.Benchmarks/Pipely.Benchmarks.csproj" />
   </Folder>
 </Solution>
 ```
@@ -443,19 +443,19 @@ src/Pipely/Pipe.cs:61:    public PipeReader Reader => _readerInstance;
 
 ---
 
-## Task 8: Adopt consumer convention in HotHandoff and tests
+## Task 8: Adopt consumer convention in FastScheduler and tests
 
 **Files:**
-- Modify: `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs` (1 file)
+- Modify: `src/Pipely/FastScheduler.cs` (1 file)
 - Modify: every `.cs` file under `tests/Pipely.*/` (~22 files across 5 projects)
 
 The substitution in Task 2 has already turned `using SpscPipelines;` into `using Pipely;`. The convention says consumers must not have that line — drop it and inline-qualify Pipely-namespace references instead.
 
-- [ ] **Step 1: Remove `using Pipely;` and `using Pipely.HotHandoff;` lines**
+- [ ] **Step 1: Remove `using Pipely;` and `using Pipely;` lines**
 
 ```bash
-files=$(grep -rl '^using Pipely\b' src/Pipely.HotHandoff tests --include='*.cs' 2>/dev/null)
-sed -i -E '/^using Pipely(\.HotHandoff)?;$/d' $files
+files=$(grep -rl '^using Pipely\b' src/Pipely tests --include='*.cs' 2>/dev/null)
+sed -i -E '/^using Pipely(\.FastScheduler)?;$/d' $files
 ```
 
 Verify:
@@ -476,24 +476,24 @@ sed -i -e '/^using SpPipe = /d' -e 's/\bSpPipe\b/Pipely.Pipe/g' tests/Pipely.Ben
 
 - [ ] **Step 3: Inline-qualify Pipely-only types mechanically**
 
-For each consumer file, add `Pipely.` (or `Pipely.HotHandoff.`) qualification to symbols that exist only in Pipely's namespace:
+For each consumer file, add `Pipely.` (or `Pipely.`) qualification to symbols that exist only in Pipely's namespace:
 
 ```bash
-files=$(grep -rl 'IContinuationDispatcher\|PipelyAwaiter\|HotHandoffContinuationDispatcher' \
-  src/Pipely.HotHandoff tests --include='*.cs')
+files=$(grep -rl 'IContinuationDispatcher\|PipelyAwaiter\|FastScheduler' \
+  src/Pipely tests --include='*.cs')
 
 for f in $files; do
   sed -i \
     -e 's/\bIContinuationDispatcher\b/Pipely.IContinuationDispatcher/g' \
     -e 's/\bPipelyAwaiter\b/Pipely.PipelyAwaiter/g' \
-    -e 's/\bHotHandoffContinuationDispatcher\b/Pipely.HotHandoff.HotHandoffContinuationDispatcher/g' \
+    -e 's/\bFastScheduler\b/Pipely.FastScheduler/g' \
     "$f"
 done
 
 # Second pass: collapse any accidental Pipely.Pipely.X over-qualification
 for f in $files; do
   sed -i \
-    -e 's/Pipely\.Pipely\.HotHandoff\./Pipely.HotHandoff./g' \
+    -e 's/Pipely\.Pipely\.FastScheduler\./Pipely./g' \
     -e 's/Pipely\.Pipely\./Pipely./g' \
     "$f"
 done
@@ -505,7 +505,7 @@ This step is per-file because `Pipe`/`PipeOptions`/`PipeWriter` exist in *both* 
 
 Files to review and edit (use the file's own context to decide each call site):
 
-- `src/Pipely.HotHandoff/HotHandoffContinuationDispatcher.cs` — references Pipely-only types (e.g., `IContinuationDispatcher`); should already be qualified by Step 3.
+- `src/Pipely/FastScheduler.cs` — references Pipely-only types (e.g., `IContinuationDispatcher`); should already be qualified by Step 3.
 - `tests/Pipely.Tests/BclParityTests.cs` — has both BCL and Pipely references; the existing `new SpscPipelines.SpscPipe()` (now `new Pipely.Pipe()` after Task 2) is already correctly qualified. The `new Pipe(...)` reference at the BCL branch should remain `new Pipe(...)` (resolves via `using System.IO.Pipelines;`).
 - `tests/Pipely.Tests/BufferSegmentTests.cs` — Pipely-internal type. Reference as `Pipely.BufferSegment` if any direct usage; check.
 - `tests/Pipely.Tests/TrackingMemoryOwner.cs` — pure helper, may not need qualification.
@@ -523,8 +523,8 @@ Files to review and edit (use the file's own context to decide each call site):
 - `tests/Pipely.Benchmarks/PipeAdapter.cs` — qualified per Step 2.
 - `tests/Pipely.Benchmarks/SpliceBenchmarks.cs` — uses `Splice` extended API; writer variables typed as `Pipely.PipeWriter`.
 - `tests/Pipely.Benchmarks/Program.cs`, `LatencyHarness.cs`, `ThroughputBenchmarks.cs`, `BclPipeAdapter.cs`, `IPipeAdapter.cs` — review each.
-- `tests/Pipely.HotHandoff.Tests/HotHandoffContinuationDispatcherTests.cs` — every `new HotHandoffContinuationDispatcher()` already qualified by Step 3; remaining `Pipe`/`PipeOptions` references qualify as Pipely.
-- `tests/Pipely.HotHandoff.Benchmarks/DispatcherLatencyHarness.cs`, `DispatcherThroughputBench.cs`, `Program.cs` — same.
+- `tests/Pipely.Tests/FastSchedulerTests.cs` — every `new FastScheduler()` already qualified by Step 3; remaining `Pipe`/`PipeOptions` references qualify as Pipely.
+- `tests/Pipely.Benchmarks/DispatcherLatencyHarness.cs`, `DispatcherThroughputBench.cs`, `Program.cs` — same.
 
 Mechanical helper for spotting call sites that need attention in a file:
 
@@ -577,7 +577,7 @@ Expected: All tests pass. Total passing test count must match the baseline recor
 ```bash
 dotnet build tests/Pipely.Stress -c Release
 dotnet build tests/Pipely.Benchmarks -c Release
-dotnet build tests/Pipely.HotHandoff.Benchmarks -c Release
+dotnet build tests/Pipely.Benchmarks -c Release
 ```
 
 Expected: all build clean. Don't run them — the existing tests cover correctness.
@@ -613,7 +613,7 @@ Rename the assembly, namespace, types, files, and folders. Public
 behavior is unchanged. Lift Pipely.PipeReader to top-level public
 (was internal nested) so future Pipely-specific reader methods can
 be added without a breaking change. Adopt the consumer convention
-in tests and the HotHandoff companion project: no `using Pipely;`,
+in tests and the FastScheduler companion project: no `using Pipely;`,
 Pipely types are qualified inline, BCL abstract types are preferred
 for variables and parameters when the extended surface is not used.
 
@@ -658,7 +658,7 @@ files=$(find docs -type f -name '*.md' \
   ! -path 'docs/superpowers/plans/2026-04-29-pipely-rebrand-implementation.md')
 
 sed -i \
-  -e 's/SpscPipelines\.HotHandoff/Pipely.HotHandoff/g' \
+  -e 's/SpscPipelines\.FastScheduler/Pipely/g' \
   -e 's/SpscPipelines\.Tests/Pipely.Tests/g' \
   -e 's/SpscPipelines\.Stress/Pipely.Stress/g' \
   -e 's/SpscPipelines\.Benchmarks/Pipely.Benchmarks/g' \
@@ -754,7 +754,7 @@ Expected: two new commits — the rebrand and the doc update — on top of the p
 - `SpscPipeOptions` → `Pipely.PipeOptions` (renamed; lives in `Pipely` namespace, shadowing BCL when qualified). Confirmed by user.
 - `SpscAwaiter` → `Pipely.PipelyAwaiter`. Confirmed by user.
 - `SpscPipeReader` lifted from nested `internal sealed` to top-level `public sealed`. Confirmed by user — enables future Pipely-specific reader API additions without a breaking change.
-- `Pipely.HotHandoff` companion project renamed alongside the main library. Confirmed by user.
+- `Pipely` companion project renamed alongside the main library. Confirmed by user.
 - All five test/aux projects renamed. Confirmed by user.
 - Historical design docs in `docs/superpowers/` updated. Confirmed by user (will squash before public).
 - Tests follow the consumer convention so they double as usage examples. Confirmed by user.

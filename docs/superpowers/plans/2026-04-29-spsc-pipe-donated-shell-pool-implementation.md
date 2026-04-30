@@ -94,7 +94,7 @@ Expected: 6 projects build, 0 errors, 1 pre-existing xUnit1030 warning.
 dotnet test Pipe.slnx -c Release --nologo
 ```
 
-Expected: 134 tests passing (119 Pipe.Tests + 15 Pipely.HotHandoff.Tests). This is the baseline for Task 2's "no regressions" check.
+Expected: 134 tests passing (119 Pipe.Tests + 15 Pipely.Tests). This is the baseline for Task 2's "no regressions" check.
 
 ---
 
