@@ -12,32 +12,44 @@ public class SchedulerBenchmarks
     // Constructed once per benchmark run, reused across all iterations. This
     // matches the apples-to-apples comparison shape: BCL Pipe and Pipely with
     // PipeScheduler.ThreadPool both have zero per-iteration "scheduler" startup
-    // cost (BCL Pipe uses TP directly; Pipely-ThreadPool uses the singleton
-    // PipeScheduler.ThreadPool). The FastScheduler equivalent must also
-    // amortize its thread-startup cost across iterations rather than pay it
-    // per measurement. Per-iteration cost is now solely pipe ctor +
-    // produce-and-drain on both sides.
+    // cost (PipeScheduler.ThreadPool is a singleton). The FastScheduler
+    // equivalent must also amortize its thread-startup cost across iterations
+    // rather than pay it per measurement. Per-iteration cost is solely pipe
+    // ctor + produce-and-drain on both sides.
     private Pipely.FastScheduler? _scheduler;
 
-    [GlobalSetup(Target = nameof(Pipely_FastScheduler_ProduceAndDrain))]
+    [GlobalSetup(Target = nameof(Pipely_FastScheduler))]
     public void SetupFastScheduler() => _scheduler = new Pipely.FastScheduler();
 
-    [GlobalCleanup(Target = nameof(Pipely_FastScheduler_ProduceAndDrain))]
+    [GlobalCleanup(Target = nameof(Pipely_FastScheduler))]
     public void CleanupFastScheduler() => _scheduler?.Dispose();
 
-    // BCL System.IO.Pipelines.Pipe — TP-driven continuations, default options
-    // (64K pause / 32K resume — same thresholds as PipeOptions.Default).
+    // BCL System.IO.Pipelines.Pipe with PipeScheduler.ThreadPool (the BCL
+    // default, set explicitly for parallel framing with Pipely_ThreadPool).
     [Benchmark(Baseline = true)]
-    public async Task BclPipe_ProduceAndDrain()
+    public async Task BCL_ThreadPool()
     {
-        var pipe = new Pipe();
+        var pipe = new Pipe(new PipeOptions(
+            readerScheduler: PipeScheduler.ThreadPool,
+            writerScheduler: PipeScheduler.ThreadPool));
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
-    // Pipely with PipeScheduler.ThreadPool (the default, set explicitly here
-    // for clarity; null and PipeScheduler.ThreadPool are equivalent).
+    // BCL System.IO.Pipelines.Pipe with PipeScheduler.Inline — BCL itself
+    // exposes the same Inline option; this row characterizes the BCL pipe's
+    // own zero-thread-hop path for direct comparison with Pipely_Inline.
     [Benchmark]
-    public async Task Pipely_ThreadPool_ProduceAndDrain()
+    public async Task BCL_Inline()
+    {
+        var pipe = new Pipe(new PipeOptions(
+            readerScheduler: PipeScheduler.Inline,
+            writerScheduler: PipeScheduler.Inline));
+        await ProduceAndDrain(pipe.Reader, pipe.Writer);
+    }
+
+    // Pipely with PipeScheduler.ThreadPool.
+    [Benchmark]
+    public async Task Pipely_ThreadPool()
     {
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
@@ -47,11 +59,11 @@ public class SchedulerBenchmarks
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
-    // Pipely with PipeScheduler.Inline — continuations run synchronously on the
-    // signaling thread (the producer for the read awaiter, the reader for the
-    // flush awaiter). No thread hop on the signal path.
+    // Pipely with PipeScheduler.Inline — continuations run synchronously on
+    // the signaling thread (the producer for the read awaiter, the reader for
+    // the flush awaiter). No thread hop on the signal path.
     [Benchmark]
-    public async Task Pipely_Inline_ProduceAndDrain()
+    public async Task Pipely_Inline()
     {
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
@@ -64,7 +76,7 @@ public class SchedulerBenchmarks
     // Pipely with FastScheduler (constructed once in [GlobalSetup], reused
     // across all iterations of this benchmark).
     [Benchmark]
-    public async Task Pipely_FastScheduler_ProduceAndDrain()
+    public async Task Pipely_FastScheduler()
     {
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
