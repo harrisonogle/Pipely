@@ -40,7 +40,8 @@ public class DispatcherThroughputBench
     {
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
-            ContinuationDispatcher = null,
+            ReaderScheduler = null,
+            WriterScheduler = null,
         });
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
@@ -52,7 +53,8 @@ public class DispatcherThroughputBench
     {
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
-            ContinuationDispatcher = _scheduler,
+            ReaderScheduler = _scheduler,
+            WriterScheduler = _scheduler,
         });
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }

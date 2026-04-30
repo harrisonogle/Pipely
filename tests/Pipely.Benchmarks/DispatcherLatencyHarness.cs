@@ -38,7 +38,8 @@ internal static class DispatcherLatencyHarness
 
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
-            ContinuationDispatcher = dispatcher,
+            ReaderScheduler = dispatcher,
+            WriterScheduler = dispatcher,
         });
 
         var samples = new long[messageCount];

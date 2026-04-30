@@ -12,13 +12,26 @@ public sealed class PipeOptions
     public int  MaxFreelistSegments   { get; }
 
     /// <summary>
-    /// Routes parked-awaiter continuations to a thread of the scheduler's choosing.
-    /// When null (the default), <see cref="PipeScheduler.ThreadPool"/> is used,
-    /// which forwards to the .NET ThreadPool — observably identical to the prior
-    /// <c>RunContinuationsAsynchronously = true</c> behavior. Init-only: chosen
-    /// once at pipe construction. See the BCL <see cref="PipeScheduler"/> contract.
+    /// Routes the reader's parked <c>ReadAsync</c> continuations to a thread of
+    /// the scheduler's choosing. Used when the reader awaits an empty pipe and
+    /// the writer signals the read awaiter on a subsequent flush. When null
+    /// (the default), <see cref="PipeScheduler.ThreadPool"/> is used.
+    /// Init-only: chosen once at pipe construction. See the BCL
+    /// <see cref="PipeScheduler"/> contract. Mirrors
+    /// <see cref="System.IO.Pipelines.PipeOptions.ReaderScheduler"/>.
     /// </summary>
-    public PipeScheduler? ContinuationDispatcher { get; init; }
+    public PipeScheduler? ReaderScheduler { get; init; }
+
+    /// <summary>
+    /// Routes the writer's parked <c>FlushAsync</c> continuations to a thread of
+    /// the scheduler's choosing. Used when the writer is paused at the
+    /// pause-writer threshold and the reader advances past resume, signaling the
+    /// flush awaiter. When null (the default), <see cref="PipeScheduler.ThreadPool"/>
+    /// is used. Init-only: chosen once at pipe construction. See the BCL
+    /// <see cref="PipeScheduler"/> contract. Mirrors
+    /// <see cref="System.IO.Pipelines.PipeOptions.WriterScheduler"/>.
+    /// </summary>
+    public PipeScheduler? WriterScheduler { get; init; }
 
     public PipeOptions(
         MemoryPool<byte>? pool = null,
