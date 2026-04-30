@@ -1,8 +1,9 @@
+using System.IO.Pipelines;
 
 namespace Pipely;
 
 /// <summary>
-/// <see cref="IContinuationDispatcher"/> implementation that routes the first hop of
+/// <see cref="PipeScheduler"/> implementation that routes the first hop of
 /// each Pipe continuation to a dedicated busy-spinning thread, with ThreadPool
 /// overflow when the dedicated thread is already invoking another continuation.
 ///
@@ -23,7 +24,7 @@ namespace Pipely;
 /// full spec and four-races correctness argument.
 /// </para>
 /// </summary>
-public sealed class FastScheduler : IContinuationDispatcher, IDisposable
+public sealed class FastScheduler : PipeScheduler, IDisposable
 {
     private const int Vacant            = 0;
     private const int Busy              = 1;
@@ -51,7 +52,7 @@ public sealed class FastScheduler : IContinuationDispatcher, IDisposable
 
     /// <summary>
     /// Cumulative count of dispatches whose slot CAS lost and were forwarded to
-    /// <see cref="ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/>.
+    /// <see cref="System.Threading.ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/>.
     /// Internal — for benchmark diagnostics only.
     /// </summary>
     internal long TpOverflowedCount => Interlocked.Read(ref _tpOverflowedCount);
@@ -66,7 +67,7 @@ public sealed class FastScheduler : IContinuationDispatcher, IDisposable
         _thread.Start();
     }
 
-    public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
+    public override void Schedule(Action<object?> callback, object? state)
     {
         // Conditional claim: succeeds only when state == Vacant (no Busy, no ShutdownRequested).
         if (Interlocked.CompareExchange(ref _state, Busy, Vacant) == Vacant)
@@ -78,8 +79,11 @@ public sealed class FastScheduler : IContinuationDispatcher, IDisposable
         }
 
         // Slot busy or shutdown — fall through to TP. UnsafeQueueUserWorkItem
-        // (not QueueUserWorkItem or Task.Run) — IContinuationDispatcher contract item #2.
-        ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
+        // (not QueueUserWorkItem or Task.Run) preserves the no-EC-capture contract
+        // documented at the PipeScheduler.Schedule call site (PipelyAwaiter.cs).
+        // Fully qualified: PipeScheduler exposes a static `ThreadPool` property
+        // that would otherwise shadow `System.Threading.ThreadPool` here.
+        System.Threading.ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
         Interlocked.Increment(ref _tpOverflowedCount);        // diagnostic — see §10 / TpOverflowedCount
     }
 

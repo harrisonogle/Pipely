@@ -50,7 +50,7 @@ public sealed partial class Pipe : IDisposable
     public Pipe(PipeOptions options)
     {
         _options = options;
-        var dispatcher = options.ContinuationDispatcher ?? ThreadPoolContinuationDispatcher.Instance;
+        var dispatcher = options.ContinuationDispatcher ?? PipeScheduler.ThreadPool;
         _readAwaiter    = new PipelyAwaiter<ReadResult>(dispatcher);
         _flushAwaiter   = new PipelyAwaiter<FlushResult>(dispatcher);
         _writerInstance = new PipeWriter(this);

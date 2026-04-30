@@ -1,3 +1,4 @@
+using System.IO.Pipelines;
 using System.Threading;
 using System.Threading.Tasks.Sources;
 
@@ -8,7 +9,7 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
     // RCA = false: with source-side EC capture, every signal-path SetResult/SetException
     // invokes our registered s_dispatch INLINE on the producer thread (RCA=false ⇒ MRVTSC
     // runs the registered callback synchronously on the calling thread). s_dispatch then
-    // routes the work item through the configured IContinuationDispatcher. With RCA=true,
+    // routes the work item through the configured PipeScheduler. With RCA=true,
     // MRVTSC would queue s_dispatch to the ThreadPool itself before invoking it — adding
     // a redundant TP hop and breaking the dispatcher's thread-routing guarantee. See spec
     // §2.5. RCA=false is set once at construction; ManualResetValueTaskSourceCore<T>.Reset
@@ -40,10 +41,10 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
     private Action<object?>? _runCb;
     private object? _runState;
 
-    // The dispatcher this awaiter routes continuations through. Set once at construction;
+    // The scheduler this awaiter routes continuations through. Set once at construction;
     // immutable for the awaiter's lifetime. Stored on the awaiter so s_dispatch can reach it
     // without a back-pointer to Pipe.
-    private readonly IContinuationDispatcher _dispatcher;
+    private readonly PipeScheduler _dispatcher;
 
     public const int Inactive   = 0b00;
     public const int Pending    = 0b01;
@@ -61,7 +62,7 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
     public long _lostWakeupResolvedCount;
     public long _lostCancelResolvedCount;
 
-    public PipelyAwaiter(IContinuationDispatcher dispatcher) => _dispatcher = dispatcher;
+    public PipelyAwaiter(PipeScheduler dispatcher) => _dispatcher = dispatcher;
 
     public short Version => _core.Version;
     public T GetResult(short token) => _core.GetResult(token);
@@ -103,11 +104,11 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
     private static readonly Action<object?> s_dispatch = static state =>
     {
         var awaiter = (PipelyAwaiter<T>)state!;
-        awaiter._dispatcher.UnsafeQueueUserWorkItem(s_invokeWithEc!, awaiter);
+        awaiter._dispatcher.Schedule(s_invokeWithEc!, awaiter);
     };
 
-    // Invoked by the dispatcher's chosen thread (FastScheduler worker, TP worker for overflow, or
-    // TP for ThreadPoolContinuationDispatcher). Reads the awaiter's fields, clears them, applies
+    // Invoked by the scheduler's chosen thread (FastScheduler worker, TP worker for overflow, or
+    // TP for PipeScheduler.ThreadPool). Reads the awaiter's fields, clears them, applies
     // the consumer-captured EC if any, and invokes the continuation.
     private static readonly Action<object?> s_invokeWithEc = static state =>
     {

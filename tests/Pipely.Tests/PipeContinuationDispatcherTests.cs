@@ -1,3 +1,4 @@
+using System.IO.Pipelines;
 using System.Threading;
 using System.Threading.Tasks.Sources;
 using Xunit;
@@ -8,42 +9,42 @@ public class PipeContinuationDispatcherTests
 {
     // ---------- Helper dispatchers ----------
 
-    private sealed class RecordingDispatcher : Pipely.IContinuationDispatcher
+    private sealed class RecordingDispatcher : PipeScheduler
     {
         private readonly Action<Action<object?>>? _onDispatch;
         public RecordingDispatcher(Action<Action<object?>>? onDispatch = null) => _onDispatch = onDispatch;
 
-        public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
+        public override void Schedule(Action<object?> callback, object? state)
         {
             _onDispatch?.Invoke(callback);
             // Forward to TP so the await completes.
-            ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
+            System.Threading.ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
         }
     }
 
     /// <summary>
-    /// Forwards every dispatch directly to <see cref="ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/>.
-    /// Used when we need a "real" custom dispatcher but don't care about the thread.
+    /// Forwards every dispatch directly to <see cref="System.Threading.ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/>.
+    /// Used when we need a "real" custom scheduler but don't care about the thread.
     /// IDisposable for symmetry with the other helpers; nothing to dispose.
     /// </summary>
-    private sealed class ForwardingDispatcher : Pipely.IContinuationDispatcher, IDisposable
+    private sealed class ForwardingDispatcher : PipeScheduler, IDisposable
     {
-        public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
-            => ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
+        public override void Schedule(Action<object?> callback, object? state)
+            => System.Threading.ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
 
         public void Dispose() { }
     }
 
     /// <summary>
-    /// "Bad" dispatcher: uses <see cref="ThreadPool.QueueUserWorkItem(WaitCallback, object?)"/>, the EC-capturing
+    /// "Bad" scheduler: uses <see cref="System.Threading.ThreadPool.QueueUserWorkItem(WaitCallback, object?)"/>, the EC-capturing
     /// variant. Demonstrates that the EC contract guarantee on the consumer's continuation still holds even
-    /// if a dispatcher misbehaves and captures EC, because MRVTSC's RunInternal restores the consumer's EC
+    /// if a scheduler misbehaves and captures EC, because MRVTSC's RunInternal restores the consumer's EC
     /// regardless of which thread (or under what context) the dispatched callback runs.
     /// </summary>
-    private sealed class BadEcCapturingDispatcher : Pipely.IContinuationDispatcher
+    private sealed class BadEcCapturingDispatcher : PipeScheduler
     {
-        public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
-            => ThreadPool.QueueUserWorkItem(s => callback(s), state);
+        public override void Schedule(Action<object?> callback, object? state)
+            => System.Threading.ThreadPool.QueueUserWorkItem(s => callback(s), state);
     }
 
     /// <summary>
@@ -58,7 +59,7 @@ public class PipeContinuationDispatcherTests
     ///   doesn't kill the dispatcher thread.
     /// - Disposable: shutdown signals the worker loop to exit and joins.
     /// </summary>
-    private sealed class DedicatedThreadDispatcher : Pipely.IContinuationDispatcher, IDisposable
+    private sealed class DedicatedThreadDispatcher : PipeScheduler, IDisposable
     {
         private readonly Thread _thread;
         private readonly Action? _setupOnThread;
@@ -84,7 +85,7 @@ public class PipeContinuationDispatcherTests
             _thread.Start();
         }
 
-        public void UnsafeQueueUserWorkItem(Action<object?> callback, object? state)
+        public override void Schedule(Action<object?> callback, object? state)
         {
             // Try to enqueue into the single slot. If the slot is occupied (overflow) or we're
             // shutting down, fall back to TP so the callback still runs (contract item #4).
@@ -97,7 +98,7 @@ public class PipeContinuationDispatcherTests
                     return;
                 }
             }
-            ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
+            System.Threading.ThreadPool.UnsafeQueueUserWorkItem(callback, state, preferLocal: false);
         }
 
         private void WorkerLoop()

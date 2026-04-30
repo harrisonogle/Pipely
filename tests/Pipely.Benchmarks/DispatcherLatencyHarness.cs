@@ -32,7 +32,7 @@ internal static class DispatcherLatencyHarness
     // DispatcherThroughputBench.ProduceAndDrain's `chunk.CopyTo(memory)` pattern.
     // Use with --count 256 --size 4096 for apples-to-apples with the BDN
     // throughput row.
-    public static async Task<DispatcherLatencyStats> Run(Pipely.IContinuationDispatcher? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
+    public static async Task<DispatcherLatencyStats> Run(System.IO.Pipelines.PipeScheduler? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (timestamp prefix)");
 

@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.IO.Pipelines;
 
 namespace Pipely;
 
@@ -11,13 +12,13 @@ public sealed class PipeOptions
     public int  MaxFreelistSegments   { get; }
 
     /// <summary>
-    /// Routes parked-awaiter continuations to a thread of the dispatcher's choosing.
-    /// When null (the default), <see cref="ThreadPoolContinuationDispatcher.Instance"/> is used,
-    /// which forwards to <see cref="System.Threading.ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/>
-    /// — observably identical to the prior <c>RunContinuationsAsynchronously = true</c> behavior.
-    /// Init-only: chosen once at pipe construction. See <see cref="IContinuationDispatcher"/> for the contract.
+    /// Routes parked-awaiter continuations to a thread of the scheduler's choosing.
+    /// When null (the default), <see cref="PipeScheduler.ThreadPool"/> is used,
+    /// which forwards to the .NET ThreadPool — observably identical to the prior
+    /// <c>RunContinuationsAsynchronously = true</c> behavior. Init-only: chosen
+    /// once at pipe construction. See the BCL <see cref="PipeScheduler"/> contract.
     /// </summary>
-    public IContinuationDispatcher? ContinuationDispatcher { get; init; }
+    public PipeScheduler? ContinuationDispatcher { get; init; }
 
     public PipeOptions(
         MemoryPool<byte>? pool = null,

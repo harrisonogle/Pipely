@@ -21,7 +21,7 @@ public class FastSchedulerTests
         // First dispatch.
         using (var done = new ManualResetEventSlim(false))
         {
-            dispatcher.UnsafeQueueUserWorkItem(_ =>
+            dispatcher.Schedule(_ =>
             {
                 firstThreadId   = Environment.CurrentManagedThreadId;
                 firstThreadName = Thread.CurrentThread.Name;
@@ -34,7 +34,7 @@ public class FastSchedulerTests
         // Second dispatch — must land on the SAME dedicated thread, not a fresh one.
         using (var done = new ManualResetEventSlim(false))
         {
-            dispatcher.UnsafeQueueUserWorkItem(_ =>
+            dispatcher.Schedule(_ =>
             {
                 secondThreadId   = Environment.CurrentManagedThreadId;
                 secondThreadName = Thread.CurrentThread.Name;
@@ -60,7 +60,7 @@ public class FastSchedulerTests
         bool secondOnTpThread = false;
 
         // First dispatch: claim the slot and hold it until released.
-        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        dispatcher.Schedule(_ =>
         {
             firstStarted.Set();
             firstRelease.Wait(TimeSpan.FromSeconds(5));
@@ -70,7 +70,7 @@ public class FastSchedulerTests
             "First callback never started — slot was never claimed.");
 
         // Second dispatch: slot is occupied; should overflow to TP.
-        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        dispatcher.Schedule(_ =>
         {
             secondOnTpThread = Thread.CurrentThread.IsThreadPoolThread;
             secondDone.Set();
@@ -100,7 +100,7 @@ public class FastSchedulerTests
 
         // Submit from multiple producer threads to exercise concurrent CAS losers
         // (which fall through to TP).
-        Parallel.For(0, totalDispatches, _ => dispatcher.UnsafeQueueUserWorkItem(cb, null));
+        Parallel.For(0, totalDispatches, _ => dispatcher.Schedule(cb, null));
 
         Assert.True(allDone.Wait(TimeSpan.FromSeconds(30)),
             $"Not all callbacks ran. Got {invocationCount} of {totalDispatches}.");
@@ -108,7 +108,7 @@ public class FastSchedulerTests
     }
 
     [Fact]
-    public void Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem()
+    public void Dispatch_NeverThrowsFromSchedule()
     {
         using var dispatcher = new Pipely.FastScheduler();
         const int totalDispatches = 5_000;
@@ -120,7 +120,7 @@ public class FastSchedulerTests
         {
             try
             {
-                dispatcher.UnsafeQueueUserWorkItem(static _ => { }, null);
+                dispatcher.Schedule(static _ => { }, null);
             }
             catch
             {
@@ -138,7 +138,7 @@ public class FastSchedulerTests
         using var firstDone  = new ManualResetEventSlim(false);
 
         // First slot-path dispatch throws.
-        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        dispatcher.Schedule(_ =>
         {
             firstDone.Set();
             throw new InvalidOperationException("intentional");
@@ -157,7 +157,7 @@ public class FastSchedulerTests
         while (observedName != "Pipe FastScheduler" && Environment.TickCount64 < deadline)
         {
             using var probeDone = new ManualResetEventSlim(false);
-            dispatcher.UnsafeQueueUserWorkItem(_ =>
+            dispatcher.Schedule(_ =>
             {
                 observedName = Thread.CurrentThread.Name;
                 probeDone.Set();
@@ -184,7 +184,7 @@ public class FastSchedulerTests
             // Two threads racing: one Dispatches, the other Disposes.
             var dispatchTask = Task.Run(() =>
             {
-                dispatcher.UnsafeQueueUserWorkItem(_ =>
+                dispatcher.Schedule(_ =>
                 {
                     Interlocked.Increment(ref invocationCount);
                     done.Set();
@@ -208,7 +208,7 @@ public class FastSchedulerTests
         using var callbackRelease = new ManualResetEventSlim(false);
         int callbackCompleted = 0;
 
-        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        dispatcher.Schedule(_ =>
         {
             callbackStarted.Set();
             callbackRelease.Wait(TimeSpan.FromSeconds(5));
@@ -244,7 +244,7 @@ public class FastSchedulerTests
 
         for (int i = 0; i < total; i++)
         {
-            dispatcher.UnsafeQueueUserWorkItem(_ =>
+            dispatcher.Schedule(_ =>
             {
                 if (Thread.CurrentThread.IsThreadPoolThread)
                     Interlocked.Increment(ref onTpThread);
@@ -274,7 +274,7 @@ public class FastSchedulerTests
         using var secondDone = new ManualResetEventSlim(false);
         bool secondOnTpThread = false;
 
-        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        dispatcher.Schedule(_ =>
         {
             dispatcher.Dispose();   // T_w Dispose — must not deadlock.
             firstDone.Set();
@@ -287,7 +287,7 @@ public class FastSchedulerTests
         // (state has ShutdownRequested set, so Vacant→Busy CAS cannot succeed),
         // even though the worker thread may still be briefly alive while the
         // outer cb finishes returning to the loop.
-        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        dispatcher.Schedule(_ =>
         {
             secondOnTpThread = Thread.CurrentThread.IsThreadPoolThread;
             secondDone.Set();
@@ -389,7 +389,7 @@ public class FastSchedulerTests
 
         // Set dispatcherLocal on the worker thread by dispatching a one-shot through the slot.
         using var setupDone = new ManualResetEventSlim(false);
-        dispatcher.UnsafeQueueUserWorkItem(_ =>
+        dispatcher.Schedule(_ =>
         {
             dispatcherLocal.Value = 999;
             setupDone.Set();

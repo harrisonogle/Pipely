@@ -9,14 +9,14 @@ public class PipelyAwaiterTests
     [Fact]
     public void NewAwaiter_StateIsInactive()
     {
-        var a = new Pipely.PipelyAwaiter<int>(Pipely.ThreadPoolContinuationDispatcher.Instance);
+        var a = new Pipely.PipelyAwaiter<int>(System.IO.Pipelines.PipeScheduler.ThreadPool);
         Assert.Equal(Pipely.PipelyAwaiter<int>.Inactive, a._state);
     }
 
     [Fact]
     public void Or_CancelFlag_SetsBitAndReturnsOldValue()
     {
-        var a = new Pipely.PipelyAwaiter<int>(Pipely.ThreadPoolContinuationDispatcher.Instance);
+        var a = new Pipely.PipelyAwaiter<int>(System.IO.Pipelines.PipeScheduler.ThreadPool);
         int old = Interlocked.Or(ref a._state, Pipely.PipelyAwaiter<int>.CancelFlag);
 
         Assert.Equal(Pipely.PipelyAwaiter<int>.Inactive, old);
@@ -26,7 +26,7 @@ public class PipelyAwaiterTests
     [Fact]
     public void OwnerCanClearCancelFlagViaCAS()
     {
-        var a = new Pipely.PipelyAwaiter<int>(Pipely.ThreadPoolContinuationDispatcher.Instance);
+        var a = new Pipely.PipelyAwaiter<int>(System.IO.Pipelines.PipeScheduler.ThreadPool);
         a._state = Pipely.PipelyAwaiter<int>.CancelFlag;     // simulate canceler's Or
 
         int prior = Interlocked.CompareExchange(ref a._state, Pipely.PipelyAwaiter<int>.Inactive, Pipely.PipelyAwaiter<int>.CancelFlag);
@@ -38,7 +38,7 @@ public class PipelyAwaiterTests
     [Fact]
     public async Task ParkThenSignal_DeliversResult()
     {
-        var a = new Pipely.PipelyAwaiter<int>(Pipely.ThreadPoolContinuationDispatcher.Instance);
+        var a = new Pipely.PipelyAwaiter<int>(System.IO.Pipelines.PipeScheduler.ThreadPool);
         a._core.Reset();
 
         // Owner: CAS Inactive → Pending.
@@ -61,7 +61,7 @@ public class PipelyAwaiterTests
     [Fact]
     public async Task ParkThenCancelerSetsFlagThenSignaler_FlagPreservedAfterDelivery()
     {
-        var a = new Pipely.PipelyAwaiter<int>(Pipely.ThreadPoolContinuationDispatcher.Instance);
+        var a = new Pipely.PipelyAwaiter<int>(System.IO.Pipelines.PipeScheduler.ThreadPool);
         a._core.Reset();
 
         Interlocked.CompareExchange(ref a._state, Pipely.PipelyAwaiter<int>.Pending, Pipely.PipelyAwaiter<int>.Inactive);
@@ -87,7 +87,7 @@ public class PipelyAwaiterTests
     [Fact]
     public async Task CancelerWinsCAS_DeliversResultAndClearsFlag()
     {
-        var a = new Pipely.PipelyAwaiter<int>(Pipely.ThreadPoolContinuationDispatcher.Instance);
+        var a = new Pipely.PipelyAwaiter<int>(System.IO.Pipelines.PipeScheduler.ThreadPool);
         a._core.Reset();
 
         Interlocked.CompareExchange(ref a._state, Pipely.PipelyAwaiter<int>.Pending, Pipely.PipelyAwaiter<int>.Inactive);
@@ -110,7 +110,7 @@ public class PipelyAwaiterTests
     [Fact]
     public void StashFields_AreReadableAfterAssignment()
     {
-        var a = new Pipely.PipelyAwaiter<int>(Pipely.ThreadPoolContinuationDispatcher.Instance);
+        var a = new Pipely.PipelyAwaiter<int>(System.IO.Pipelines.PipeScheduler.ThreadPool);
         var head = new Pipely.BufferSegment();
         head.RentFrom(System.Buffers.MemoryPool<byte>.Shared, 1024, 0, this);
         var tail = new Pipely.BufferSegment();
