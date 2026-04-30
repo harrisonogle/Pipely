@@ -12,8 +12,8 @@ namespace PipelyBenchmarks;
 //   1. Rents a buffer from MemoryPool<byte>.Shared.
 //   2. Writes data to it (simulates the upstream fill we cannot avoid).
 //   3. Hands it off to the pipe.
-//        BCL Pipe / Pipe (GetSpan): GetSpan + CopyTo + Advance + Dispose source.
-//        Pipe (Splice): Splice(source) — ownership transferred; no CopyTo, no Dispose.
+//        BCL Pipe / Pipely (GetSpan): GetSpan + CopyTo + Advance + Dispose source.
+//        Pipely (Splice): Splice(source) — ownership transferred; no CopyTo, no Dispose.
 //
 // Consumer drains identically across variants. Backpressure disabled. TotalBytes is fixed
 // at 1 MiB per iteration so wall-clock is comparable across configs.
@@ -42,14 +42,14 @@ public class SpliceBenchmarks
     }
 
     [Benchmark]
-    public Task Pipe_GetSpan()
+    public Task Pipely_GetSpan()
     {
         var pipe = new Pipely.Pipe(PipelyOptions);
         return RunGetSpan(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
     }
 
     [Benchmark]
-    public Task Pipe_Splice()
+    public Task Pipely_Splice()
     {
         var pipe = new Pipely.Pipe(PipelyOptions);
         return RunSplice(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());

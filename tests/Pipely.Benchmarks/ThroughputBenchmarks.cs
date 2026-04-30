@@ -16,9 +16,9 @@ public class ThroughputBenchmarks
     }
 
     [Benchmark]
-    public async Task Pipe_ProduceAndDrain()
+    public async Task Pipely_ProduceAndDrain()
     {
-        using var adapter = new PipeAdapter();
+        using var adapter = new PipelyPipeAdapter();
         await ProduceAndDrain(adapter);
     }
 

@@ -37,7 +37,7 @@ AMD Ryzen 7 8700F 4.02GHz, 1 CPU, 16 logical and 8 physical cores
 | Method                  | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
 |-------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
 | BclPipe_ProduceAndDrain | 103.59 us | 1.164 us | 1.089 us |  1.00 | 0.1221 |   7.10 KB |        1.00 |
-| Pipe_ProduceAndDrain    |  75.14 us | 0.598 us | 0.559 us |  0.73 | 0.3662 |  10.76 KB |        1.52 |
+| Pipely_ProduceAndDrain  |  75.14 us | 0.598 us | 0.559 us |  0.73 | 0.3662 |  10.76 KB |        1.52 |
 
 (All 15 iterations retained for both. SPSC StdDev = 0.56 us = 0.74% of mean;
 BCL StdDev = 1.09 us = 1.05% of mean. Run on a quiet machine with the
@@ -84,36 +84,36 @@ latency under sustained throughput. Same hardware/build as throughput run, commi
 
 Three independent trials (1 warmup, not recorded):
 
-| Pipe | Run |  Min |  P50 |   P90 |    P99 |     P99.9 |       Max |
-|------|----:|-----:|-----:|------:|-------:|----------:|----------:|
-| BCL  |   1 |  360 |  890 | 1,440 |  6,779 |    28,659 |    35,810 |
-| BCL  |   2 |  330 |  830 | 1,550 |  7,660 |    28,390 |    31,970 |
-| BCL  |   3 |  370 |  920 | 1,630 | 15,980 |   646,481 |   647,471 |
-| Pipe |   1 |  250 |  690 | 1,020 |  3,280 |    13,550 |    35,440 |
-| Pipe |   2 |  270 |  690 | 1,010 | 26,510 |    59,749 |    85,819 |
-| Pipe |   3 |  320 |  670 |   960 | 11,540 | 5,134,950 | 5,151,340 |
+| Pipe   | Run |  Min |  P50 |   P90 |    P99 |     P99.9 |       Max |
+|--------|----:|-----:|-----:|------:|-------:|----------:|----------:|
+| BCL    |   1 |  360 |  890 | 1,440 |  6,779 |    28,659 |    35,810 |
+| BCL    |   2 |  330 |  830 | 1,550 |  7,660 |    28,390 |    31,970 |
+| BCL    |   3 |  370 |  920 | 1,630 | 15,980 |   646,481 |   647,471 |
+| Pipely |   1 |  250 |  690 | 1,020 |  3,280 |    13,550 |    35,440 |
+| Pipely |   2 |  270 |  690 | 1,010 | 26,510 |    59,749 |    85,819 |
+| Pipely |   3 |  320 |  670 |   960 | 11,540 | 5,134,950 | 5,151,340 |
 
-(All values in nanoseconds. Trial 3's Pipe P99.9/Max are dominated by a
+(All values in nanoseconds. Trial 3's Pipely P99.9/Max are dominated by a
 single multi-ms outlier — most likely a GC pause; the awaiter counters for
-that trial are clean, so it's not a pipe-internal stall. Trial 2's Pipe P99
-of 26,510 ns is a single ~26 µs spike — the next-worst sample is at the
+that trial are clean, so it's not a pipe-internal stall. Trial 2's Pipely
+P99 of 26,510 ns is a single ~26 µs spike — the next-worst sample is at the
 P99.9 mark of 59,749 ns, so a small cluster of tail samples sits above the
 P99 line for that trial only.)
 
 ### Verdict
 
 - **Min** is essentially tied (~250-390 ns for both) — both pipes hit the same noise floor on the
-  fastest path; Pipe trends slightly lower (250-320 vs 330-370).
-- **P50:** Pipe ~670-690 ns vs BCL ~830-920 ns → **~1.2-1.4× lower median**, consistently across
+  fastest path; Pipely trends slightly lower (250-320 vs 330-370).
+- **P50:** Pipely ~670-690 ns vs BCL ~830-920 ns → **~1.2-1.4× lower median**, consistently across
   all three trials. Smaller margin than earlier baselines (which saw ~3.4×) because BCL's median
-  is faster on this run, but the gap is in Pipe's favor in every trial.
-- **P90:** Pipe ~960-1,020 ns vs BCL ~1,440-1,630 ns → **~1.4-1.7× lower**, again consistent
+  is faster on this run, but the gap is in Pipely's favor in every trial.
+- **P90:** Pipely ~960-1,020 ns vs BCL ~1,440-1,630 ns → **~1.4-1.7× lower**, again consistent
   across all trials.
-- **P99:** Pipe ~3.3-26.5 µs vs BCL ~6.8-16.0 µs → Pipe wins trials 1 (3.3 vs 6.8) and 3
+- **P99:** Pipely ~3.3-26.5 µs vs BCL ~6.8-16.0 µs → Pipely wins trials 1 (3.3 vs 6.8) and 3
   (11.5 vs 16.0) but **loses trial 2** (26.5 vs 7.7) due to a single tail cluster. The
   P99 is the percentile most sensitive to small numbers of stalls — a one-trial regression
   there is a real signal worth investigating but doesn't change the 2/3 directional win.
-- **P99.9 / Max:** Tail is dominated by OS scheduling jitter and GC. Pipe's trial 3 produced a
+- **P99.9 / Max:** Tail is dominated by OS scheduling jitter and GC. Pipely's trial 3 produced a
   single multi-millisecond outlier; BCL's trial 3 saw a ~650 µs outlier. Trials 1 and 2 are
   cleanly bounded under 90 µs for both pipes. Lock-free vs locked doesn't change worst-case
   runtime behavior — neither pipe wins the tail consistently.
@@ -141,8 +141,8 @@ P99 line for that trial only.)
 
 **Compared:**
 
-- **Latency** (custom harness, P50/P90/P99 by sort): `tp-default` (Pipe with `ContinuationDispatcher = null`, i.e., `ThreadPoolContinuationDispatcher.Instance`) vs `fast-scheduler` (Pipe with `FastScheduler`).
-- **Throughput** (BenchmarkDotNet, 1 MiB / 4 KiB chunks): three-way head-to-head — `BclPipe` (BCL `System.IO.Pipelines.Pipe`, baseline), `Pipe_TpDefault`, `Pipe_FastScheduler` — all in the same BDN process invocation so their numbers are directly comparable.
+- **Latency** (custom harness, P50/P90/P99 by sort): `tp-default` (Pipely with `ContinuationDispatcher = null`, i.e., `ThreadPoolContinuationDispatcher.Instance`) vs `fast-scheduler` (Pipely with `FastScheduler`).
+- **Throughput** (BenchmarkDotNet, 1 MiB / 4 KiB chunks): three-way head-to-head — `BclPipe` (BCL `System.IO.Pipelines.Pipe`, baseline), `Pipely_TpDefault`, `Pipely_FastScheduler` — all in the same BDN process invocation so their numbers are directly comparable.
 
 **Spec reference:** `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md` §8.
 
@@ -167,7 +167,7 @@ measurement that drove it.
 - Hardware/build details captured at the top of each results section.
 - The FastScheduler worker thread sits at ~100% on its core during the busy-spin
   loop. Latency and throughput wins must be read against this CPU cost.
-- **Scheduler amortization:** `Pipe_FastScheduler_ProduceAndDrain` constructs the scheduler once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring `BclPipe`'s no-extra-state baseline and `Pipe_TpDefault`'s singleton-dispatcher baseline). Per-iteration cost for all three rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one scheduler per recorded trial, not per message).
+- **Scheduler amortization:** `Pipely_FastScheduler_ProduceAndDrain` constructs the scheduler once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring `BclPipe`'s no-extra-state baseline and `Pipely_TpDefault`'s singleton-dispatcher baseline). Per-iteration cost for all three rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one scheduler per recorded trial, not per message).
 
 ## Starting tunables
 
@@ -194,13 +194,13 @@ the prior baseline.
 | Method                                | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
 |---------------------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
 | `BclPipe_ProduceAndDrain`             | 105.09 us | 0.834 us | 0.780 us | 1.00  | 0.1221 |   7.03 KB |        1.00 |
-| `Pipe_TpDefault_ProduceAndDrain`      |  70.34 us | 0.242 us | 0.215 us | 0.67  | 0.2441 |  11.03 KB |        1.57 |
-| `Pipe_FastScheduler_ProduceAndDrain`  |  50.45 us | 0.185 us | 0.173 us | 0.48  | 0.2441 |   9.21 KB |        1.31 |
+| `Pipely_TpDefault_ProduceAndDrain`      |  70.34 us | 0.242 us | 0.215 us | 0.67  | 0.2441 |  11.03 KB |        1.57 |
+| `Pipely_FastScheduler_ProduceAndDrain`  |  50.45 us | 0.185 us | 0.173 us | 0.48  | 0.2441 |   9.21 KB |        1.31 |
 
 Reading:
-- `Pipe_TpDefault` is **1.50×** faster than BCL — consistent with the prior `BclPipe vs Pipe` characterization above.
-- `Pipe_FastScheduler` is **1.39×** faster than `Pipe_TpDefault` (50.45 / 70.34) and **2.08×** faster than BCL.
-- `Pipe_FastScheduler` allocates **0.84×** the bytes of `Pipe_TpDefault` (9.21 / 11.03 KB) — the worker-thread invocation path doesn't allocate the per-event TP work-item objects.
+- `Pipely_TpDefault` is **1.50×** faster than BCL — consistent with the prior `BclPipe vs Pipely` characterization above.
+- `Pipely_FastScheduler` is **1.39×** faster than `Pipely_TpDefault` (50.45 / 70.34) and **2.08×** faster than BCL.
+- `Pipely_FastScheduler` allocates **0.84×** the bytes of `Pipely_TpDefault` (9.21 / 11.03 KB) — the worker-thread invocation path doesn't allocate the per-event TP work-item objects.
 
 ### Latency (ns) — 1 M messages × 256 B, 5 warmup + 10 recorded trials
 
@@ -224,7 +224,7 @@ Aggregate across the 10 recorded trials (each trial sorts 1 M samples and reads 
 
 The two measurements characterize the same scheduler under two different kinds of workload, and the contrast is the design's central finding.
 
-**Throughput workload — FastScheduler wins decisively.** 1.39× over `Pipe_TpDefault`, 2.08× over BCL, with lower allocations. The 4 KiB-chunk workload's backpressure cycles produce idle windows long enough (>10 µs) for TP workers to exit their spin and actually sleep on the kernel semaphore. Each resume then pays a TP wake-gap on the order of multiple µs. FastScheduler's continuously-hot worker thread skips the kernel wake entirely. This is the workload pattern the scheduler was designed for: streams where TP queues empty long enough that TP workers park between events.
+**Throughput workload — FastScheduler wins decisively.** 1.39× over `Pipely_TpDefault`, 2.08× over BCL, with lower allocations. The 4 KiB-chunk workload's backpressure cycles produce idle windows long enough (>10 µs) for TP workers to exit their spin and actually sleep on the kernel semaphore. Each resume then pays a TP wake-gap on the order of multiple µs. FastScheduler's continuously-hot worker thread skips the kernel wake entirely. This is the workload pattern the scheduler was designed for: streams where TP queues empty long enough that TP workers park between events.
 
 **Latency workload — FastScheduler is comparable-to-slightly-worse.** P50 median 1.16× (worse), Mean median 1.19× (worse), tails (P99) effectively unchanged. The 256 B / 1 M-message workload sustains MHz event rates; idle windows between events are sub-µs, well inside TP's spin-then-sleep threshold. TP workers never actually park, so there is no kernel-wake cost for FastScheduler to escape. The scheduler's per-event overhead (worker-thread `Interlocked` operations on the same cache line touched by the producer's signal path; cache contention without CPU pinning) shows up in the per-message latency without the wake-gap savings to offset it.
 

@@ -11,10 +11,10 @@ internal sealed record AwaiterCounters(
     long LostCancelResolvedCount
 );
 
-internal sealed class PipeAdapter : IPipeAdapter
+internal sealed class PipelyPipeAdapter : IPipeAdapter
 {
     private readonly Pipely.Pipe _pipe;
-    public PipeAdapter(Pipely.PipeOptions? options = null) => _pipe = new Pipely.Pipe(options ?? Pipely.PipeOptions.Default);
+    public PipelyPipeAdapter(Pipely.PipeOptions? options = null) => _pipe = new Pipely.Pipe(options ?? Pipely.PipeOptions.Default);
     public PipeReader Reader => _pipe.Reader;
     public PipeWriter Writer => _pipe.Writer;
     public void Dispose() => _pipe.Dispose();

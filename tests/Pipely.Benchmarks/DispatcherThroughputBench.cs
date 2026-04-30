@@ -10,19 +10,19 @@ public class DispatcherThroughputBench
     private const int ChunkSize  = 4096;
 
     // Constructed once per benchmark run, reused across all iterations. This
-    // matches the apples-to-apples comparison shape: BCL Pipe and Pipe's
+    // matches the apples-to-apples comparison shape: BCL Pipe and Pipely's
     // default TP dispatcher both have zero per-iteration "dispatcher" startup
-    // cost (the BCL pipe uses TP directly; Pipe-TP uses the singleton
+    // cost (BCL Pipe uses TP directly; Pipely-TP uses the singleton
     // ThreadPoolContinuationDispatcher.Instance). The FastScheduler equivalent
     // must also amortize its thread-startup cost across iterations rather
     // than pay it per measurement. Per-iteration cost is now solely
     // pipe ctor + produce-and-drain on both sides.
     private Pipely.FastScheduler? _scheduler;
 
-    [GlobalSetup(Target = nameof(Pipe_FastScheduler_ProduceAndDrain))]
+    [GlobalSetup(Target = nameof(Pipely_FastScheduler_ProduceAndDrain))]
     public void SetupFastScheduler() => _scheduler = new Pipely.FastScheduler();
 
-    [GlobalCleanup(Target = nameof(Pipe_FastScheduler_ProduceAndDrain))]
+    [GlobalCleanup(Target = nameof(Pipely_FastScheduler_ProduceAndDrain))]
     public void CleanupFastScheduler() => _scheduler?.Dispose();
 
     // BCL System.IO.Pipelines.Pipe — TP-driven continuations, default options
@@ -34,9 +34,9 @@ public class DispatcherThroughputBench
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
-    // Pipe with the default ThreadPoolContinuationDispatcher (no override).
+    // Pipely with the default ThreadPoolContinuationDispatcher (no override).
     [Benchmark]
-    public async Task Pipe_TpDefault_ProduceAndDrain()
+    public async Task Pipely_TpDefault_ProduceAndDrain()
     {
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
@@ -45,10 +45,10 @@ public class DispatcherThroughputBench
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
-    // Pipe with FastScheduler (constructed once in [GlobalSetup], reused
+    // Pipely with FastScheduler (constructed once in [GlobalSetup], reused
     // across all iterations of this benchmark).
     [Benchmark]
-    public async Task Pipe_FastScheduler_ProduceAndDrain()
+    public async Task Pipely_FastScheduler_ProduceAndDrain()
     {
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
