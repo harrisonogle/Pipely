@@ -1,10 +1,23 @@
 # Benchmark Results
 
-**Date:** 2026-04-26
+**Date:** 2026-04-30
 **Hardware:** AMD Ryzen 7 8700F 8-Core Processor (16 logical / 8 physical cores, base 4.02 GHz, boost 5.06 GHz), 30 GiB RAM
 **OS:** Linux Ubuntu 24.04.4 LTS (Noble Numbat), kernel 6.17.0-22-generic
 **Build:** Release, .NET SDK 10.0.107 / Runtime .NET 10.0.7, RyuJIT x86-64-v4, Concurrent Server GC
-**Commit:** `51aa01385c6ab92d3b5345fd9c4fd6033beb1050`
+**Commit:** `b0c312b` (Post-rename namespace cleanup)
+
+> **Note on prior numbers.** Earlier revisions of this section were recorded
+> when the test/bench/stress projects lived under `Pipely.*` namespaces.
+> Because both `Pipely` and `System.IO.Pipelines` expose identically-named
+> types (`Pipe`, `PipeReader`, `PipeWriter`, `PipeOptions`), unqualified `Pipe`
+> inside a `Pipely.Benchmarks` file resolved to `Pipely.Pipe`, not the BCL
+> type — the "BCL" baseline was silently measuring Pipely vs Pipely. Commit
+> `b0c312b` moved the test projects to top-level `PipelyBenchmarks` /
+> `PipelyTests` / `PipelyStress` namespaces (assembly names preserved),
+> restoring genuine BCL-vs-Pipely comparison. The numbers below were
+> taken after that fix on a quiet machine with each BDN class invoked
+> in isolation (`--filter '*<ClassName>*'`), so they should be directly
+> comparable to the FastScheduler "Run 1" baseline below.
 
 ## Throughput
 
@@ -21,30 +34,32 @@ AMD Ryzen 7 8700F 4.02GHz, 1 CPU, 16 logical and 8 physical cores
   DefaultJob : .NET 10.0.7 (10.0.7, 10.0.726.21808), X64 RyuJIT x86-64-v4
 ```
 
-| Method                   | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
-|------------------------- |----------:|---------:|---------:|------:|-------:|----------:|------------:|
-| BclPipe_ProduceAndDrain  | 110.34 us | 0.728 us | 0.681 us |  1.00 |      - |   6.87 KB |        1.00 |
-| Pipe_ProduceAndDrain |  73.69 us | 0.263 us | 0.220 us |  0.67 | 0.1221 |   8.44 KB |        1.23 |
+| Method                  | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
+|-------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
+| BclPipe_ProduceAndDrain | 103.59 us | 1.164 us | 1.089 us |  1.00 | 0.1221 |   7.10 KB |        1.00 |
+| Pipe_ProduceAndDrain    |  75.14 us | 0.598 us | 0.559 us |  0.73 | 0.3662 |  10.76 KB |        1.52 |
 
-(Two SPSC outliers at 74.50 us and 75.00 us were trimmed by BDN; the 13 retained iterations are
-tightly clustered, StdDev = 0.22 us = 0.30% of mean.)
+(All 15 iterations retained for both. SPSC StdDev = 0.56 us = 0.74% of mean;
+BCL StdDev = 1.09 us = 1.05% of mean. Run on a quiet machine with the
+benchmark class invoked in isolation: `dotnet run -c Release -- --filter
+'*ThroughputBenchmarks*'`.)
 
 ## Verdict
 
-- **BCL throughput:** 1 MiB / 110.34 us ≈ **9.50 GB/s** (1 GB = 10^9 B).
-- **SPSC throughput:** 1 MiB / 73.69 us ≈ **14.23 GB/s**.
-- **Speedup (BCL mean / SPSC mean):** ~1.50x — i.e. SPSC takes 67% of the time BCL does for the
-  same single-producer / single-consumer 1 MiB transfer. Both runs are extremely stable
-  (BCL 0.62% StdDev, SPSC 0.30% StdDev) so the gap is real and well outside measurement noise.
-- **Allocations per op:** SPSC **8.44 KB** vs BCL **6.87 KB** (1.23x). SPSC also reports
-  Gen0 = 0.1221 collections / 1000 ops, while BCL shows none.
+- **BCL throughput:** 1 MiB / 103.59 us ≈ **10.12 GB/s** (1 GB = 10^9 B).
+- **SPSC throughput:** 1 MiB / 75.14 us ≈ **13.95 GB/s**.
+- **Speedup (BCL mean / SPSC mean):** ~1.38x — i.e. SPSC takes 73% of the time BCL does for the
+  same single-producer / single-consumer 1 MiB transfer. SPSC StdDev 0.74%; BCL StdDev 1.05% —
+  both well inside noise tolerances and the 28 us gap is real.
+- **Allocations per op:** SPSC **10.76 KB** vs BCL **7.10 KB** (1.52x). Both pipes report Gen0
+  collections (BCL 0.12, SPSC 0.37 collections / 1000 ops) at this allocation rate.
 
 The spec target was throughput "materially higher than BCL's `Pipe`" on the single-producer /
-single-consumer hot path. A 1.50x speedup at this chunk size meets that bar.
+single-consumer hot path. A 1.38x speedup at this chunk size meets that bar.
 
 ### Notes / caveats
 
-- **Higher allocations.** SPSC's per-op allocation is ~1.6 KB above BCL. This benchmark constructs
+- **Higher allocations.** SPSC's per-op allocation is ~3.7 KB above BCL. This benchmark constructs
   a fresh pipe (and therefore new TripleBuffer slots and ReaderState/WriterState graphs) every
   iteration, plus the producer Task / consumer Task / FlushAsync awaitables, so the gap is partly
   an artifact of one-shot construction rather than steady-state per-byte allocation. Confirming
@@ -65,32 +80,43 @@ single-consumer hot path. A 1.50x speedup at this chunk size meets that bar.
 `Stopwatch.GetTimestamp()` value. Consumer reads each message and records `(now - timestamp)` into
 a flat 100K-element `long[]`. After both sides finish, the array is sorted and exact percentiles
 are read by index (nearest-rank). No artificial pacing — measures producer→consumer hand-off
-latency under sustained throughput. Same hardware/build as throughput run, commit `81cd302`.
+latency under sustained throughput. Same hardware/build as throughput run, commit `b0c312b`.
 
-Three independent runs:
+Three independent trials (1 warmup, not recorded):
 
-| Pipe     | Run | Min  | P50    | P90    | P99      | P99.9    | Max      | Mean    |
-|----------|----:|-----:|-------:|-------:|---------:|---------:|---------:|--------:|
-| BCL      |   1 | 210ns| 2,230ns| 4,950ns| 156,267ns| 6,209,599ns| 6,212,910ns| 21,898ns|
-| BCL      |   2 | 220ns| 2,350ns| 6,590ns|  28,079ns| 5,848,336ns| 5,850,656ns| 19,091ns|
-| BCL      |   3 | 230ns| 2,390ns| 5,880ns|  33,260ns| 5,094,158ns| 5,098,688ns| 15,938ns|
-| Pipe |   1 | 250ns|   680ns| 1,230ns|  14,400ns| 3,840,958ns| 3,850,797ns| 11,923ns|
-| Pipe |   2 | 210ns|   570ns|   940ns|   4,370ns| 3,476,284ns| 3,486,363ns| 10,646ns|
-| Pipe |   3 | 230ns|   680ns| 1,190ns|   9,080ns| 3,623,882ns| 3,633,742ns| 11,265ns|
+| Pipe | Run |  Min |  P50 |   P90 |    P99 |     P99.9 |       Max |
+|------|----:|-----:|-----:|------:|-------:|----------:|----------:|
+| BCL  |   1 |  360 |  890 | 1,440 |  6,779 |    28,659 |    35,810 |
+| BCL  |   2 |  330 |  830 | 1,550 |  7,660 |    28,390 |    31,970 |
+| BCL  |   3 |  370 |  920 | 1,630 | 15,980 |   646,481 |   647,471 |
+| Pipe |   1 |  250 |  690 | 1,020 |  3,280 |    13,550 |    35,440 |
+| Pipe |   2 |  270 |  690 | 1,010 | 26,510 |    59,749 |    85,819 |
+| Pipe |   3 |  320 |  670 |   960 | 11,540 | 5,134,950 | 5,151,340 |
+
+(All values in nanoseconds. Trial 3's Pipe P99.9/Max are dominated by a
+single multi-ms outlier — most likely a GC pause; the awaiter counters for
+that trial are clean, so it's not a pipe-internal stall. Trial 2's Pipe P99
+of 26,510 ns is a single ~26 µs spike — the next-worst sample is at the
+P99.9 mark of 59,749 ns, so a small cluster of tail samples sits above the
+P99 line for that trial only.)
 
 ### Verdict
 
-- **Min** is essentially tied (~200-250 ns for both) — both pipes hit the same noise floor on the
-  fastest path.
-- **P50:** Pipe ~600-700 ns vs BCL ~2.2-2.4 µs → **~3.4× lower median**.
-- **P90:** Pipe ~0.9-1.2 µs vs BCL ~5-6.5 µs → **~4-6× lower**.
-- **P99:** Pipe ~4-14 µs vs BCL ~28-156 µs → **~3-11× lower**, with BCL's P99 noticeably more
-  variable run-to-run. This is the most striking gap and was completely hidden by the prior
-  power-of-2 histogram (both reported the same 16,384 ns bucket label).
-- **P99.9 / Max:** Both ~3-6 ms. The tail is dominated by OS scheduling jitter and GC, not by pipe
-  internals; lock-free vs locked doesn't change worst-case runtime behavior. Expected.
-- **Mean:** Pipe ~10-12 µs vs BCL ~16-22 µs → ~1.5-1.8× lower mean. The mean is dragged up
-  for both by the millisecond-scale outliers, so percentile views are more informative.
+- **Min** is essentially tied (~250-390 ns for both) — both pipes hit the same noise floor on the
+  fastest path; Pipe trends slightly lower (250-320 vs 330-370).
+- **P50:** Pipe ~670-690 ns vs BCL ~830-920 ns → **~1.2-1.4× lower median**, consistently across
+  all three trials. Smaller margin than earlier baselines (which saw ~3.4×) because BCL's median
+  is faster on this run, but the gap is in Pipe's favor in every trial.
+- **P90:** Pipe ~960-1,020 ns vs BCL ~1,440-1,630 ns → **~1.4-1.7× lower**, again consistent
+  across all trials.
+- **P99:** Pipe ~3.3-26.5 µs vs BCL ~6.8-16.0 µs → Pipe wins trials 1 (3.3 vs 6.8) and 3
+  (11.5 vs 16.0) but **loses trial 2** (26.5 vs 7.7) due to a single tail cluster. The
+  P99 is the percentile most sensitive to small numbers of stalls — a one-trial regression
+  there is a real signal worth investigating but doesn't change the 2/3 directional win.
+- **P99.9 / Max:** Tail is dominated by OS scheduling jitter and GC. Pipe's trial 3 produced a
+  single multi-millisecond outlier; BCL's trial 3 saw a ~650 µs outlier. Trials 1 and 2 are
+  cleanly bounded under 90 µs for both pipes. Lock-free vs locked doesn't change worst-case
+  runtime behavior — neither pipe wins the tail consistently.
 
 ### Notes / caveats
 
