@@ -1,7 +1,7 @@
 using System.IO.Pipelines;
 using BenchmarkDotNet.Attributes;
 
-namespace Pipely.Benchmarks;
+namespace PipelyBenchmarks;
 
 [MemoryDiagnoser]
 public class DispatcherThroughputBench

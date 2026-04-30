@@ -2,7 +2,7 @@ using System.Buffers;
 using System.IO.Pipelines;
 using Xunit;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public enum PipeKind { Bcl, Pipely }
 

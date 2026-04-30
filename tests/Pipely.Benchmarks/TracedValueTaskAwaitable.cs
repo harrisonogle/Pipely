@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 
-namespace Pipely.Benchmarks;
+namespace PipelyBenchmarks;
 
 // Wraps a ValueTask<T> so we can measure the time from "continuation scheduled"
 // (OnCompleted invoked) to "continuation actually resumed" — the runtime's wake-gap

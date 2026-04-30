@@ -1,6 +1,6 @@
 using BenchmarkDotNet.Attributes;
 
-namespace Pipely.Benchmarks;
+namespace PipelyBenchmarks;
 
 [MemoryDiagnoser]
 public class ThroughputBenchmarks

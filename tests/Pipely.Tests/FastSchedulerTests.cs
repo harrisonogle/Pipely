@@ -3,7 +3,7 @@ using System.Diagnostics;
 using System.IO.Pipelines;
 using System.Runtime.InteropServices;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public class FastSchedulerTests
 {
@@ -12,7 +12,7 @@ public class FastSchedulerTests
     [Fact]
     public void Dispatch_InvokesCallbackOnDedicatedThread()
     {
-        using var dispatcher = new FastScheduler();
+        using var dispatcher = new Pipely.FastScheduler();
         int? firstThreadId    = null;
         int? secondThreadId   = null;
         string? firstThreadName  = null;
@@ -53,7 +53,7 @@ public class FastSchedulerTests
     [Fact]
     public void Dispatch_OverflowFallsBackToThreadPool()
     {
-        using var dispatcher = new FastScheduler();
+        using var dispatcher = new Pipely.FastScheduler();
         using var firstStarted = new ManualResetEventSlim(false);
         using var firstRelease = new ManualResetEventSlim(false);
         using var secondDone   = new ManualResetEventSlim(false);
@@ -87,7 +87,7 @@ public class FastSchedulerTests
     [Fact]
     public void Dispatch_InvokesEachCallbackExactlyOnce()
     {
-        using var dispatcher = new FastScheduler();
+        using var dispatcher = new Pipely.FastScheduler();
         const int totalDispatches = 10_000;
         int invocationCount = 0;
         var allDone = new CountdownEvent(totalDispatches);
@@ -110,7 +110,7 @@ public class FastSchedulerTests
     [Fact]
     public void Dispatch_NeverThrowsFromUnsafeQueueUserWorkItem()
     {
-        using var dispatcher = new FastScheduler();
+        using var dispatcher = new Pipely.FastScheduler();
         const int totalDispatches = 5_000;
         int dispatchExceptions = 0;
 
@@ -134,7 +134,7 @@ public class FastSchedulerTests
     [Fact]
     public void ThrowingCallback_DoesNotKillDispatcherThread()
     {
-        using var dispatcher = new FastScheduler();
+        using var dispatcher = new Pipely.FastScheduler();
         using var firstDone  = new ManualResetEventSlim(false);
 
         // First slot-path dispatch throws.
@@ -177,7 +177,7 @@ public class FastSchedulerTests
 
         for (int trial = 0; trial < trials; trial++)
         {
-            var dispatcher = new FastScheduler();
+            var dispatcher = new Pipely.FastScheduler();
             int invocationCount = 0;
             using var done = new ManualResetEventSlim(false);
 
@@ -203,7 +203,7 @@ public class FastSchedulerTests
     [Fact]
     public async Task Dispose_BlocksUntilInFlightCallbackCompletes()
     {
-        var dispatcher = new FastScheduler();
+        var dispatcher = new Pipely.FastScheduler();
         using var callbackStarted = new ManualResetEventSlim(false);
         using var callbackRelease = new ManualResetEventSlim(false);
         int callbackCompleted = 0;
@@ -234,7 +234,7 @@ public class FastSchedulerTests
     [Fact]
     public void Dispatch_AfterDispose_AlwaysRunsOnThreadPool()
     {
-        var dispatcher = new FastScheduler();
+        var dispatcher = new Pipely.FastScheduler();
         dispatcher.Dispose();
 
         const int total = 100;
@@ -269,7 +269,7 @@ public class FastSchedulerTests
         // (thread waiting for itself to exit). With the escape, Dispose returns
         // immediately; the worker thread terminates naturally once the cb
         // returns to the loop.
-        var dispatcher = new FastScheduler();
+        var dispatcher = new Pipely.FastScheduler();
         using var firstDone  = new ManualResetEventSlim(false);
         using var secondDone = new ManualResetEventSlim(false);
         bool secondOnTpThread = false;
@@ -302,11 +302,11 @@ public class FastSchedulerTests
     [Fact]
     public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
     {
-        using var dispatcher = new FastScheduler();
-        using var pipeA = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
-        using var pipeB = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new Pipely.FastScheduler();
+        using var pipeA = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipeB = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
-        static async Task Roundtrip(Pipe pipe, int payloadBytes)
+        static async Task Roundtrip(Pipely.Pipe pipe, int payloadBytes)
         {
             var readTask = pipe.Reader.ReadAsync().AsTask();
             await Task.Run(async () =>
@@ -331,8 +331,8 @@ public class FastSchedulerTests
     [Fact]
     public async Task Pipe_WithFastScheduler_BasicReadFlush_RoundTrip()
     {
-        using var dispatcher = new FastScheduler();
-        using var pipe = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new Pipely.FastScheduler();
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         var readTask = pipe.Reader.ReadAsync().AsTask();
         Assert.False(readTask.IsCompleted, "Reader should park on the empty pipe.");
@@ -354,8 +354,8 @@ public class FastSchedulerTests
     public async Task Pipe_WithFastScheduler_AsyncLocalFlowsToContinuation()
     {
         var asyncLocal = new AsyncLocal<int>();
-        using var dispatcher = new FastScheduler();
-        using var pipe = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new Pipely.FastScheduler();
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         asyncLocal.Value = 42;
 
@@ -385,7 +385,7 @@ public class FastSchedulerTests
         var consumerLocal   = new AsyncLocal<int>();
         var dispatcherLocal = new AsyncLocal<int>();
 
-        using var dispatcher = new FastScheduler();
+        using var dispatcher = new Pipely.FastScheduler();
 
         // Set dispatcherLocal on the worker thread by dispatching a one-shot through the slot.
         using var setupDone = new ManualResetEventSlim(false);
@@ -396,7 +396,7 @@ public class FastSchedulerTests
         }, null);
         Assert.True(setupDone.Wait(TimeSpan.FromSeconds(5)));
 
-        using var pipe = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         consumerLocal.Value = 42;
 
@@ -423,8 +423,8 @@ public class FastSchedulerTests
     [Fact]
     public async Task Pipe_WithFastScheduler_RapidParkResumeCycles_NoVersionMismatch()
     {
-        using var dispatcher = new FastScheduler();
-        using var pipe = new Pipe(new PipeOptions { ContinuationDispatcher = dispatcher });
+        using var dispatcher = new Pipely.FastScheduler();
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ContinuationDispatcher = dispatcher });
 
         const int totalCycles  = 1000;
         const int messageBytes = 8;
@@ -493,7 +493,7 @@ public class FastSchedulerTests
     [Fact]
     public async Task Pipe_WithFastScheduler_RepeatedIteration_PerMessageConsumer_DoesNotHang()
     {
-        using var dispatcher = new FastScheduler();
+        using var dispatcher = new Pipely.FastScheduler();
         const int iterations   = 30;            // BDN's WorkloadJitting hung at op 16; 30 gives margin.
         const int messageCount = 1_000_000;     // Same as the BDN temp workload (commit c1ba6b9).
         const int chunkSize    = 256;           // Same as the BDN temp workload.
@@ -502,7 +502,7 @@ public class FastSchedulerTests
         {
             for (int iter = 0; iter < iterations; iter++)
             {
-                using var pipe = new Pipe(new PipeOptions
+                using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
                 {
                     ContinuationDispatcher = dispatcher,
                 });

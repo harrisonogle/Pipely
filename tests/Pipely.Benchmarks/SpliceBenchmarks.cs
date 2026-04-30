@@ -2,7 +2,7 @@ using System.Buffers;
 using System.IO.Pipelines;
 using BenchmarkDotNet.Attributes;
 
-namespace Pipely.Benchmarks;
+namespace PipelyBenchmarks;
 
 // Benchmarks PipeWriter.Splice against GetSpan+Advance under the realistic scenario
 // Splice was designed for: an upstream component (network RX, parser, reorder buffer, etc.)

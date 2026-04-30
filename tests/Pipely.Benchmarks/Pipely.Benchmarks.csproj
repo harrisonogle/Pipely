@@ -10,6 +10,8 @@
   </ItemGroup>
 
   <PropertyGroup>
+    <AssemblyName>Pipely.Benchmarks</AssemblyName>
+    <RootNamespace>PipelyBenchmarks</RootNamespace>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>

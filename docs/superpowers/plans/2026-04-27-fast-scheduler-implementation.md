@@ -144,7 +144,7 @@ Write `tests/Pipely.Tests/FastSchedulerTests.cs`:
 ```csharp
 using Pipely;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public class FastSchedulerTests
 {
@@ -1364,7 +1364,7 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using Pipely;
 
-namespace Pipely.Benchmarks;
+namespace PipelyBenchmarks;
 
 internal sealed record LatencyStats(
     long Count,
@@ -1529,7 +1529,7 @@ Write `tests/Pipely.Benchmarks/DispatcherThroughputBench.cs`:
 using BenchmarkDotNet.Attributes;
 using Pipely;
 
-namespace Pipely.Benchmarks;
+namespace PipelyBenchmarks;
 
 [MemoryDiagnoser]
 public class DispatcherThroughputBench

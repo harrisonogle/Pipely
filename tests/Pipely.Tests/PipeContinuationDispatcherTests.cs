@@ -2,7 +2,7 @@ using System.Threading;
 using System.Threading.Tasks.Sources;
 using Xunit;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public class PipeContinuationDispatcherTests
 {

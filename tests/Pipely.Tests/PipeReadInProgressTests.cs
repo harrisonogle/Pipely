@@ -1,6 +1,6 @@
 using Xunit;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public class PipeReadInProgressTests
 {

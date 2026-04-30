@@ -1,6 +1,6 @@
 using Xunit;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public class PipeWriterTests
 {
@@ -74,7 +74,7 @@ public class PipeWriterTests
         using var pipe = new Pipely.Pipe();
         // Manually publish a reader-completed state via the readerTb (proxy for Reader.Complete which is Task 9).
         pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
-        var readerSnap = new ReaderState { IsCompleted = true, CompletionException = null };
+        var readerSnap = new Pipely.ReaderState { IsCompleted = true, CompletionException = null };
         pipe._readerTb.ProducerSlot() = readerSnap;
         pipe._readerTb.Publish();
 
@@ -89,7 +89,7 @@ public class PipeWriterTests
         using var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
         var ex = new InvalidOperationException("from reader");
-        pipe._readerTb.ProducerSlot() = new ReaderState { IsCompleted = true, CompletionException = ex };
+        pipe._readerTb.ProducerSlot() = new Pipely.ReaderState { IsCompleted = true, CompletionException = ex };
         pipe._readerTb.Publish();
 
         var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await pipe.Writer.FlushAsync());

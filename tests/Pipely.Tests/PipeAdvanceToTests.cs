@@ -1,7 +1,7 @@
 using System.Buffers;
 using Xunit;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public class PipeAdvanceToTests
 {
@@ -57,7 +57,7 @@ public class PipeAdvanceToTests
     {
         using var pipe = new Pipely.Pipe();
         // Simulate empty IsCompleted=true ReadResult by direct publish.
-        pipe._writerTb.ProducerSlot() = new WriterState { IsCompleted = true };
+        pipe._writerTb.ProducerSlot() = new Pipely.WriterState { IsCompleted = true };
         pipe._writerTb.Publish();
 
         var r = await pipe.Reader.ReadAsync();

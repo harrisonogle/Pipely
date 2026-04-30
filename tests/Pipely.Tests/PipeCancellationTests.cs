@@ -1,7 +1,7 @@
 using System.Buffers;
 using Xunit;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public class PipeCancellationTests
 {

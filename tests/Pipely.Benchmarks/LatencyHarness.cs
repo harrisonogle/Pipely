@@ -5,7 +5,7 @@ using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace Pipely.Benchmarks;
+namespace PipelyBenchmarks;
 
 internal sealed record SampleStats(
     long Count,

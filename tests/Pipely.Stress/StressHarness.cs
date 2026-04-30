@@ -1,5 +1,4 @@
-
-namespace Pipely.Stress;
+namespace PipelyStress;
 
 internal sealed class StressHarness
 {

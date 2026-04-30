@@ -1,7 +1,7 @@
 using System.Buffers;
 using Xunit;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public class PipeReaderTests
 {
@@ -34,7 +34,7 @@ public class PipeReaderTests
     {
         using var pipe = new Pipely.Pipe();
         // Simulate Writer.Complete(null) by direct WriterState publish (real Complete in Task 9).
-        pipe._writerTb.ProducerSlot() = new WriterState { IsCompleted = true };
+        pipe._writerTb.ProducerSlot() = new Pipely.WriterState { IsCompleted = true };
         pipe._writerTb.Publish();
 
         var result = await pipe.Reader.ReadAsync();
@@ -47,7 +47,7 @@ public class PipeReaderTests
     {
         using var pipe = new Pipely.Pipe();
         var ex = new InvalidOperationException("from writer");
-        pipe._writerTb.ProducerSlot() = new WriterState { IsCompleted = true, CompletionException = ex };
+        pipe._writerTb.ProducerSlot() = new Pipely.WriterState { IsCompleted = true, CompletionException = ex };
         pipe._writerTb.Publish();
 
         var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await pipe.Reader.ReadAsync());

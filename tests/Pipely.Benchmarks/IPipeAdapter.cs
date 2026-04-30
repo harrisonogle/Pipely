@@ -1,6 +1,6 @@
 using System.IO.Pipelines;
 
-namespace Pipely.Benchmarks;
+namespace PipelyBenchmarks;
 
 internal interface IPipeAdapter : IDisposable
 {

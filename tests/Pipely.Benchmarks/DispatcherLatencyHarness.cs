@@ -3,7 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 
-namespace Pipely.Benchmarks;
+namespace PipelyBenchmarks;
 
 internal sealed record DispatcherLatencyStats(
     long   Count,
@@ -32,11 +32,11 @@ internal static class DispatcherLatencyHarness
     // DispatcherThroughputBench.ProduceAndDrain's `chunk.CopyTo(memory)` pattern.
     // Use with --count 256 --size 4096 for apples-to-apples with the BDN
     // throughput row.
-    public static async Task<DispatcherLatencyStats> Run(IContinuationDispatcher? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
+    public static async Task<DispatcherLatencyStats> Run(Pipely.IContinuationDispatcher? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (timestamp prefix)");
 
-        using var pipe = new Pipe(new PipeOptions
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
             ContinuationDispatcher = dispatcher,
         });

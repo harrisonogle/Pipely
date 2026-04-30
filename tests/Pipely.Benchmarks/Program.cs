@@ -1,5 +1,5 @@
 using BenchmarkDotNet.Running;
-using Pipely.Benchmarks;
+using PipelyBenchmarks;
 using System.CommandLine;
 
 // Subcommand-style routing:

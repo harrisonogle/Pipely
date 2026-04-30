@@ -1,7 +1,7 @@
 using System.Buffers;
 using Xunit;
 
-namespace Pipely.Tests;
+namespace PipelyTests;
 
 public class BufferSegmentTests
 {
@@ -10,7 +10,7 @@ public class BufferSegmentTests
     [Fact]
     public void RentFrom_SetsAvailableMemoryAndOwnerToken()
     {
-        var seg = new BufferSegment();
+        var seg = new Pipely.BufferSegment();
         seg.RentFrom(MemoryPool<byte>.Shared, sizeHint: 1024, runningIndex: 0, owner: Owner);
 
         Assert.True(seg.AvailableMemory.Length >= 1024);
@@ -25,10 +25,10 @@ public class BufferSegmentTests
     [Fact]
     public void Freeze_SetsEndAndMemoryAndNext()
     {
-        var seg = new BufferSegment();
+        var seg = new Pipely.BufferSegment();
         seg.RentFrom(MemoryPool<byte>.Shared, 1024, 0, Owner);
 
-        var next = new BufferSegment();
+        var next = new Pipely.BufferSegment();
         next.RentFrom(MemoryPool<byte>.Shared, 1024, 256, Owner);
 
         seg.Freeze(bytesFilled: 256, next);
@@ -42,7 +42,7 @@ public class BufferSegmentTests
     [Fact]
     public void RecycleReset_RestoresFullMemoryAndPreservesOwner()
     {
-        var seg = new BufferSegment();
+        var seg = new Pipely.BufferSegment();
         seg.RentFrom(MemoryPool<byte>.Shared, 1024, 0, Owner);
         int capacity = seg.AvailableMemory.Length;
         seg.Freeze(256, null);
@@ -59,7 +59,7 @@ public class BufferSegmentTests
     [Fact]
     public void DisposeOwned_ReleasesMemoryOwner()
     {
-        var seg = new BufferSegment();
+        var seg = new Pipely.BufferSegment();
         seg.RentFrom(MemoryPool<byte>.Shared, 1024, 0, Owner);
 
         seg.DisposeOwned();
@@ -92,7 +92,7 @@ public class BufferSegmentTests
     [Fact]
     public void RentFrom_SetsIsDonatedFalse()
     {
-        var seg = new BufferSegment();
+        var seg = new Pipely.BufferSegment();
         seg.RentFrom(MemoryPool<byte>.Shared, 1024, 0, Owner);
         Assert.False(seg.IsDonated);
     }
@@ -103,7 +103,7 @@ public class BufferSegmentTests
         var owner = new TrackingMemoryOwner(1024);
         var slice = owner.Memory.Slice(64, 256);
 
-        var seg = new BufferSegment();
+        var seg = new Pipely.BufferSegment();
         seg.AdoptFrom(owner, slice, runningIndex: 999, pipeOwner: Owner);
 
         Assert.Equal(256, seg.AvailableMemory.Length);
@@ -121,7 +121,7 @@ public class BufferSegmentTests
     {
         var owner = new TrackingMemoryOwner(1024);
         var slice = owner.Memory;
-        var seg = new BufferSegment();
+        var seg = new Pipely.BufferSegment();
         seg.AdoptFrom(owner, slice, runningIndex: 0, pipeOwner: Owner);
 
         Assert.Equal(0, owner.DisposeCount);
@@ -141,7 +141,7 @@ public class BufferSegmentTests
         var owner = new TrackingMemoryOwner(bytes);
         var slice = owner.Memory.Slice(100, 50);
 
-        var seg = new BufferSegment();
+        var seg = new Pipely.BufferSegment();
         seg.AdoptFrom(owner, slice, runningIndex: 0, pipeOwner: Owner);
 
         // The donated segment's Memory should reference bytes 100..149 of the underlying array.
@@ -157,13 +157,13 @@ public class BufferSegmentTests
         // a previously-donated _writingHead, the call _writingHead.Freeze(filled, next)
         // re-writes End/base.Memory to the same values they already held; only Next changes.
         var owner = new TrackingMemoryOwner(64);
-        var seg   = new BufferSegment();
+        var seg   = new Pipely.BufferSegment();
         seg.AdoptFrom(owner, owner.Memory, runningIndex: 0, pipeOwner: Owner);
 
         int endBefore       = seg.End;
         int memLenBefore    = ((ReadOnlySequenceSegment<byte>)seg).Memory.Length;
 
-        var next = new BufferSegment();
+        var next = new Pipely.BufferSegment();
         next.RentFrom(MemoryPool<byte>.Shared, 32, runningIndex: 64, owner: Owner);
 
         seg.Freeze(bytesFilled: seg.End, next);
