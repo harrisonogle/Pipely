@@ -141,8 +141,8 @@ P99 line for that trial only.)
 
 **Compared:**
 
-- **Latency** (custom harness, P50/P90/P99 by sort): `ThreadPool` (Pipely with `ContinuationDispatcher = null`, i.e., `ThreadPoolContinuationDispatcher.Instance`) vs `fast-scheduler` (Pipely with `FastScheduler`).
-- **Throughput** (BenchmarkDotNet, 1 MiB / 4 KiB chunks): three-way head-to-head — `BclPipe` (BCL `System.IO.Pipelines.Pipe`, baseline), `Pipely_ThreadPool`, `Pipely_FastScheduler` — all in the same BDN process invocation so their numbers are directly comparable.
+- **Latency** (custom harness, P50/P90/P99 by sort): `ThreadPool` (Pipely with `ReaderScheduler = WriterScheduler = PipeScheduler.ThreadPool`, the default) vs `FastScheduler` (Pipely with both schedulers set to a `Pipely.FastScheduler` instance).
+- **Throughput** (BenchmarkDotNet, 1 MiB / 4 KiB chunks): five-way head-to-head — `BCL_ThreadPool`, `BCL_Inline`, `Pipely_ThreadPool`, `Pipely_Inline`, `Pipely_FastScheduler` — all in the same BDN process invocation so their numbers are directly comparable. The 2×2 BCL × Pipely × {ThreadPool, Inline} matrix isolates "scheduler" from "pipe internals"; the FastScheduler row is Pipely-only since BCL has no analogue.
 
 **Spec reference:** `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md` §8.
 
@@ -167,7 +167,7 @@ measurement that drove it.
 - Hardware/build details captured at the top of each results section.
 - The FastScheduler worker thread sits at ~100% on its core during the busy-spin
   loop. Latency and throughput wins must be read against this CPU cost.
-- **Scheduler amortization:** `Pipely_FastScheduler_ProduceAndDrain` constructs the scheduler once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring `BclPipe`'s no-extra-state baseline and `Pipely_ThreadPool`'s singleton-dispatcher baseline). Per-iteration cost for all three rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one scheduler per recorded trial, not per message).
+- **Scheduler amortization:** `Pipely_FastScheduler` constructs the scheduler once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring the `ThreadPool` and `Inline` rows, which use BCL singletons with no extra state). Per-iteration cost for all five rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one scheduler per recorded trial, not per message).
 
 ## Starting tunables
 
@@ -183,26 +183,36 @@ the prior baseline.
 
 ## Run 1 — starting configuration
 
-**Date:** 2026-04-27
+**Date:** 2026-04-27 (latency); 2026-04-30 (throughput re-measurement with the 5-variant scheduler matrix)
 **Hardware:** AMD Ryzen 7 8700F (8 physical / 16 logical cores), Linux Ubuntu 24.04.4 LTS, kernel 6.17.0-22-generic
 **Build:** Release, .NET SDK 10.0.107 / Runtime .NET 10.0.7, Server GC + concurrent
-**Commit:** `9b98a8f` (FastScheduler bench: amortize scheduler + add BCL to 3-way throughput)
+**Commit:** `9b98a8f` (latency); `07be068` (throughput — adds `BCL_Inline` and explicit `BCL_ThreadPool` for direct scheduler-by-scheduler comparison)
 **Tunables:** as in "Starting tunables" above; no overrides.
 
-### Throughput (1 MiB / 4 KiB chunks; head-to-head-to-head, same BDN process)
+### Throughput (1 MiB / 4 KiB chunks; five-way head-to-head, same BDN process)
 
-| Method                                | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
-|---------------------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
-| `BclPipe_ProduceAndDrain`             | 105.09 us | 0.834 us | 0.780 us | 1.00  | 0.1221 |   7.03 KB |        1.00 |
-| `Pipely_ThreadPool_ProduceAndDrain`      |  70.34 us | 0.242 us | 0.215 us | 0.67  | 0.2441 |  11.03 KB |        1.57 |
-| `Pipely_FastScheduler_ProduceAndDrain`  |  50.45 us | 0.185 us | 0.173 us | 0.48  | 0.2441 |   9.21 KB |        1.31 |
+| Method                 | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
+|------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
+| `BCL_ThreadPool`       | 107.02 us | 0.448 us | 0.419 us |  1.00 | 0.1221 |   6.88 KB |        1.00 |
+| `BCL_Inline`           |  43.43 us | 0.428 us | 0.401 us |  0.41 | 0.1221 |   5.77 KB |        0.84 |
+| `Pipely_ThreadPool`    |  68.68 us | 0.297 us | 0.278 us |  0.64 | 0.2441 |  10.76 KB |        1.56 |
+| `Pipely_Inline`        |  41.85 us | 0.402 us | 0.376 us |  0.39 | 0.1831 |   8.55 KB |        1.24 |
+| `Pipely_FastScheduler` |  49.45 us | 0.416 us | 0.347 us |  0.46 | 0.2441 |   9.21 KB |        1.34 |
 
 Reading:
-- `Pipely_ThreadPool` is **1.50×** faster than BCL — consistent with the prior `BclPipe vs Pipely` characterization above.
-- `Pipely_FastScheduler` is **1.39×** faster than `Pipely_ThreadPool` (50.45 / 70.34) and **2.08×** faster than BCL.
-- `Pipely_FastScheduler` allocates **0.84×** the bytes of `Pipely_ThreadPool` (9.21 / 11.03 KB) — the worker-thread invocation path doesn't allocate the per-event TP work-item objects.
+- **Inline ≈ Inline.** `BCL_Inline` 43.43 us, `Pipely_Inline` 41.85 us — within 4%. Once the TP wake-gap is removed, per-event work is dominated by pipe internals, and BCL and Pipely are essentially tied. This isolates the "scheduler" axis from the "pipe internals" axis.
+- **ThreadPool: Pipely beats BCL by ~1.56×.** `BCL_ThreadPool` 107.02 us vs `Pipely_ThreadPool` 68.68 us (38 us absolute gap). At the same scheduler, Pipely's awaiter machinery is materially leaner per-event than BCL's.
+- **FastScheduler beats ThreadPool by ~1.39×** within Pipely (`Pipely_FastScheduler` 49.45 vs `Pipely_ThreadPool` 68.68). Most of the TP wake-gap is escaped by the busy-spinning worker thread.
+- **Inline beats FastScheduler by ~1.18×** (`Pipely_Inline` 41.85 vs `Pipely_FastScheduler` 49.45). FastScheduler still pays a slot-CAS + worker-thread coordination cost on each dispatch; Inline pays nothing. FastScheduler's role is to escape TP without forcing continuations onto the producer's thread (the price of Inline) — the comparison to make is FastScheduler vs ThreadPool, not FastScheduler vs Inline.
+- **Allocations.** `BCL_Inline` is the leanest at 5.77 KB. Pipely variants allocate ~2-3 KB more across the board (awaiter struct fields + EC capture stash). The TP variants are heaviest on both sides because of per-event TP work-item objects. FastScheduler allocates between TP and Inline — its slot-busy fallback path uses TP work items.
 
 ### Latency (ns) — 1 M messages × 256 B, 5 warmup + 10 recorded trials
+
+> **Provenance:** the latency aggregate below is the original 2026-04-27
+> measurement at commit `9b98a8f`, prior to the BCL_Inline / scheduler-matrix
+> work. The throughput re-measurement above did not include latency. A
+> latency re-measurement against the expanded matrix would be a useful
+> follow-up but is not in this run.
 
 Per-trial percentiles (ns, both configurations same trial). Compact summary across trials below; per-trial detail captured from the run.
 
@@ -224,7 +234,7 @@ Aggregate across the 10 recorded trials (each trial sorts 1 M samples and reads 
 
 The two measurements characterize the same scheduler under two different kinds of workload, and the contrast is the design's central finding.
 
-**Throughput workload — FastScheduler wins decisively.** 1.39× over `Pipely_ThreadPool`, 2.08× over BCL, with lower allocations. The 4 KiB-chunk workload's backpressure cycles produce idle windows long enough (>10 µs) for TP workers to exit their spin and actually sleep on the kernel semaphore. Each resume then pays a TP wake-gap on the order of multiple µs. FastScheduler's continuously-hot worker thread skips the kernel wake entirely. This is the workload pattern the scheduler was designed for: streams where TP queues empty long enough that TP workers park between events.
+**Throughput workload — FastScheduler wins over ThreadPool, but Inline wins overall.** Within Pipely, FastScheduler is 1.39× over `Pipely_ThreadPool`, with lower allocations. The 4 KiB-chunk workload's backpressure cycles produce idle windows long enough (>10 µs) for TP workers to exit their spin and actually sleep on the kernel semaphore; each resume then pays a TP wake-gap on the order of multiple µs. FastScheduler's continuously-hot worker thread skips the kernel wake entirely. The expanded matrix above shows that `Pipely_Inline` is faster still (1.18× over FastScheduler) — Inline pays no scheduling cost at all because continuations run synchronously on the signaling thread. **FastScheduler's niche is therefore narrower than "fastest scheduler": it is the fastest scheduler that still runs continuations on a separate thread.** Choose Inline when continuation-on-signal-thread is acceptable; choose FastScheduler when continuations need an off-thread context but TP wake-gap costs too much.
 
 **Latency workload — FastScheduler is comparable-to-slightly-worse.** P50 median 1.16× (worse), Mean median 1.19× (worse), tails (P99) effectively unchanged. The 256 B / 1 M-message workload sustains MHz event rates; idle windows between events are sub-µs, well inside TP's spin-then-sleep threshold. TP workers never actually park, so there is no kernel-wake cost for FastScheduler to escape. The scheduler's per-event overhead (worker-thread `Interlocked` operations on the same cache line touched by the producer's signal path; cache contention without CPU pinning) shows up in the per-message latency without the wake-gap savings to offset it.
 
