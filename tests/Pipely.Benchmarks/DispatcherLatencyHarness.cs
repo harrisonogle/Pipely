@@ -29,7 +29,7 @@ internal static class DispatcherLatencyHarness
     //
     // copyChunk = true: producer also copies a pre-allocated zero-filled
     // message-sized chunk into the buffer, matching
-    // DispatcherThroughputBench.ProduceAndDrain's `chunk.CopyTo(memory)` pattern.
+    // SchedulerBenchmarks.ProduceAndDrain's `chunk.CopyTo(memory)` pattern.
     // Use with --count 256 --size 4096 for apples-to-apples with the BDN
     // throughput row.
     public static async Task<DispatcherLatencyStats> Run(System.IO.Pipelines.PipeScheduler? dispatcher, int messageCount, int messageBytes, bool copyChunk = false)
@@ -116,7 +116,7 @@ internal static class DispatcherLatencyHarness
     {
         Console.WriteLine();
         Console.WriteLine($"=== {label} ===");
-        Console.WriteLine($"| {"Stat",-8} | {"tp-default",12} | {"fast-scheduler",14} |  Ratio |");
+        Console.WriteLine($"| {"Stat",-8} | {"ThreadPool",12} | {"FastScheduler",14} |  Ratio |");
         Console.WriteLine($"|:---------|-------------:|---------------:|-------:|");
         PrintRow("Count", baseline.Count,  compare.Count);
         PrintRow("Min",   baseline.MinNs,  compare.MinNs);

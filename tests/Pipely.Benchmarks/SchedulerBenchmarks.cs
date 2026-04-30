@@ -4,19 +4,19 @@ using BenchmarkDotNet.Attributes;
 namespace PipelyBenchmarks;
 
 [MemoryDiagnoser]
-public class DispatcherThroughputBench
+public class SchedulerBenchmarks
 {
     private const int TotalBytes = 1 << 20;        // 1 MiB per iteration
     private const int ChunkSize  = 4096;
 
     // Constructed once per benchmark run, reused across all iterations. This
-    // matches the apples-to-apples comparison shape: BCL Pipe and Pipely's
-    // default TP dispatcher both have zero per-iteration "dispatcher" startup
-    // cost (BCL Pipe uses TP directly; Pipely-TP uses the singleton
-    // ThreadPoolContinuationDispatcher.Instance). The FastScheduler equivalent
-    // must also amortize its thread-startup cost across iterations rather
-    // than pay it per measurement. Per-iteration cost is now solely
-    // pipe ctor + produce-and-drain on both sides.
+    // matches the apples-to-apples comparison shape: BCL Pipe and Pipely with
+    // PipeScheduler.ThreadPool both have zero per-iteration "scheduler" startup
+    // cost (BCL Pipe uses TP directly; Pipely-ThreadPool uses the singleton
+    // PipeScheduler.ThreadPool). The FastScheduler equivalent must also
+    // amortize its thread-startup cost across iterations rather than pay it
+    // per measurement. Per-iteration cost is now solely pipe ctor +
+    // produce-and-drain on both sides.
     private Pipely.FastScheduler? _scheduler;
 
     [GlobalSetup(Target = nameof(Pipely_FastScheduler_ProduceAndDrain))]
@@ -34,14 +34,29 @@ public class DispatcherThroughputBench
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
-    // Pipely with the default ThreadPoolContinuationDispatcher (no override).
+    // Pipely with PipeScheduler.ThreadPool (the default, set explicitly here
+    // for clarity; null and PipeScheduler.ThreadPool are equivalent).
     [Benchmark]
-    public async Task Pipely_TpDefault_ProduceAndDrain()
+    public async Task Pipely_ThreadPool_ProduceAndDrain()
     {
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
-            ReaderScheduler = null,
-            WriterScheduler = null,
+            ReaderScheduler = PipeScheduler.ThreadPool,
+            WriterScheduler = PipeScheduler.ThreadPool,
+        });
+        await ProduceAndDrain(pipe.Reader, pipe.Writer);
+    }
+
+    // Pipely with PipeScheduler.Inline — continuations run synchronously on the
+    // signaling thread (the producer for the read awaiter, the reader for the
+    // flush awaiter). No thread hop on the signal path.
+    [Benchmark]
+    public async Task Pipely_Inline_ProduceAndDrain()
+    {
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
+        {
+            ReaderScheduler = PipeScheduler.Inline,
+            WriterScheduler = PipeScheduler.Inline,
         });
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }

@@ -5,7 +5,7 @@ using System.CommandLine;
 // Subcommand-style routing:
 //   (no args, or BDN args like --filter / --job)  → BenchmarkSwitcher (BDN auto-discovery)
 //   latency                                       → BCL-vs-Pipe latency harness
-//   dispatcher-latency                            → tp-default vs FastScheduler latency harness
+//   dispatcher-latency                            → ThreadPool vs FastScheduler latency harness
 if (args.Length == 0 || (args[0] != "latency" && args[0] != "dispatcher-latency"))
 {
     BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
@@ -120,11 +120,11 @@ static Command BuildDispatcherLatencyCommand()
 
     var copyChunkOption = new Option<bool>("--copy-chunk")
     {
-        Description = "Producer copies a full message-sized zero-filled chunk into each rented buffer (matching DispatcherThroughputBench.ProduceAndDrain's `chunk.CopyTo(memory)` per-event memcpy). When omitted (default), only the 8-byte timestamp is written and remaining bytes are uninitialized — the high-rate per-message latency workload. Pair with --count 256 --size 4096 for apples-to-apples with the BDN throughput row.",
+        Description = "Producer copies a full message-sized zero-filled chunk into each rented buffer (matching SchedulerBenchmarks.ProduceAndDrain's `chunk.CopyTo(memory)` per-event memcpy). When omitted (default), only the 8-byte timestamp is written and remaining bytes are uninitialized — the high-rate per-message latency workload. Pair with --count 256 --size 4096 for apples-to-apples with the BDN throughput row.",
         DefaultValueFactory = _ => false,
     };
 
-    var dispatcherLatencyCommand = new Command("dispatcher-latency", "Run the dispatcher latency comparison (tp-default vs FastScheduler)")
+    var dispatcherLatencyCommand = new Command("dispatcher-latency", "Run the scheduler latency comparison (ThreadPool vs FastScheduler)")
     {
         countOption, sizeOption, trialsOption, warmupOption, copyChunkOption,
     };
@@ -235,11 +235,11 @@ static async Task RunDispatcherLatency(int count, int size, int trials, int warm
     string writeMode = copyChunk ? "full chunk copy" : "timestamp-only writes";
     Console.WriteLine($"Dispatcher latency comparison: {count:N0} messages × {size} B, {trials} trials, {warmup} warmup, {writeMode}");
 
-    // Phase 1 — tp-default. No FastScheduler exists during this phase, so the
-    // TP-default measurement is not contaminated by a busy-spinning worker
+    // Phase 1 — ThreadPool. No FastScheduler exists during this phase, so the
+    // ThreadPool measurement is not contaminated by a busy-spinning worker
     // thread eating a core.
     Console.WriteLine();
-    Console.WriteLine($"--- Phase 1: tp-default ({warmup} warmup + {trials} recorded trials) ---");
+    Console.WriteLine($"--- Phase 1: ThreadPool ({warmup} warmup + {trials} recorded trials) ---");
     for (int w = 0; w < warmup; w++)
     {
         Console.WriteLine($"  Warmup {w + 1}/{warmup} (not recorded)");
@@ -251,7 +251,7 @@ static async Task RunDispatcherLatency(int count, int size, int trials, int warm
 
     // Phase 2 — FastScheduler. Single scheduler amortized across warmup +
     // all recorded trials (matches the [GlobalSetup] amortization pattern
-    // used by DispatcherThroughputBench.Pipe_FastScheduler_ProduceAndDrain).
+    // used by SchedulerBenchmarks.Pipely_FastScheduler_ProduceAndDrain).
     // Per-trial slot/TP counts are taken as deltas of the cumulative
     // scheduler counters between trial boundaries.
     Console.WriteLine();

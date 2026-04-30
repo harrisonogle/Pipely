@@ -141,15 +141,15 @@ P99 line for that trial only.)
 
 **Compared:**
 
-- **Latency** (custom harness, P50/P90/P99 by sort): `tp-default` (Pipely with `ContinuationDispatcher = null`, i.e., `ThreadPoolContinuationDispatcher.Instance`) vs `fast-scheduler` (Pipely with `FastScheduler`).
-- **Throughput** (BenchmarkDotNet, 1 MiB / 4 KiB chunks): three-way head-to-head — `BclPipe` (BCL `System.IO.Pipelines.Pipe`, baseline), `Pipely_TpDefault`, `Pipely_FastScheduler` — all in the same BDN process invocation so their numbers are directly comparable.
+- **Latency** (custom harness, P50/P90/P99 by sort): `ThreadPool` (Pipely with `ContinuationDispatcher = null`, i.e., `ThreadPoolContinuationDispatcher.Instance`) vs `fast-scheduler` (Pipely with `FastScheduler`).
+- **Throughput** (BenchmarkDotNet, 1 MiB / 4 KiB chunks): three-way head-to-head — `BclPipe` (BCL `System.IO.Pipelines.Pipe`, baseline), `Pipely_ThreadPool`, `Pipely_FastScheduler` — all in the same BDN process invocation so their numbers are directly comparable.
 
 **Spec reference:** `docs/superpowers/specs/2026-04-27-fast-scheduler-design.md` §8.
 
 ## Design-completion criterion
 
 > The implementation is finalized when measurements either justify a tuned
-> configuration that beats `tp-default` at the percentiles that matter
+> configuration that beats `ThreadPool` at the percentiles that matter
 > (P50, P90, P99) under reasonable CPU cost, or demonstrate that no
 > reasonable configuration does. Each iteration of the implementation lands
 > the change with the measurement that justified it.
@@ -162,12 +162,12 @@ measurement that drove it.
 ## Methodology
 
 - Latency: `dotnet run -c Release --project tests/Pipely.Benchmarks -- dispatcher-latency --count 100000 --size 256 --trials 3 --warmup 1`
-- Throughput: `dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter '*DispatcherThroughputBench*'`
+- Throughput: `dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter '*SchedulerBenchmarks*'`
 - Three latency trials per recorded run; warmup trial not recorded.
 - Hardware/build details captured at the top of each results section.
 - The FastScheduler worker thread sits at ~100% on its core during the busy-spin
   loop. Latency and throughput wins must be read against this CPU cost.
-- **Scheduler amortization:** `Pipely_FastScheduler_ProduceAndDrain` constructs the scheduler once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring `BclPipe`'s no-extra-state baseline and `Pipely_TpDefault`'s singleton-dispatcher baseline). Per-iteration cost for all three rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one scheduler per recorded trial, not per message).
+- **Scheduler amortization:** `Pipely_FastScheduler_ProduceAndDrain` constructs the scheduler once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring `BclPipe`'s no-extra-state baseline and `Pipely_ThreadPool`'s singleton-dispatcher baseline). Per-iteration cost for all three rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one scheduler per recorded trial, not per message).
 
 ## Starting tunables
 
@@ -194,13 +194,13 @@ the prior baseline.
 | Method                                | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
 |---------------------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
 | `BclPipe_ProduceAndDrain`             | 105.09 us | 0.834 us | 0.780 us | 1.00  | 0.1221 |   7.03 KB |        1.00 |
-| `Pipely_TpDefault_ProduceAndDrain`      |  70.34 us | 0.242 us | 0.215 us | 0.67  | 0.2441 |  11.03 KB |        1.57 |
+| `Pipely_ThreadPool_ProduceAndDrain`      |  70.34 us | 0.242 us | 0.215 us | 0.67  | 0.2441 |  11.03 KB |        1.57 |
 | `Pipely_FastScheduler_ProduceAndDrain`  |  50.45 us | 0.185 us | 0.173 us | 0.48  | 0.2441 |   9.21 KB |        1.31 |
 
 Reading:
-- `Pipely_TpDefault` is **1.50×** faster than BCL — consistent with the prior `BclPipe vs Pipely` characterization above.
-- `Pipely_FastScheduler` is **1.39×** faster than `Pipely_TpDefault` (50.45 / 70.34) and **2.08×** faster than BCL.
-- `Pipely_FastScheduler` allocates **0.84×** the bytes of `Pipely_TpDefault` (9.21 / 11.03 KB) — the worker-thread invocation path doesn't allocate the per-event TP work-item objects.
+- `Pipely_ThreadPool` is **1.50×** faster than BCL — consistent with the prior `BclPipe vs Pipely` characterization above.
+- `Pipely_FastScheduler` is **1.39×** faster than `Pipely_ThreadPool` (50.45 / 70.34) and **2.08×** faster than BCL.
+- `Pipely_FastScheduler` allocates **0.84×** the bytes of `Pipely_ThreadPool` (9.21 / 11.03 KB) — the worker-thread invocation path doesn't allocate the per-event TP work-item objects.
 
 ### Latency (ns) — 1 M messages × 256 B, 5 warmup + 10 recorded trials
 
@@ -208,7 +208,7 @@ Per-trial percentiles (ns, both configurations same trial). Compact summary acro
 
 Aggregate across the 10 recorded trials (each trial sorts 1 M samples and reads exact percentile by index):
 
-| Stat   | `tp-default` min / median / max | `fast-scheduler` min / median / max | median ratio (FS/TP) |
+| Stat   | `ThreadPool` min / median / max | `fast-scheduler` min / median / max | median ratio (FS/TP) |
 |--------|----------------------:|----------------------------:|---------------------:|
 | Min    |   120 /   190 /   230 |   130 /   190 /   220       | 1.00 |
 | P50    |   950 / 1,185 / 1,530 | 1,170 / 1,370 / 1,730       | 1.16 |
@@ -218,19 +218,19 @@ Aggregate across the 10 recorded trials (each trial sorts 1 M samples and reads 
 | Max    | 28,620 / 33,945 / 86,428 | 24,980 / 36,095 / 93,949 | 1.06 |
 | Mean   | 1,287 / 1,465 / 1,764 | 1,329 / 1,750 / 1,920       | 1.19 |
 
-(Per-trial tables: 10 trials each producing the per-percentile pair (`tp-default`, `fast-scheduler`); the aggregate above is min/median/max of each per-percentile column across the 10 trials.)
+(Per-trial tables: 10 trials each producing the per-percentile pair (`ThreadPool`, `fast-scheduler`); the aggregate above is min/median/max of each per-percentile column across the 10 trials.)
 
 ### Observations
 
 The two measurements characterize the same scheduler under two different kinds of workload, and the contrast is the design's central finding.
 
-**Throughput workload — FastScheduler wins decisively.** 1.39× over `Pipely_TpDefault`, 2.08× over BCL, with lower allocations. The 4 KiB-chunk workload's backpressure cycles produce idle windows long enough (>10 µs) for TP workers to exit their spin and actually sleep on the kernel semaphore. Each resume then pays a TP wake-gap on the order of multiple µs. FastScheduler's continuously-hot worker thread skips the kernel wake entirely. This is the workload pattern the scheduler was designed for: streams where TP queues empty long enough that TP workers park between events.
+**Throughput workload — FastScheduler wins decisively.** 1.39× over `Pipely_ThreadPool`, 2.08× over BCL, with lower allocations. The 4 KiB-chunk workload's backpressure cycles produce idle windows long enough (>10 µs) for TP workers to exit their spin and actually sleep on the kernel semaphore. Each resume then pays a TP wake-gap on the order of multiple µs. FastScheduler's continuously-hot worker thread skips the kernel wake entirely. This is the workload pattern the scheduler was designed for: streams where TP queues empty long enough that TP workers park between events.
 
 **Latency workload — FastScheduler is comparable-to-slightly-worse.** P50 median 1.16× (worse), Mean median 1.19× (worse), tails (P99) effectively unchanged. The 256 B / 1 M-message workload sustains MHz event rates; idle windows between events are sub-µs, well inside TP's spin-then-sleep threshold. TP workers never actually park, so there is no kernel-wake cost for FastScheduler to escape. The scheduler's per-event overhead (worker-thread `Interlocked` operations on the same cache line touched by the producer's signal path; cache contention without CPU pinning) shows up in the per-message latency without the wake-gap savings to offset it.
 
 **CPU cost.** FastScheduler's worker thread sits at ~100% on its core during the busy-spin loop. Both measurements above are with one core continuously consumed. For applications where the wake-gap escape genuinely matters, this is the explicit cost.
 
-**Design-completion criterion (spec §8.3) — characterization.** The criterion was "beats `tp-default` at the percentiles that matter under reasonable CPU cost, *or* demonstrates that no reasonable configuration does." This run shows neither pure outcome but a workload-shaped one: the scheduler delivers its designed-for benefit (TP wake-gap escape) for streams where TP would otherwise park, and is overhead-only for streams where TP stays hot. This is a useful, honest characterization to ship with — the scheduler should be selected against the workload's expected idle pattern, not blindly applied.
+**Design-completion criterion (spec §8.3) — characterization.** The criterion was "beats `ThreadPool` at the percentiles that matter under reasonable CPU cost, *or* demonstrates that no reasonable configuration does." This run shows neither pure outcome but a workload-shaped one: the scheduler delivers its designed-for benefit (TP wake-gap escape) for streams where TP would otherwise park, and is overhead-only for streams where TP stays hot. This is a useful, honest characterization to ship with — the scheduler should be selected against the workload's expected idle pattern, not blindly applied.
 
 The starting tunables (`SpinIterations = 10`, no pinning, single-slot mailbox) deliver the throughput win without further tuning. CPU pinning may improve the latency-workload tail behavior but is unlikely to change the central observation (no wake-gap to escape → no benefit possible).
 
