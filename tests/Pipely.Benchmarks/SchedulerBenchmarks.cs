@@ -3,89 +3,121 @@ using BenchmarkDotNet.Attributes;
 
 namespace PipelyBenchmarks;
 
+// Headline five-way scheduler matrix. Each Pipe is constructed once in
+// [GlobalSetup] and reused across all BDN iterations — neither side calls
+// Complete() between iterations. Reported allocations exclude per-Pipe
+// construction and isolate steady-state per-1 MiB-transfer cost across the
+// five pipe × scheduler variants. This is the production-shape measurement
+// (long-lived pipes) and drives the README's headline table.
+//
+// Pair with FreshPipeSchedulerBenchmarks: per-row (FreshPipe per-iter alloc) -
+// (this row's per-iter alloc) ≈ amortized per-Pipe construction cost for
+// that variant.
 [MemoryDiagnoser]
 public class SchedulerBenchmarks
 {
-    private const int TotalBytes = 1 << 20;        // 1 MiB per iteration
+    private const int TotalBytes = 1 << 20;
     private const int ChunkSize  = 4096;
 
-    // Constructed once per benchmark run, reused across all iterations. This
-    // matches the apples-to-apples comparison shape: BCL Pipe and Pipely with
-    // PipeScheduler.ThreadPool both have zero per-iteration "scheduler" startup
-    // cost (PipeScheduler.ThreadPool is a singleton). The FastScheduler
-    // equivalent must also amortize its thread-startup cost across iterations
-    // rather than pay it per measurement. Per-iteration cost is solely pipe
-    // ctor + produce-and-drain on both sides.
+    private readonly byte[] _chunk = new byte[ChunkSize];
+
+    private Pipe?                 _bclTp;
+    private Pipe?                 _bclInline;
+    private Pipely.Pipe?          _pipelyTp;
+    private Pipely.Pipe?          _pipelyInline;
+    private Pipely.Pipe?          _pipelyFs;
     private Pipely.FastScheduler? _scheduler;
 
+    [GlobalSetup(Target = nameof(BCL_ThreadPool))]
+    public void SetupBclTp() => _bclTp = new Pipe(new PipeOptions(
+        readerScheduler: PipeScheduler.ThreadPool,
+        writerScheduler: PipeScheduler.ThreadPool));
+
+    [GlobalCleanup(Target = nameof(BCL_ThreadPool))]
+    public void CleanupBclTp()
+    {
+        _bclTp!.Writer.Complete();
+        _bclTp.Reader.Complete();
+    }
+
+    [GlobalSetup(Target = nameof(BCL_Inline))]
+    public void SetupBclInline() => _bclInline = new Pipe(new PipeOptions(
+        readerScheduler: PipeScheduler.Inline,
+        writerScheduler: PipeScheduler.Inline));
+
+    [GlobalCleanup(Target = nameof(BCL_Inline))]
+    public void CleanupBclInline()
+    {
+        _bclInline!.Writer.Complete();
+        _bclInline.Reader.Complete();
+    }
+
+    [GlobalSetup(Target = nameof(Pipely_ThreadPool))]
+    public void SetupPipelyTp() => _pipelyTp = new Pipely.Pipe(new Pipely.PipeOptions(
+        readerScheduler: PipeScheduler.ThreadPool,
+        writerScheduler: PipeScheduler.ThreadPool));
+
+    [GlobalCleanup(Target = nameof(Pipely_ThreadPool))]
+    public void CleanupPipelyTp()
+    {
+        _pipelyTp!.Writer.Complete();
+        _pipelyTp.Reader.Complete();
+        _pipelyTp.Dispose();
+    }
+
+    [GlobalSetup(Target = nameof(Pipely_Inline))]
+    public void SetupPipelyInline() => _pipelyInline = new Pipely.Pipe(new Pipely.PipeOptions(
+        readerScheduler: PipeScheduler.Inline,
+        writerScheduler: PipeScheduler.Inline));
+
+    [GlobalCleanup(Target = nameof(Pipely_Inline))]
+    public void CleanupPipelyInline()
+    {
+        _pipelyInline!.Writer.Complete();
+        _pipelyInline.Reader.Complete();
+        _pipelyInline.Dispose();
+    }
+
     [GlobalSetup(Target = nameof(Pipely_FastScheduler))]
-    public void SetupFastScheduler() => _scheduler = new Pipely.FastScheduler();
-
-    [GlobalCleanup(Target = nameof(Pipely_FastScheduler))]
-    public void CleanupFastScheduler() => _scheduler?.Dispose();
-
-    // BCL System.IO.Pipelines.Pipe with PipeScheduler.ThreadPool (the BCL
-    // default, set explicitly for parallel framing with Pipely_ThreadPool).
-    [Benchmark(Baseline = true)]
-    public async Task BCL_ThreadPool()
+    public void SetupPipelyFs()
     {
-        var pipe = new Pipe(new PipeOptions(
-            readerScheduler: PipeScheduler.ThreadPool,
-            writerScheduler: PipeScheduler.ThreadPool));
-        await ProduceAndDrain(pipe.Reader, pipe.Writer);
-    }
-
-    // BCL System.IO.Pipelines.Pipe with PipeScheduler.Inline — BCL itself
-    // exposes the same Inline option; this row characterizes the BCL pipe's
-    // own zero-thread-hop path for direct comparison with Pipely_Inline.
-    [Benchmark]
-    public async Task BCL_Inline()
-    {
-        var pipe = new Pipe(new PipeOptions(
-            readerScheduler: PipeScheduler.Inline,
-            writerScheduler: PipeScheduler.Inline));
-        await ProduceAndDrain(pipe.Reader, pipe.Writer);
-    }
-
-    // Pipely with PipeScheduler.ThreadPool.
-    [Benchmark]
-    public async Task Pipely_ThreadPool()
-    {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
-            readerScheduler: PipeScheduler.ThreadPool,
-            writerScheduler: PipeScheduler.ThreadPool));
-        await ProduceAndDrain(pipe.Reader, pipe.Writer);
-    }
-
-    // Pipely with PipeScheduler.Inline — continuations run synchronously on
-    // the signaling thread (the producer for the read awaiter, the reader for
-    // the flush awaiter). No thread hop on the signal path.
-    [Benchmark]
-    public async Task Pipely_Inline()
-    {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
-            readerScheduler: PipeScheduler.Inline,
-            writerScheduler: PipeScheduler.Inline));
-        await ProduceAndDrain(pipe.Reader, pipe.Writer);
-    }
-
-    // Pipely with FastScheduler (constructed once in [GlobalSetup], reused
-    // across all iterations of this benchmark).
-    [Benchmark]
-    public async Task Pipely_FastScheduler()
-    {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
+        _scheduler = new Pipely.FastScheduler();
+        _pipelyFs  = new Pipely.Pipe(new Pipely.PipeOptions(
             readerScheduler: _scheduler,
             writerScheduler: _scheduler));
-        await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
-    private static async Task ProduceAndDrain(PipeReader reader, PipeWriter writer)
+    [GlobalCleanup(Target = nameof(Pipely_FastScheduler))]
+    public void CleanupPipelyFs()
     {
+        _pipelyFs!.Writer.Complete();
+        _pipelyFs.Reader.Complete();
+        _pipelyFs.Dispose();
+        _scheduler!.Dispose();
+    }
+
+    [Benchmark(Baseline = true)]
+    public Task BCL_ThreadPool() => ProduceAndDrain(_bclTp!.Reader, _bclTp.Writer);
+
+    [Benchmark]
+    public Task BCL_Inline() => ProduceAndDrain(_bclInline!.Reader, _bclInline.Writer);
+
+    [Benchmark]
+    public Task Pipely_ThreadPool() => ProduceAndDrain(_pipelyTp!.Reader, _pipelyTp.Writer);
+
+    [Benchmark]
+    public Task Pipely_Inline() => ProduceAndDrain(_pipelyInline!.Reader, _pipelyInline.Writer);
+
+    [Benchmark]
+    public Task Pipely_FastScheduler() => ProduceAndDrain(_pipelyFs!.Reader, _pipelyFs.Writer);
+
+    private Task ProduceAndDrain(PipeReader reader, PipeWriter writer)
+    {
+        var chunk = _chunk;
+
         var producer = Task.Run(async () =>
         {
             int written = 0;
-            var chunk = new byte[ChunkSize];
             while (written < TotalBytes)
             {
                 var memory = writer.GetMemory(chunk.Length);
@@ -94,20 +126,21 @@ public class SchedulerBenchmarks
                 await writer.FlushAsync();
                 written += chunk.Length;
             }
-            writer.Complete();
+            // No Complete — Pipe survives for the next iteration.
         });
 
         var consumer = Task.Run(async () =>
         {
-            while (true)
+            long read = 0;
+            while (read < TotalBytes)
             {
                 var result = await reader.ReadAsync();
+                read += result.Buffer.Length;
                 reader.AdvanceTo(result.Buffer.End);
-                if (result.IsCompleted) break;
             }
-            reader.Complete();
+            // No Complete — Pipe survives for the next iteration.
         });
 
-        await Task.WhenAll(producer, consumer);
+        return Task.WhenAll(producer, consumer);
     }
 }

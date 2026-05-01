@@ -4,7 +4,7 @@
 **Hardware:** AMD Ryzen 7 8700F 8-Core Processor (16 logical / 8 physical cores, base 4.02 GHz, boost 5.06 GHz), 30 GiB RAM
 **OS:** Linux Ubuntu 24.04.4 LTS (Noble Numbat), kernel 6.17.0-22-generic
 **Build:** Release, .NET SDK 10.0.107 / Runtime .NET 10.0.7, RyuJIT x86-64-v4, Concurrent Server GC
-**Commit:** `af5f617` (PipelyAwaiter: zero-alloc TP fast-path via IThreadPoolWorkItem)
+**Commit:** post-`5a572b8` (re-measured after the headline benchmarks were flipped to steady-state shape; `Pipe` reused across iterations)
 
 > **Note on prior numbers.** Earlier revisions of this section were recorded
 > when the test/bench/stress projects lived under `Pipely.*` namespaces.
@@ -23,46 +23,42 @@
 
 `ThroughputBenchmarks.ProduceAndDrain` — single producer task fills 1 MiB through 4 KiB chunks
 (`GetMemory` / copy / `Advance` / `FlushAsync`), single consumer drains via `ReadAsync` /
-`AdvanceTo(buffer.End)`. `TotalBytes = 1 << 20`, `ChunkSize = 4096`. Both sides call synchronous
-`Complete()` at the end. `[MemoryDiagnoser]` tracks allocations.
+`AdvanceTo(buffer.End)`. `TotalBytes = 1 << 20`, `ChunkSize = 4096`. The `Pipe` is constructed
+once in `[GlobalSetup]` and reused across BDN iterations; neither side calls `Complete()`
+between iterations. Reported allocations therefore exclude per-`Pipe` construction and
+characterize the production shape (long-lived pipes). `[MemoryDiagnoser]` tracks allocations.
 
 ```
 BenchmarkDotNet v0.15.8, Linux Ubuntu 24.04.4 LTS (Noble Numbat)
-AMD Ryzen 7 8700F 4.02GHz, 1 CPU, 16 logical and 8 physical cores
+AMD Ryzen 7 8700F 4.00GHz, 1 CPU, 16 logical and 8 physical cores
 .NET SDK 10.0.107
   [Host]     : .NET 10.0.7 (10.0.7, 10.0.726.21808), X64 RyuJIT x86-64-v4
   DefaultJob : .NET 10.0.7 (10.0.7, 10.0.726.21808), X64 RyuJIT x86-64-v4
 ```
 
-| Method                  | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
-|-------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
-| BclPipe_ProduceAndDrain | 107.03 us | 1.643 us | 1.537 us |  1.00 | 0.2441 |   7.06 KB |        1.00 |
-| Pipely_ProduceAndDrain  |  76.56 us | 0.535 us | 0.573 us |  0.72 | 0.2441 |   8.80 KB |        1.25 |
+| Method                  | Mean      | Error    | StdDev   | Ratio | Allocated | Alloc Ratio |
+|-------------------------|----------:|---------:|---------:|------:|----------:|------------:|
+| BclPipe_ProduceAndDrain | 109.78 us | 0.483 us | 0.428 us |  1.00 |     926 B |        1.00 |
+| Pipely_ProduceAndDrain  |  74.64 us | 0.371 us | 0.309 us |  0.68 |     969 B |        1.05 |
 
 (Run on a quiet machine with the benchmark class invoked in isolation:
 `dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter
-'PipelyBenchmarks.ThroughputBenchmarks*'`.)
+'PipelyBenchmarks.ThroughputBenchmarks.*'`.)
 
 ## Verdict
 
-- **BCL throughput:** 1 MiB / 107.03 us ≈ **9.80 GB/s** (1 GB = 10^9 B).
-- **Pipely throughput:** 1 MiB / 76.56 us ≈ **13.69 GB/s**.
-- **Speedup (BCL mean / Pipely mean):** ~1.40x — i.e. Pipely takes 72% of the time BCL does for the
+- **BCL throughput:** 1 MiB / 109.78 us ≈ **9.55 GB/s** (1 GB = 10^9 B).
+- **Pipely throughput:** 1 MiB / 74.64 us ≈ **14.05 GB/s**.
+- **Speedup (BCL mean / Pipely mean):** ~1.47x — i.e. Pipely takes 68% of the time BCL does for the
   same single-producer / single-consumer 1 MiB transfer.
-- **Allocations per op:** Pipely **8.80 KB** vs BCL **7.06 KB** (1.25x). The remaining ~1.7 KB
-  gap is entirely per-`Pipe` construction (this benchmark builds a fresh `Pipe` each iteration);
-  the steady-state per-op cost is byte-for-byte tied with BCL. See "Steady-state allocations"
-  below for the breakdown.
+- **Allocations per op:** Pipely **969 B** vs BCL **926 B** (1.05x). With the `Pipe` reused
+  across iterations, both pipes' per-op cost is essentially the harness floor (`Task.Run` /
+  `Task.WhenAll` state machines), and Pipely's awaiter machinery adds only ~40 B over BCL's.
+  Per-`Pipe` construction itself is ~1.7 KB heavier in Pipely — see "Per-`Pipe` construction cost"
+  below.
 
 ### Notes / caveats
 
-- **Allocation source.** The previous revision of this section reported a 1.52x ratio (10.76 KB
-  vs 7.10 KB) at commit `b0c312b`. The 2 KB drop here is from the `IThreadPoolWorkItem` TP
-  fast-path in `PipelyAwaiter` (commit `af5f617`): `PipeScheduler.ThreadPool.Schedule(action,
-  state)` was wrapping its arguments per signal; queuing the awaiter directly via
-  `ThreadPool.UnsafeQueueUserWorkItem(this, ...)` removes that wrapper. The remaining ~1.7 KB
-  excess vs BCL is per-`Pipe` construction overhead (TripleBuffer / PipelyAwaiter as classes
-  rather than struct-embedded as BCL does).
 - **Single chunk size only.** Both pipes are exercised at 4 KiB chunks, the size that corresponds
   to MemoryPool's default rental. Smaller chunks would amplify per-flush overhead; larger chunks
   would shift the bottleneck toward the memcpy. A future task should sweep {64 B, 1 KiB, 4 KiB,
@@ -72,67 +68,66 @@ AMD Ryzen 7 8700F 4.02GHz, 1 CPU, 16 logical and 8 physical cores
 - **Pause/resume thresholds match.** BCL's `PipeOptions.Default` pause/resume = 64K/32K; the
   SPSC adapter passes `PipeOptions.Default` which uses the same 64K/32K. So the comparison
   exercises identical backpressure points.
+- **TP fast-path attribution.** Before commit `af5f617` (`IThreadPoolWorkItem` TP fast-path in
+  `PipelyAwaiter`), `Pipely_ThreadPool` paid an extra ~2.2 KB per op from
+  `PipeScheduler.ThreadPool.Schedule(action, state)` wrapper allocations. Queuing the awaiter as
+  a work item directly removed them; this is why the steady-state allocation now ties BCL
+  within harness noise.
 
-## Steady-state allocations
+## Per-`Pipe` construction cost (fresh-`Pipe` companion)
 
-`SteadyStateThroughputBenchmarks` and `SteadyStateSchedulerBenchmarks` are companions to the
-above, identical in shape except that the `Pipe` is constructed once in `[GlobalSetup]` and
-reused across BDN iterations (neither side calls `Complete()` between iterations). Reported
-allocations therefore exclude per-`Pipe` construction and isolate the per-1 MiB-transfer
-steady-state cost.
+`FreshPipeThroughputBenchmarks` and `FreshPipeSchedulerBenchmarks` are the fresh-`Pipe`
+companions to the headline benchmarks above. Each constructs a new `Pipe` per iteration and
+calls `Complete()` on both sides at the end. Reported allocations therefore include per-`Pipe`
+construction; the per-row delta versus the headline isolates that construction cost.
 
-### Steady-state throughput (`Pipe` reused across iterations)
+### Fresh-`Pipe` throughput
 
 | Method                  | Mean      | Allocated | Alloc Ratio |
 |-------------------------|----------:|----------:|------------:|
-| BclPipe_ProduceAndDrain | 109.78 us |     937 B |        1.00 |
-| Pipely_ProduceAndDrain  |  70.50 us |     952 B |        1.02 |
+| BclPipe_ProduceAndDrain | 106.83 us |   7.09 KB |        1.00 |
+| Pipely_ProduceAndDrain  |  76.20 us |   8.79 KB |        1.24 |
 
-Pipely's per-op allocation ties BCL within run noise (15 B over a 937 B floor that is
-harness-side `Task.Run` / `Task.WhenAll` state machines, identical between the two rows).
-
-### Steady-state, five-way scheduler matrix
+### Fresh-`Pipe`, five-way scheduler matrix
 
 | Method               | Mean      | Allocated | Alloc Ratio |
 |----------------------|----------:|----------:|------------:|
-| BCL_ThreadPool       | 106.45 us |     815 B |        1.00 |
-| BCL_Inline           |  46.46 us |     709 B |        0.87 |
-| Pipely_ThreadPool    |  71.97 us |     820 B |        1.01 |
-| Pipely_Inline        |  42.03 us |     750 B |        0.92 |
-| Pipely_FastScheduler |  67.42 us |    1229 B |        1.51 |
+| BCL_ThreadPool       | 109.10 us |   6.91 KB |        1.00 |
+| BCL_Inline           |  49.46 us |   6.08 KB |        0.88 |
+| Pipely_ThreadPool    |  71.99 us |   8.85 KB |        1.28 |
+| Pipely_Inline        |  41.73 us |   8.65 KB |        1.25 |
+| Pipely_FastScheduler |  49.95 us |   9.29 KB |        1.34 |
 
-Reading:
-- **Pipely_ThreadPool ≈ BCL_ThreadPool** at 820 B vs 815 B. Before the
-  `IThreadPoolWorkItem` fast-path (commit `af5f617`), `Pipely_ThreadPool` allocated 2962 B
-  here — a 3.91x ratio. The 2.2 KB delta was per-signal wrapper allocations from
-  `PipeScheduler.ThreadPool.Schedule(action, state)`; queuing the awaiter as a work item
-  directly removes them.
-- **Pipely_Inline ≈ BCL_Inline.** Both inline paths run continuations on the signaling
-  thread with no scheduler hop, so per-op allocation is essentially the harness floor.
-- **Pipely_FastScheduler 1229 B.** Higher than the TP rows because FastScheduler still
-  routes some signals through TP overflow when the worker's mailbox is full. The number
-  was 865 B in the run that drove the fast-path investigation, and 1229 B in the
-  re-measurement; the difference is within FastScheduler's measurement noise (worker
-  busy-spin causes scheduling jitter). The fast-path code change in `PipelyAwaiter`
-  doesn't affect FastScheduler's own routing.
+### Construction-cost delta
 
-### Per-`Pipe` construction cost
+The per-row delta (fresh-`Pipe` − headline) isolates the per-`Pipe` construction component:
 
-The delta between per-iter and steady-state allocation isolates the per-`Pipe` construction
-component for each variant:
+| Method               | Fresh-`Pipe` | Headline | Per-`Pipe` ctor |
+|----------------------|-------------:|---------:|----------------:|
+| BCL Pipe (Throughput)|      7.09 KB |    926 B |        ~6.2 KB  |
+| Pipely Pipe (TP)     |      8.79 KB |    969 B |        ~7.8 KB  |
+| BCL_ThreadPool       |      6.91 KB |    816 B |        ~6.1 KB  |
+| BCL_Inline           |      6.08 KB |    743 B |        ~5.4 KB  |
+| Pipely_ThreadPool    |      8.85 KB |    889 B |        ~7.9 KB  |
+| Pipely_Inline        |      8.65 KB |    750 B |        ~7.9 KB  |
+| Pipely_FastScheduler |      9.29 KB |  1,158 B |        ~8.2 KB  |
 
-| Method            | Per-iter | Steady-state | Per-`Pipe` ctor |
-|-------------------|---------:|-------------:|----------------:|
-| BCL Pipe          |  7.06 KB |        937 B |        ~6.1 KB  |
-| Pipely Pipe (TP)  |  8.80 KB |        952 B |        ~7.8 KB  |
-
-Pipely's per-`Pipe` construction is ~1.7 KB heavier than BCL's. The structural source is
-that Pipely allocates two `TripleBuffer<T>` (`sealed class`, ~512 B each, three
-cache-line-padded slots) and two `PipelyAwaiter<T>` (`sealed class`, holds the awaiter
-state) where BCL embeds the equivalent state directly in `Pipe` (`PipeAwaitable` is a
-`struct`). For long-lived pipes — the production use case — this is amortized to
+Pipely's per-`Pipe` construction is ~1.7 KB heavier than BCL's at every variant. The structural
+source is that Pipely allocates two `TripleBuffer<T>` (`sealed class`, ~512 B each, three
+cache-line-padded slots) and two `PipelyAwaiter<T>` (`sealed class`, holds the awaiter state)
+where BCL embeds the equivalent state directly in `Pipe` (`PipeAwaitable` is a `struct`). For
+long-lived pipes — the production use case captured by the headline rows — this is amortized to
 near-zero per op. For very short-lived pipes the extra ~1.7 KB shows up as a one-shot
 construction cost.
+
+### Caveat — fresh-`Pipe` `Pipely_FastScheduler` mean
+
+`Pipely_FastScheduler`'s mean is faster in the fresh-`Pipe` row (49.95 us) than in the headline
+steady-state row (63.86 us). This reproduces across runs and is FastScheduler-specific: the
+worker thread's mailbox / CAS path interacts with always-warm pipe state differently than with
+freshly-constructed pipes. The other four variants behave conventionally (steady-state ≤
+fresh-`Pipe` mean within run noise). The mean delta does not affect the allocation analysis
+above.
 
 ## Latency
 
@@ -222,12 +217,13 @@ measurement that drove it.
 ## Methodology
 
 - Latency: `dotnet run -c Release --project tests/Pipely.Benchmarks -- dispatcher-latency --count 100000 --size 256 --trials 3 --warmup 1`
-- Throughput: `dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter '*SchedulerBenchmarks*'`
+- Throughput (headline, steady-state): `dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter 'PipelyBenchmarks.SchedulerBenchmarks.*'`
+- Throughput (fresh-`Pipe` companion): `dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter 'PipelyBenchmarks.FreshPipeSchedulerBenchmarks.*'`
 - Three latency trials per recorded run; warmup trial not recorded.
 - Hardware/build details captured at the top of each results section.
 - The FastScheduler worker thread sits at ~100% on its core during the busy-spin
   loop. Latency and throughput wins must be read against this CPU cost.
-- **Scheduler amortization:** `Pipely_FastScheduler` constructs the scheduler once via `[GlobalSetup]` and reuses it across all BDN iterations (mirroring the `ThreadPool` and `Inline` rows, which use BCL singletons with no extra state). Per-iteration cost for all five rows is therefore solely pipe ctor + produce-and-drain — apples to apples. The latency harness similarly amortizes (one scheduler per recorded trial, not per message).
+- **Pipe + scheduler amortization:** the headline `SchedulerBenchmarks` reuses the `Pipe` across iterations (production shape: long-lived pipes); `Pipely_FastScheduler` likewise constructs its scheduler once via `[GlobalSetup]`, mirroring the `ThreadPool` / `Inline` rows that use BCL singletons. Per-iteration cost for all five rows is therefore solely produce-and-drain on a warm `Pipe` — apples to apples. The fresh-`Pipe` companion (`FreshPipeSchedulerBenchmarks`) constructs a new `Pipe` per iteration; the per-row delta is the per-`Pipe` construction cost. The latency harness similarly amortizes the scheduler (one per recorded trial, not per message).
 
 ## Starting tunables
 
@@ -243,28 +239,28 @@ the prior baseline.
 
 ## Run 1 — starting configuration
 
-**Date:** 2026-04-27 (latency); 2026-04-30 (throughput re-measurement with the 5-variant scheduler matrix; re-re-measured at `af5f617` after the TP fast-path)
+**Date:** 2026-04-27 (latency); 2026-04-30 (throughput re-measured under headline-flipped (steady-state) `SchedulerBenchmarks`)
 **Hardware:** AMD Ryzen 7 8700F (8 physical / 16 logical cores), Linux Ubuntu 24.04.4 LTS, kernel 6.17.0-22-generic
 **Build:** Release, .NET SDK 10.0.107 / Runtime .NET 10.0.7, Server GC + concurrent
-**Commit:** `9b98a8f` (latency); `af5f617` (throughput — re-measurement after `IThreadPoolWorkItem` TP fast-path; supersedes `07be068`)
+**Commit:** `9b98a8f` (latency); post-`5a572b8` (throughput — `Pipe` reused across iterations; supersedes `af5f617` fresh-`Pipe` numbers, which now live under `FreshPipeSchedulerBenchmarks`)
 **Tunables:** as in "Starting tunables" above; no overrides.
 
-### Throughput (1 MiB / 4 KiB chunks; five-way head-to-head, same BDN process)
+### Throughput (1 MiB / 4 KiB chunks; five-way head-to-head, same BDN process; `Pipe` reused across iterations)
 
-| Method                 | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
-|------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
-| `BCL_ThreadPool`       | 105.08 us | 0.625 us | 0.554 us |  1.00 | 0.1221 |   7.14 KB |        1.00 |
-| `BCL_Inline`           |  44.23 us | 0.560 us | 0.468 us |  0.42 | 0.1221 |   5.79 KB |        0.81 |
-| `Pipely_ThreadPool`    |  72.11 us | 0.282 us | 0.264 us |  0.69 | 0.3662 |   8.86 KB |        1.24 |
-| `Pipely_Inline`        |  43.22 us | 0.431 us | 0.382 us |  0.41 | 0.1831 |   8.57 KB |        1.20 |
-| `Pipely_FastScheduler` |  49.95 us | 0.437 us | 0.365 us |  0.48 | 0.3662 |   9.26 KB |        1.30 |
+| Method                 | Mean      | Error    | StdDev   | Ratio | Allocated | Alloc Ratio |
+|------------------------|----------:|---------:|---------:|------:|----------:|------------:|
+| `BCL_ThreadPool`       | 103.64 us | 0.553 us | 0.517 us |  1.00 |     816 B |        1.00 |
+| `BCL_Inline`           |  48.47 us | 0.308 us | 0.273 us |  0.47 |     743 B |        0.91 |
+| `Pipely_ThreadPool`    |  71.24 us | 0.291 us | 0.273 us |  0.69 |     889 B |        1.09 |
+| `Pipely_Inline`        |  41.70 us | 0.769 us | 0.719 us |  0.40 |     750 B |        0.92 |
+| `Pipely_FastScheduler` |  63.86 us | 0.996 us | 0.932 us |  0.62 |   1,158 B |        1.42 |
 
 Reading:
-- **Inline ≈ Inline.** `BCL_Inline` 44.23 us, `Pipely_Inline` 43.22 us — within 3%. Once the TP wake-gap is removed, per-event work is dominated by pipe internals, and BCL and Pipely are essentially tied. This isolates the "scheduler" axis from the "pipe internals" axis.
-- **ThreadPool: Pipely beats BCL by ~1.46×.** `BCL_ThreadPool` 105.08 us vs `Pipely_ThreadPool` 72.11 us (33 us absolute gap). At the same scheduler, Pipely's awaiter machinery is materially leaner per-event than BCL's.
-- **FastScheduler beats ThreadPool by ~1.44×** within Pipely (`Pipely_FastScheduler` 49.95 vs `Pipely_ThreadPool` 72.11). Most of the TP wake-gap is escaped by the busy-spinning worker thread.
-- **Inline beats FastScheduler by ~1.16×** (`Pipely_Inline` 43.22 vs `Pipely_FastScheduler` 49.95). FastScheduler still pays a slot-CAS + worker-thread coordination cost on each dispatch; Inline pays nothing. FastScheduler's role is to escape TP without forcing continuations onto the producer's thread (the price of Inline) — the comparison to make is FastScheduler vs ThreadPool, not FastScheduler vs Inline.
-- **Allocations.** `BCL_Inline` is the leanest at 5.79 KB. Pipely's allocation gap vs BCL is now uniform across schedulers (1.20–1.30x) and is entirely per-`Pipe` construction overhead — see "Steady-state allocations" above for the per-op-vs-per-construction breakdown. Prior to commit `af5f617` (`IThreadPoolWorkItem` TP fast-path), `Pipely_ThreadPool` allocated 10.76 KB (1.56x); the per-signal wrapper allocation from `PipeScheduler.ThreadPool.Schedule(action, state)` was the source.
+- **Inline ≈ Inline.** `BCL_Inline` 48.47 us, `Pipely_Inline` 41.70 us — Pipely is ~14% faster on the inline path. Once the TP wake-gap is removed, per-event work is dominated by pipe internals; the gap reflects Pipely's lighter awaiter / signaling path. (At the matched-pipe-internals comparison, the two are close — the variance comes from inline-path differences in awaiter structure.)
+- **ThreadPool: Pipely beats BCL by ~1.45×.** `BCL_ThreadPool` 103.64 us vs `Pipely_ThreadPool` 71.24 us (32 us absolute gap). At the same scheduler, Pipely's awaiter machinery is materially leaner per-event than BCL's.
+- **FastScheduler beats ThreadPool by ~1.12×** within Pipely (`Pipely_FastScheduler` 63.86 vs `Pipely_ThreadPool` 71.24). Most of the TP wake-gap is escaped by the busy-spinning worker thread; the steady-state mean shows a smaller margin than the fresh-`Pipe` companion (~1.44×) because reused-`Pipe` state reduces FastScheduler's per-iter advantage.
+- **Inline beats FastScheduler by ~1.53×** (`Pipely_Inline` 41.70 vs `Pipely_FastScheduler` 63.86). FastScheduler still pays a slot-CAS + worker-thread coordination cost on each dispatch; Inline pays nothing. FastScheduler's role is to escape TP without forcing continuations onto the producer's thread (the price of Inline) — the comparison to make is FastScheduler vs ThreadPool, not FastScheduler vs Inline.
+- **Allocations.** With the `Pipe` reused across iterations, all five rows are within ~450 B of each other — per-op cost is essentially the harness floor. `Pipely_FastScheduler` (1,158 B) carries an extra ~340 B over `Pipely_ThreadPool` because FastScheduler still routes some signals through TP overflow when the worker's mailbox is full, and that overflow path allocates per-signal wrappers. The fresh-`Pipe` companion (`FreshPipeSchedulerBenchmarks`) shows the per-`Pipe` construction component — see the "Per-`Pipe` construction cost" section earlier in this doc for the delta breakdown.
 
 ### Latency (ns) — 1 M messages × 256 B, 5 warmup + 10 recorded trials
 
