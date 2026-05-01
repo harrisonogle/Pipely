@@ -4,8 +4,15 @@ using System.Threading.Tasks.Sources;
 
 namespace Pipely;
 
-internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
+internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>, IThreadPoolWorkItem
 {
+    // IThreadPoolWorkItem.Execute lets us be queued via
+    // ThreadPool.UnsafeQueueUserWorkItem(this, ...) — zero per-signal allocation,
+    // because the awaiter itself is the work-item node. Used only by the TP
+    // fast-path inside s_dispatch (when _dispatcher is PipeScheduler.ThreadPool);
+    // other dispatchers continue to go through PipeScheduler.Schedule(action, state).
+    void IThreadPoolWorkItem.Execute() => s_invokeWithEc(this);
+
     // RCA = false: with source-side EC capture, every signal-path SetResult/SetException
     // invokes our registered s_dispatch INLINE on the producer thread (RCA=false ⇒ MRVTSC
     // runs the registered callback synchronously on the calling thread). s_dispatch then
@@ -142,9 +149,20 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
         var awaiter = (PipelyAwaiter<T>)state!;
         var sc = awaiter._capturedSC;
         if (sc is not null)
+        {
             sc.Post(s_invokeWithEcSendOrPost!, awaiter);
+        }
+        else if (ReferenceEquals(awaiter._dispatcher, PipeScheduler.ThreadPool))
+        {
+            // TP fast-path: queue the awaiter itself as the work item. Avoids the
+            // wrapper allocation that PipeScheduler.ThreadPool.Schedule(Action<object?>,
+            // object) would otherwise pay per signal — the same trick BCL Pipe uses.
+            ThreadPool.UnsafeQueueUserWorkItem(awaiter, preferLocal: false);
+        }
         else
+        {
             awaiter._dispatcher.Schedule(s_invokeWithEc!, awaiter);
+        }
     };
 
     // SendOrPostCallback adapter for the SC.Post path. Forwards to s_invokeWithEc, which has
