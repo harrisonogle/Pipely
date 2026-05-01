@@ -10,13 +10,15 @@ Headline numbers on a single-producer / single-consumer 1 MiB transfer through 4
 
 | Method                 | Mean (μs) | Ratio | Allocated |
 |------------------------|----------:|------:|----------:|
-| `BCL_ThreadPool`       |    107.02 |  1.00 |   6.88 KB |
-| `BCL_Inline`           |     43.43 |  0.41 |   5.77 KB |
-| `Pipely_ThreadPool`    |     68.68 |  0.64 |  10.76 KB |
-| `Pipely_Inline`        |     41.85 |  0.39 |   8.55 KB |
-| `Pipely_FastScheduler` |     49.45 |  0.46 |   9.21 KB |
+| `BCL_ThreadPool`       |    105.08 |  1.00 |   7.14 KB |
+| `BCL_Inline`           |     44.23 |  0.42 |   5.79 KB |
+| `Pipely_ThreadPool`    |     72.11 |  0.69 |   8.86 KB |
+| `Pipely_Inline`        |     43.22 |  0.41 |   8.57 KB |
+| `Pipely_FastScheduler` |     49.95 |  0.48 |   9.26 KB |
 
-At the same scheduler, Pipely is **~1.56× faster than BCL** (`Pipely_ThreadPool` vs `BCL_ThreadPool`); with continuations inlined the two implementations are within 4%, so the gap is in the awaiter / signaling path rather than in the rest of the pipe.
+At the same scheduler, Pipely is **~1.46× faster than BCL** (`Pipely_ThreadPool` vs `BCL_ThreadPool`); with continuations inlined the two implementations are within 3%, so the gap is in the awaiter / signaling path rather than in the rest of the pipe.
+
+Allocations above are per-iteration with a fresh `Pipe` constructed each time. The companion `SteadyStateSchedulerBenchmarks` reuses the `Pipe` across iterations to isolate per-op cost from per-`Pipe` construction; under that measurement Pipely matches BCL byte-for-byte at every scheduler (within ~1%), and per-`Pipe` construction is ~1.7 KB heavier than BCL because Pipely uses two `TripleBuffer<T>` instances and two `PipelyAwaiter<T>` instances where BCL embeds awaitable state directly in `Pipe`. See [`RESULTS.md`](tests/Pipely.Benchmarks/RESULTS.md) for the breakdown.
 
 For latency under sustained throughput (256-byte messages, 100K samples, exact percentiles by sort), Pipely's P50 is ~1.2–1.4× lower and P90 is ~1.4–1.7× lower than BCL across all measured trials. Tail behavior (P99.9, Max) is dominated by GC and OS scheduling and is not consistently better for either pipe.
 
