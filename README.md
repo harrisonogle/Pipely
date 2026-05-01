@@ -55,7 +55,7 @@ var consumer = Task.Run(async () =>
 await Task.WhenAll(producer, consumer);
 ```
 
-`Pipely.PipeOptions` mirrors the BCL options (`MinimumSegmentSize`, `PauseWriterThreshold`, `ResumeWriterThreshold`, `ReaderScheduler`, `WriterScheduler`); the defaults match `PipeOptions.Default`.
+`Pipely.PipeOptions` mirrors the BCL options (`MinimumSegmentSize`, `PauseWriterThreshold`, `ResumeWriterThreshold`, `ReaderScheduler`, `WriterScheduler`, `UseSynchronizationContext`); the defaults match `PipeOptions.Default`.
 
 ## Design
 
