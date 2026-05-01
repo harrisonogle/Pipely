@@ -159,4 +159,47 @@ public class BclParityTests
         spsc.Writer.Complete();
         spsc.Writer.Complete();   // no throw
     }
+
+    [Theory]
+    [InlineData(PipeKind.Bcl)]
+    [InlineData(PipeKind.Pipely)]
+    public async Task UnflushedBytes_ParityScript_AdvanceFlushCompleteSequence(PipeKind kind)
+    {
+        var (reader, writer, disp) = CreatePipe(kind);
+        using (disp)
+        {
+            // Both BCL and Pipely override these to true.
+            Assert.True(writer.CanGetUnflushedBytes);
+
+            // Fresh pipe.
+            Assert.Equal(0L, writer.UnflushedBytes);
+
+            // Advance accumulates.
+            writer.GetMemory(100);
+            writer.Advance(40);
+            Assert.Equal(40L, writer.UnflushedBytes);
+
+            writer.Advance(10);
+            Assert.Equal(50L, writer.UnflushedBytes);
+
+            // FlushAsync resets to 0. Drain on the reader so backpressure
+            // is irrelevant and the flush completes synchronously.
+            var flushTask = writer.FlushAsync();
+            var read = await reader.ReadAsync();
+            reader.AdvanceTo(read.Buffer.End);
+            await flushTask;
+            Assert.Equal(0L, writer.UnflushedBytes);
+
+            // Post-flush Advance accumulates from 0.
+            writer.GetMemory(100);
+            writer.Advance(7);
+            Assert.Equal(7L, writer.UnflushedBytes);
+
+            // Complete resets to 0 (BCL: CommitUnsynchronized inside CompleteWriter;
+            // Pipely: snapshot publish in Complete writes _lastPublishedWriterState
+            // to current _totalWritten).
+            writer.Complete();
+            Assert.Equal(0L, writer.UnflushedBytes);
+        }
+    }
 }
