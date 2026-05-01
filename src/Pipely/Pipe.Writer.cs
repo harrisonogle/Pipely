@@ -153,6 +153,15 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
         }
     }
 
+    // ---------- UnflushedBytes (BCL parity) ----------
+    // Mirrors System.IO.Pipelines.Pipe.DefaultPipeWriter: pure accessors, no
+    // validation, no synchronization. Writer-thread-only by SPSC contract.
+
+    public override bool CanGetUnflushedBytes => true;
+
+    public override long UnflushedBytes
+        => _pipe._totalWritten - _pipe._lastPublishedWriterState.TotalWritten;
+
     private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
     {
         _pipe._flushAwaiter._ctr.Dispose();        // R5b cleanup
