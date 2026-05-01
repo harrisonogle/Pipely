@@ -838,6 +838,63 @@ public class PipeContinuationDispatcherTests
         Assert.Equal(0, Volatile.Read(ref dispatcherScheduleCount));
     }
 
+    // ---------- D.5 — SC honored on FlushAsync parking ----------
+
+    /// <summary>
+    /// Symmetric to D.4 but for the writer-side awaiter: with the default
+    /// UseSynchronizationContext = true, a parked FlushAsync continuation also honors a
+    /// non-default SynchronizationContext at the await site. Verifies that the wiring in
+    /// Pipe.cs forwards the option to both awaiters (read + flush).
+    /// </summary>
+    [Fact]
+    public async Task SynchronizationContext_AtAwait_Honored_ContinuationViaSCPost_FlushAsync()
+    {
+        int dispatcherScheduleCount = 0;
+        var dispatcher = new RecordingDispatcher(_ => Interlocked.Increment(ref dispatcherScheduleCount));
+
+        // Pause threshold is small so the FlushAsync parks deterministically.
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
+        {
+            ReaderScheduler = dispatcher,
+            WriterScheduler = dispatcher,
+            // UseSynchronizationContext defaults to true.
+        });
+
+        // Pre-fill the pipe so the next Write+Flush will park at the pause threshold.
+        // PipeOptions.PauseWriterThreshold default is 65536; write that much to push the
+        // writer over the pause line on the next flush.
+        var firstMem = pipe.Writer.GetMemory(70_000);
+        firstMem.Span.Clear();
+        pipe.Writer.Advance(70_000);
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+
+        try
+        {
+            // The reader will drain enough to drop us below ResumeWriterThreshold (default 32768),
+            // releasing the parked flush. Run after a small delay to guarantee the flush parks first.
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                var rr = await pipe.Reader.ReadAsync();
+                pipe.Reader.AdvanceTo(rr.Buffer.End);  // consume everything → unblock writer
+            });
+
+            // This FlushAsync parks (we're over PauseWriterThreshold). Continuation will resume
+            // on the SC's chosen thread.
+            await pipe.Writer.FlushAsync();
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+
+        Assert.Equal(1, Volatile.Read(ref sc.PostCount));
+        Assert.Equal(0, Volatile.Read(ref dispatcherScheduleCount));
+    }
+
     // ---------- E.1 — SetResult-fires-first race (direct-awaiter, N-iteration stress) ----------
 
     /// <summary>
