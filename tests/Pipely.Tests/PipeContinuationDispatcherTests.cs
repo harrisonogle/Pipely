@@ -895,6 +895,51 @@ public class PipeContinuationDispatcherTests
         Assert.Equal(0, Volatile.Read(ref dispatcherScheduleCount));
     }
 
+    // ---------- D.6 — default base SynchronizationContext is NOT honored ----------
+
+    /// <summary>
+    /// Even with <see cref="Pipely.PipeOptions.UseSynchronizationContext"/> = true, an SC whose
+    /// runtime type is exactly <see cref="SynchronizationContext"/> (the default base type) is
+    /// treated as "no SC" and does NOT cause SC.Post routing. Matches BCL's runtime check at
+    /// PipeAwaitable.cs:115-127. The continuation falls through to the configured dispatcher.
+    /// </summary>
+    [Fact]
+    public async Task SynchronizationContext_DefaultBaseType_NotHonored_FallsThroughToDispatcher()
+    {
+        using var dispatcher = new DedicatedThreadDispatcher();
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+
+        // Install the default base SynchronizationContext (NOT a derived type). The
+        // OnCompleted SC-capture branch sees this and rejects it via the GetType() check.
+        var defaultSc = new SynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(defaultSc);
+
+        string? observedThreadName = null;
+        try
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                var mem = pipe.Writer.GetMemory(5);
+                mem.Span.Clear();
+                pipe.Writer.Advance(5);
+                await pipe.Writer.FlushAsync();
+            });
+
+            var rr = await pipe.Reader.ReadAsync();
+            pipe.Reader.AdvanceTo(rr.Buffer.End);
+            observedThreadName = Thread.CurrentThread.Name;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+
+        // Continuation ran on the dispatcher's worker thread, NOT under the base SC.
+        Assert.Equal(nameof(DedicatedThreadDispatcher), observedThreadName);
+    }
+
     // ---------- E.1 — SetResult-fires-first race (direct-awaiter, N-iteration stress) ----------
 
     /// <summary>
