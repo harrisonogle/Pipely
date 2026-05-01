@@ -52,7 +52,7 @@ public sealed class FastScheduler : PipeScheduler, IDisposable
 
     /// <summary>
     /// Cumulative count of dispatches whose slot CAS lost and were forwarded to
-    /// <see cref="System.Threading.ThreadPool.UnsafeQueueUserWorkItem(Action{object?}, object?, bool)"/>.
+    /// <see cref="System.Threading.ThreadPool.UnsafeQueueUserWorkItem{TState}(Action{TState}, TState, bool)"/>.
     /// Internal — for benchmark diagnostics only.
     /// </summary>
     internal long TpOverflowedCount => Interlocked.Read(ref _tpOverflowedCount);
