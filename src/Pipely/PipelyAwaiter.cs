@@ -171,9 +171,10 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>, IThreadPoolWorkIte
     // re-allocating per dispatch.
     private static readonly SendOrPostCallback s_invokeWithEcSendOrPost = static state => s_invokeWithEc!(state);
 
-    // Invoked by the scheduler's chosen thread (FastScheduler worker, TP worker for overflow, or
-    // TP for PipeScheduler.ThreadPool). Reads the awaiter's fields, clears them, applies
-    // the consumer-captured EC if any, and invokes the continuation.
+    // Invoked by the scheduler's chosen thread (TP worker for PipeScheduler.ThreadPool,
+    // signaling thread for PipeScheduler.Inline, or whatever a custom PipeScheduler routes to).
+    // Reads the awaiter's fields, clears them, applies the consumer-captured EC if any,
+    // and invokes the continuation.
     private static readonly Action<object?> s_invokeWithEc = static state =>
     {
         var awaiter = (PipelyAwaiter<T>)state!;

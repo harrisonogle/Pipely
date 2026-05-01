@@ -6,15 +6,14 @@ Same usage and behavior as `System.IO.Pipelines.Pipe` — but lock-free, and wit
 
 ## Benchmarks
 
-Headline numbers on a single-producer / single-consumer 1 MiB transfer through 4 KiB chunks (AMD Ryzen 7 8700F, .NET 10, Server GC). The `Pipe` is constructed once and reused across iterations — the production shape for long-lived pipes. All five rows are from the same BenchmarkDotNet process invocation, so they are directly comparable.
+Headline numbers on a single-producer / single-consumer 1 MiB transfer through 4 KiB chunks (AMD Ryzen 7 8700F, .NET 10, Server GC). The `Pipe` is constructed once and reused across iterations — the production shape for long-lived pipes. All four rows are from the same BenchmarkDotNet process invocation, so they are directly comparable.
 
-| Method                 | Mean (μs) | Ratio | Allocated |
-|------------------------|----------:|------:|----------:|
-| `BCL_ThreadPool`       |    103.64 |  1.00 |     816 B |
-| `BCL_Inline`           |     48.47 |  0.47 |     743 B |
-| `Pipely_ThreadPool`    |     71.24 |  0.69 |     889 B |
-| `Pipely_Inline`        |     41.70 |  0.40 |     750 B |
-| `Pipely_FastScheduler` |     63.86 |  0.62 |   1,158 B |
+| Method              | Mean (μs) | Ratio | Allocated |
+|---------------------|----------:|------:|----------:|
+| `BCL_ThreadPool`    |    103.64 |  1.00 |     816 B |
+| `BCL_Inline`        |     48.47 |  0.47 |     743 B |
+| `Pipely_ThreadPool` |     71.24 |  0.69 |     889 B |
+| `Pipely_Inline`     |     41.70 |  0.40 |     750 B |
 
 At the same scheduler, Pipely is **~1.45× faster than BCL** (`Pipely_ThreadPool` vs `BCL_ThreadPool`); with continuations inlined the two implementations are within 5%, so the gap is in the awaiter / signaling path rather than in the rest of the pipe.
 
@@ -22,7 +21,7 @@ Allocations above are per-1 MiB-transfer with the `Pipe` reused across iteration
 
 For latency under sustained throughput (256-byte messages, 100K samples, exact percentiles by sort), Pipely's P50 is ~1.2–1.4× lower and P90 is ~1.4–1.7× lower than BCL across all measured trials. Tail behavior (P99.9, Max) is dominated by GC and OS scheduling and is not consistently better for either pipe.
 
-Full methodology, caveats, per-trial percentiles, and the FastScheduler workload analysis live in [`tests/Pipely.Benchmarks/RESULTS.md`](tests/Pipely.Benchmarks/RESULTS.md).
+Full methodology, caveats, and per-trial percentiles live in [`tests/Pipely.Benchmarks/RESULTS.md`](tests/Pipely.Benchmarks/RESULTS.md).
 
 ## Getting started
 
@@ -89,8 +88,6 @@ There is also a `Splice(IMemoryOwner<byte>, int start, int length)` overload for
 
 `PipeOptions.ReaderScheduler` and `PipeOptions.WriterScheduler` accept any `System.IO.Pipelines.PipeScheduler` and route parked `ReadAsync` / `FlushAsync` continuations the same way the BCL pipe does. `PipeScheduler.ThreadPool` is the default; `PipeScheduler.Inline` runs continuations on the signaling thread.
 
-Pipely also ships `Pipely.FastScheduler`, a busy-spinning `PipeScheduler` for streams where the ThreadPool's spin-then-sleep wake-gap is the dominant latency cost. It runs a dedicated worker thread at ~100% on its core, so it's a niche tool — useful when you need an off-thread continuation context but the TP wake-gap is too expensive, and not appropriate when continuations can run inline. See the FastScheduler section of [`RESULTS.md`](tests/Pipely.Benchmarks/RESULTS.md) for the workload analysis.
-
 ## Building, testing, benchmarks
 
 Requires the .NET 10 SDK.
@@ -106,7 +103,7 @@ Benchmarks (BenchmarkDotNet, run from the repo root):
 # Throughput: BCL vs Pipely, single-producer / single-consumer 1 MiB transfer
 dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter 'PipelyBenchmarks.ThroughputBenchmarks.*'
 
-# Five-variant scheduler matrix (BCL × Pipely × {ThreadPool, Inline} + Pipely_FastScheduler)
+# Four-variant scheduler matrix (BCL × Pipely × {ThreadPool, Inline})
 dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter 'PipelyBenchmarks.SchedulerBenchmarks.*'
 
 # Fresh-Pipe companions (per-Pipe construction cost = FreshPipe per-iter alloc - headline per-iter alloc)
@@ -114,7 +111,7 @@ dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter 'PipelyBench
 
 # Latency harness (sort-all-samples, exact percentiles)
 dotnet run -c Release --project tests/Pipely.Benchmarks -- \
-    dispatcher-latency --count 100000 --size 256 --trials 3 --warmup 1
+    latency --count 100000 --size 256 --trials 3 --warmup 1
 ```
 
 ## License

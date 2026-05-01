@@ -71,8 +71,6 @@ There is also a `Splice(IMemoryOwner<byte>, int start, int length)` overload for
 
 `PipeOptions.ReaderScheduler` and `PipeOptions.WriterScheduler` accept any `System.IO.Pipelines.PipeScheduler` and route parked `ReadAsync` / `FlushAsync` continuations the same way the BCL pipe does. `PipeScheduler.ThreadPool` is the default; `PipeScheduler.Inline` runs continuations on the signaling thread.
 
-Pipely also ships `Pipely.FastScheduler`, a busy-spinning `PipeScheduler` for streams where the ThreadPool's spin-then-sleep wake-gap is the dominant latency cost. It runs a dedicated worker thread at ~100% on its core, so it's a niche tool — useful when you need an off-thread continuation context but the TP wake-gap is too expensive, and not appropriate when continuations can run inline.
-
 ## Benchmarks and source
 
 - Repository: <https://github.com/harrisonogle/Pipely>

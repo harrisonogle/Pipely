@@ -3,11 +3,11 @@ using BenchmarkDotNet.Attributes;
 
 namespace PipelyBenchmarks;
 
-// Headline five-way scheduler matrix. Each Pipe is constructed once in
+// Headline four-way scheduler matrix. Each Pipe is constructed once in
 // [GlobalSetup] and reused across all BDN iterations — neither side calls
 // Complete() between iterations. Reported allocations exclude per-Pipe
 // construction and isolate steady-state per-1 MiB-transfer cost across the
-// five pipe × scheduler variants. This is the production-shape measurement
+// four pipe × scheduler variants. This is the production-shape measurement
 // (long-lived pipes) and drives the README's headline table.
 //
 // Pair with FreshPipeSchedulerBenchmarks: per-row (FreshPipe per-iter alloc) -
@@ -21,12 +21,10 @@ public class SchedulerBenchmarks
 
     private readonly byte[] _chunk = new byte[ChunkSize];
 
-    private Pipe?                 _bclTp;
-    private Pipe?                 _bclInline;
-    private Pipely.Pipe?          _pipelyTp;
-    private Pipely.Pipe?          _pipelyInline;
-    private Pipely.Pipe?          _pipelyFs;
-    private Pipely.FastScheduler? _scheduler;
+    private Pipe?        _bclTp;
+    private Pipe?        _bclInline;
+    private Pipely.Pipe? _pipelyTp;
+    private Pipely.Pipe? _pipelyInline;
 
     [GlobalSetup(Target = nameof(BCL_ThreadPool))]
     public void SetupBclTp() => _bclTp = new Pipe(new PipeOptions(
@@ -78,24 +76,6 @@ public class SchedulerBenchmarks
         _pipelyInline.Dispose();
     }
 
-    [GlobalSetup(Target = nameof(Pipely_FastScheduler))]
-    public void SetupPipelyFs()
-    {
-        _scheduler = new Pipely.FastScheduler();
-        _pipelyFs  = new Pipely.Pipe(new Pipely.PipeOptions(
-            readerScheduler: _scheduler,
-            writerScheduler: _scheduler));
-    }
-
-    [GlobalCleanup(Target = nameof(Pipely_FastScheduler))]
-    public void CleanupPipelyFs()
-    {
-        _pipelyFs!.Writer.Complete();
-        _pipelyFs.Reader.Complete();
-        _pipelyFs.Dispose();
-        _scheduler!.Dispose();
-    }
-
     [Benchmark(Baseline = true)]
     public Task BCL_ThreadPool() => ProduceAndDrain(_bclTp!.Reader, _bclTp.Writer);
 
@@ -107,9 +87,6 @@ public class SchedulerBenchmarks
 
     [Benchmark]
     public Task Pipely_Inline() => ProduceAndDrain(_pipelyInline!.Reader, _pipelyInline.Writer);
-
-    [Benchmark]
-    public Task Pipely_FastScheduler() => ProduceAndDrain(_pipelyFs!.Reader, _pipelyFs.Writer);
 
     private Task ProduceAndDrain(PipeReader reader, PipeWriter writer)
     {
