@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.IO.Pipelines;
+using System.Threading;
 using Xunit;
 
 namespace PipelyTests;
@@ -27,6 +28,31 @@ public class BclParityTests
     {
         public static readonly NoOpDisposable Instance = new();
         public void Dispose() { }
+    }
+
+    private sealed class CapturingSynchronizationContext : SynchronizationContext
+    {
+        public int PostCount;
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            Interlocked.Increment(ref PostCount);
+            ThreadPool.UnsafeQueueUserWorkItem(_ => d(state), null);
+        }
+    }
+
+    private static (PipeReader Reader, PipeWriter Writer, IDisposable Disposer) CreatePipeWithSyncCtx(PipeKind kind, bool useSyncCtx)
+    {
+        switch (kind)
+        {
+            case PipeKind.Bcl:
+                var bcl = new Pipe(new PipeOptions(useSynchronizationContext: useSyncCtx));
+                return (bcl.Reader, bcl.Writer, NoOpDisposable.Instance);
+            case PipeKind.Pipely:
+                var spsc = new Pipely.Pipe(new Pipely.PipeOptions { UseSynchronizationContext = useSyncCtx });
+                return (spsc.Reader, spsc.Writer, spsc);
+            default:
+                throw new ArgumentOutOfRangeException(nameof(kind));
+        }
     }
 
     [Theory]
@@ -210,5 +236,74 @@ public class BclParityTests
         Assert.True(new Pipely.PipeOptions().UseSynchronizationContext);
         Assert.True(new Pipely.PipeOptions { UseSynchronizationContext = true }.UseSynchronizationContext);
         Assert.False(new Pipely.PipeOptions { UseSynchronizationContext = false }.UseSynchronizationContext);
+    }
+
+    [Theory]
+    [InlineData(PipeKind.Bcl)]
+    [InlineData(PipeKind.Pipely)]
+    public async Task UseSynchronizationContext_True_SCIsHonored(PipeKind kind)
+    {
+        var (reader, writer, disp) = CreatePipeWithSyncCtx(kind, useSyncCtx: true);
+        using (disp)
+        {
+            var sc = new CapturingSynchronizationContext();
+            var prev = SynchronizationContext.Current;
+            SynchronizationContext.SetSynchronizationContext(sc);
+            try
+            {
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(50);
+                    var mem = writer.GetMemory(5);
+                    mem.Span.Clear();
+                    writer.Advance(5);
+                    await writer.FlushAsync();
+                });
+
+                var rr = await reader.ReadAsync();
+                reader.AdvanceTo(rr.Buffer.End);
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(prev);
+            }
+
+            Assert.True(Volatile.Read(ref sc.PostCount) > 0,
+                $"{kind}: expected SC.Post to be called when UseSynchronizationContext = true");
+        }
+    }
+
+    [Theory]
+    [InlineData(PipeKind.Bcl)]
+    [InlineData(PipeKind.Pipely)]
+    public async Task UseSynchronizationContext_False_SCIsBypassed(PipeKind kind)
+    {
+        var (reader, writer, disp) = CreatePipeWithSyncCtx(kind, useSyncCtx: false);
+        using (disp)
+        {
+            var sc = new CapturingSynchronizationContext();
+            var prev = SynchronizationContext.Current;
+            SynchronizationContext.SetSynchronizationContext(sc);
+            try
+            {
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(50);
+                    var mem = writer.GetMemory(5);
+                    mem.Span.Clear();
+                    writer.Advance(5);
+                    await writer.FlushAsync();
+                });
+
+                var rr = await reader.ReadAsync();
+                reader.AdvanceTo(rr.Buffer.End);
+            }
+            finally
+            {
+                SynchronizationContext.SetSynchronizationContext(prev);
+            }
+
+            Assert.Equal(0, Volatile.Read(ref sc.PostCount));
+        }
     }
 }
