@@ -998,6 +998,58 @@ public class PipeContinuationDispatcherTests
         Assert.Equal(0, Volatile.Read(ref sc.PostCount));
     }
 
+    // ---------- D.8 — EC preserved across the SC.Post hop ----------
+
+    /// <summary>
+    /// AsyncLocal&lt;T&gt; values set at the await site are visible inside the continuation
+    /// even when the continuation is dispatched via SC.Post (rather than the configured
+    /// dispatcher). This exercises the composition of two source-side captures: EC (existing)
+    /// and SC (new). The capturing SC runs the posted callback on a TP worker thread with
+    /// no inherited EC of its own — if the EC apply step were skipped on the SC.Post path,
+    /// AsyncLocal would not propagate.
+    /// </summary>
+    [Fact]
+    public async Task EC_PreservedAcrossSCPost_AsyncLocalVisibleInContinuation()
+    {
+        using var pipe = new Pipely.Pipe(); // default options → UseSynchronizationContext = true
+
+        var local = new AsyncLocal<int>();
+        local.Value = 0;
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+
+        int observedAsyncLocal = -1;
+        try
+        {
+            local.Value = 12345;  // set on the await thread, AFTER the SC is installed
+
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                var mem = pipe.Writer.GetMemory(5);
+                mem.Span.Clear();
+                pipe.Writer.Advance(5);
+                await pipe.Writer.FlushAsync();
+            });
+
+            var rr = await pipe.Reader.ReadAsync();
+            pipe.Reader.AdvanceTo(rr.Buffer.End);
+
+            // Read AsyncLocal from inside the continuation context. With EC capture +
+            // ExecutionContext.Run inside s_invokeWithEc, this should observe 12345.
+            observedAsyncLocal = local.Value;
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+
+        Assert.Equal(1, Volatile.Read(ref sc.PostCount));    // SC.Post was used
+        Assert.Equal(12345, observedAsyncLocal);             // EC propagated across the hop
+    }
+
     // ---------- E.1 — SetResult-fires-first race (direct-awaiter, N-iteration stress) ----------
 
     /// <summary>
