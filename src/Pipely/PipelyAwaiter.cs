@@ -46,6 +46,18 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
     // without a back-pointer to Pipe.
     private readonly PipeScheduler _dispatcher;
 
+    // When true, OnCompleted captures a non-default SynchronizationContext from the consumer
+    // thread; s_dispatch then routes the continuation via SC.Post instead of _dispatcher.Schedule.
+    // Set once at construction from PipeOptions.UseSynchronizationContext.
+    private readonly bool _useSyncContext;
+
+    // Source-side SC capture stash. Written in OnCompleted on the consumer thread (with
+    // Volatile.Write, ordered alongside _capturedEC / _realState / _realContinuation). Read by
+    // s_dispatch with a plain read; the publication happens-before edge is provided by MRVTSC's
+    // interlocked-on-_continuation (OnCompleted-fires-first path) or by the TP queue→dequeue
+    // (SetResult-fires-first race). Cleared in s_invokeWithEc on the dispatcher's thread.
+    private SynchronizationContext? _capturedSC;
+
     public const int Inactive   = 0b00;
     public const int Pending    = 0b01;
     public const int StateMask  = 0b01;
@@ -62,7 +74,11 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
     public long _lostWakeupResolvedCount;
     public long _lostCancelResolvedCount;
 
-    public PipelyAwaiter(PipeScheduler dispatcher) => _dispatcher = dispatcher;
+    public PipelyAwaiter(PipeScheduler dispatcher, bool useSynchronizationContext = false)
+    {
+        _dispatcher     = dispatcher;
+        _useSyncContext = useSynchronizationContext;
+    }
 
     public short Version => _core.Version;
     public T GetResult(short token) => _core.GetResult(token);
@@ -80,17 +96,36 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
                 ? ExecutionContext.Capture()
                 : null;
 
-        // Volatile.Write publication order: cap EC, then state, then continuation. The TP-dispatched
-        // s_dispatch in the SetResult-fires-first race reads these post-publication via the
-        // happens-before edge from queue-call to dequeued callback. See spec §4.
+        // Capture SynchronizationContext on the awaiter thread (the consumer's), under the same
+        // rationale as EC capture — capturing inside s_dispatch would observe the producer
+        // thread's SC, which is not what the consumer's await semantics promise. The SC is
+        // captured iff (a) the pipe was constructed with UseSynchronizationContext = true,
+        // (b) the consumer didn't suppress UseSchedulingContext in the await flags
+        // (e.g. ConfigureAwait(false) strips it), and (c) SC.Current is non-default
+        // (non-null and not exactly the base SynchronizationContext type — matches BCL's
+        // PipeAwaitable.OnCompleted check at runtime/PipeAwaitable.cs:115-127).
+        SynchronizationContext? sc = null;
+        if (_useSyncContext &&
+            (flags & ValueTaskSourceOnCompletedFlags.UseSchedulingContext) != 0)
+        {
+            var current = SynchronizationContext.Current;
+            if (current is not null && current.GetType() != typeof(SynchronizationContext))
+                sc = current;
+        }
+
+        // Volatile.Write publication order: cap EC, cap SC, then state, then continuation. The
+        // TP-dispatched s_dispatch in the SetResult-fires-first race reads these post-publication
+        // via the happens-before edge from queue-call to dequeued callback. See spec §4.
         Volatile.Write(ref _capturedEC, ec);
+        Volatile.Write(ref _capturedSC, sc);
         Volatile.Write(ref _realState, state);
         Volatile.Write(ref _realContinuation, continuation);
 
         // Strip both EC and SchedulingContext flags before forwarding. EC is captured by us;
         // leaving the flag on would have MRVTSC capture again (wasteful, unused). SchedulingContext
-        // is stripped to honor the dispatcher's contract — the dispatcher controls routing,
-        // not the consumer's captured SC/TaskScheduler. See spec §2.2 and §3.3.
+        // is stripped because routing is decided by us in s_dispatch (either through the captured
+        // SC or through the configured dispatcher); we don't want MRVTSC to also try to honor it.
+        // See spec §2.2 and §3.3.
         const ValueTaskSourceOnCompletedFlags suppressed =
             ValueTaskSourceOnCompletedFlags.FlowExecutionContext |
             ValueTaskSourceOnCompletedFlags.UseSchedulingContext;
@@ -100,12 +135,23 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
     // Registered with _core via OnCompleted. Invoked inline by MRVTSC.SetResult on the producer
     // thread (RCA=false), or — in the rare SetResult-fires-first race — queued to TP by MRVTSC
     // and invoked there. In either case, routes the work item (the awaiter itself, as state)
-    // through the dispatcher.
+    // through the captured SC if present, else through the configured dispatcher. Either path
+    // ends in s_invokeWithEc, which applies the captured EC and invokes the consumer's continuation.
     private static readonly Action<object?> s_dispatch = static state =>
     {
         var awaiter = (PipelyAwaiter<T>)state!;
-        awaiter._dispatcher.Schedule(s_invokeWithEc!, awaiter);
+        var sc = awaiter._capturedSC;
+        if (sc is not null)
+            sc.Post(s_invokeWithEcSendOrPost!, awaiter);
+        else
+            awaiter._dispatcher.Schedule(s_invokeWithEc!, awaiter);
     };
+
+    // SendOrPostCallback adapter for the SC.Post path. Forwards to s_invokeWithEc, which has
+    // the (object? state) signature already; SendOrPostCallback's signature is identical
+    // (it's also `void(object?)`), so the adapter is just a static delegate cache to avoid
+    // re-allocating per dispatch.
+    private static readonly SendOrPostCallback s_invokeWithEcSendOrPost = static state => s_invokeWithEc!(state);
 
     // Invoked by the scheduler's chosen thread (FastScheduler worker, TP worker for overflow, or
     // TP for PipeScheduler.ThreadPool). Reads the awaiter's fields, clears them, applies
@@ -119,6 +165,7 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>
         awaiter._realContinuation = null;
         awaiter._realState = null;
         awaiter._capturedEC = null;
+        awaiter._capturedSC = null;
 
         if (ec is not null)
         {

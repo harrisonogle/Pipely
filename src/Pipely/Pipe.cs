@@ -52,8 +52,8 @@ public sealed partial class Pipe : IDisposable
         _options = options;
         var readerScheduler = options.ReaderScheduler ?? PipeScheduler.ThreadPool;
         var writerScheduler = options.WriterScheduler ?? PipeScheduler.ThreadPool;
-        _readAwaiter    = new PipelyAwaiter<ReadResult>(readerScheduler);
-        _flushAwaiter   = new PipelyAwaiter<FlushResult>(writerScheduler);
+        _readAwaiter    = new PipelyAwaiter<ReadResult>(readerScheduler, options.UseSynchronizationContext);
+        _flushAwaiter   = new PipelyAwaiter<FlushResult>(writerScheduler, options.UseSynchronizationContext);
         _writerInstance = new PipeWriter(this);
         _readerInstance = new PipeReader(this);
     }
