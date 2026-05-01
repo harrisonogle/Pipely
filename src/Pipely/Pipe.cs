@@ -6,7 +6,8 @@ namespace Pipely;
 
 public sealed partial class Pipe : IDisposable
 {
-    internal readonly PipeOptions _options;
+    internal readonly System.IO.Pipelines.PipeOptions _options;
+    internal readonly int _maxFreelistSegments;
     internal readonly TripleBuffer<WriterState> _writerTb = new();
     internal readonly TripleBuffer<ReaderState> _readerTb = new();
     internal readonly PipelyAwaiter<ReadResult>  _readAwaiter;
@@ -47,9 +48,22 @@ public sealed partial class Pipe : IDisposable
     private readonly PipeReader _readerInstance;
 
     public Pipe() : this(PipeOptions.Default) { }
-    public Pipe(PipeOptions options)
+
+    public Pipe(PipeOptions options) : this(options, options.MaxFreelistSegments) { }
+
+    public Pipe(System.IO.Pipelines.PipeOptions options, int? maxFreelistSegments = null)
+        : this(
+            options,
+            maxFreelistSegments
+                ?? (options as PipeOptions)?.MaxFreelistSegments
+                ?? PipeOptions.Default.MaxFreelistSegments)
+    { }
+
+    private Pipe(System.IO.Pipelines.PipeOptions options, int maxFreelistSegments)
     {
+        if (maxFreelistSegments < 0) throw new ArgumentOutOfRangeException(nameof(maxFreelistSegments));
         _options = options;
+        _maxFreelistSegments = maxFreelistSegments;
         _readAwaiter    = new PipelyAwaiter<ReadResult>(options.ReaderScheduler, options.UseSynchronizationContext);
         _flushAwaiter   = new PipelyAwaiter<FlushResult>(options.WriterScheduler, options.UseSynchronizationContext);
         _writerInstance = new PipeWriter(this);
@@ -130,7 +144,7 @@ public sealed partial class Pipe : IDisposable
 
     internal void PushFreelist(BufferSegment s)
     {
-        if (_freelistCount >= _options.MaxFreelistSegments)
+        if (_freelistCount >= _maxFreelistSegments)
         {
             s.DisposeOwned();
             return;
@@ -144,7 +158,7 @@ public sealed partial class Pipe : IDisposable
 
     internal void PushDonatedShellFreelist(BufferSegment shell)
     {
-        if (_donatedShellFreelistCount >= _options.MaxFreelistSegments)
+        if (_donatedShellFreelistCount >= _maxFreelistSegments)
             return;     // cap exceeded; drop the shell to GC
         shell.SetFreelistNext(_donatedShellFreelistHead);
         _donatedShellFreelistHead = shell;
