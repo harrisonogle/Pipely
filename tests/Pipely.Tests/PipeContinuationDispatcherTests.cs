@@ -990,7 +990,8 @@ public class PipeContinuationDispatcherTests
         }
         finally
         {
-            // Restore in case the above didn't execute (exception path).
+            // Restore on exception path; idempotent on success (SC was already restored above
+            // before awaiting tcs.Task to avoid the Task<T> awaiter capturing it).
             SynchronizationContext.SetSynchronizationContext(prev);
         }
 
