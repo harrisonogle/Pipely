@@ -51,11 +51,9 @@ public class SchedulerBenchmarks
     [Benchmark]
     public async Task Pipely_ThreadPool()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
-        {
-            ReaderScheduler = PipeScheduler.ThreadPool,
-            WriterScheduler = PipeScheduler.ThreadPool,
-        });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
+            readerScheduler: PipeScheduler.ThreadPool,
+            writerScheduler: PipeScheduler.ThreadPool));
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
@@ -65,11 +63,9 @@ public class SchedulerBenchmarks
     [Benchmark]
     public async Task Pipely_Inline()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
-        {
-            ReaderScheduler = PipeScheduler.Inline,
-            WriterScheduler = PipeScheduler.Inline,
-        });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
+            readerScheduler: PipeScheduler.Inline,
+            writerScheduler: PipeScheduler.Inline));
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 
@@ -78,11 +74,9 @@ public class SchedulerBenchmarks
     [Benchmark]
     public async Task Pipely_FastScheduler()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
-        {
-            ReaderScheduler = _scheduler,
-            WriterScheduler = _scheduler,
-        });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
+            readerScheduler: _scheduler,
+            writerScheduler: _scheduler));
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
     }
 

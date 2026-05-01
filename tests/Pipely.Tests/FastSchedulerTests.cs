@@ -303,8 +303,8 @@ public class FastSchedulerTests
     public async Task SingleDispatcher_ServingMultiplePipes_CompletesAllAwaiters()
     {
         using var dispatcher = new Pipely.FastScheduler();
-        using var pipeA = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
-        using var pipeB = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+        using var pipeA = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        using var pipeB = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         static async Task Roundtrip(Pipely.Pipe pipe, int payloadBytes)
         {
@@ -332,7 +332,7 @@ public class FastSchedulerTests
     public async Task Pipe_WithFastScheduler_BasicReadFlush_RoundTrip()
     {
         using var dispatcher = new Pipely.FastScheduler();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         var readTask = pipe.Reader.ReadAsync().AsTask();
         Assert.False(readTask.IsCompleted, "Reader should park on the empty pipe.");
@@ -355,7 +355,7 @@ public class FastSchedulerTests
     {
         var asyncLocal = new AsyncLocal<int>();
         using var dispatcher = new Pipely.FastScheduler();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         asyncLocal.Value = 42;
 
@@ -396,7 +396,7 @@ public class FastSchedulerTests
         }, null);
         Assert.True(setupDone.Wait(TimeSpan.FromSeconds(5)));
 
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         consumerLocal.Value = 42;
 
@@ -424,7 +424,7 @@ public class FastSchedulerTests
     public async Task Pipe_WithFastScheduler_RapidParkResumeCycles_NoVersionMismatch()
     {
         using var dispatcher = new Pipely.FastScheduler();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         const int totalCycles  = 1000;
         const int messageBytes = 8;
@@ -502,10 +502,7 @@ public class FastSchedulerTests
         {
             for (int iter = 0; iter < iterations; iter++)
             {
-                using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
-                {
-                    ReaderScheduler = dispatcher, WriterScheduler = dispatcher,
-                });
+                using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
                 await ProduceAndDrainPerMessage(pipe.Reader, pipe.Writer, messageCount, chunkSize);
             }
         });

@@ -1,71 +1,42 @@
 using System.Buffers;
 using System.IO.Pipelines;
-using System.Threading;
 
 namespace Pipely;
 
-public sealed class PipeOptions
+/// <summary>
+/// Pipely options. Extends <see cref="System.IO.Pipelines.PipeOptions"/> with
+/// <see cref="MaxFreelistSegments"/>; all other knobs are inherited and behave
+/// identically to the BCL.
+/// </summary>
+public sealed class PipeOptions : System.IO.Pipelines.PipeOptions
 {
-    public MemoryPool<byte> Pool { get; }
-    public int  MinimumSegmentSize    { get; }
-    public long PauseWriterThreshold  { get; }
-    public long ResumeWriterThreshold { get; }
-    public int  MaxFreelistSegments   { get; }
-
     /// <summary>
-    /// Routes the reader's parked <c>ReadAsync</c> continuations to a thread of
-    /// the scheduler's choosing. Used when the reader awaits an empty pipe and
-    /// the writer signals the read awaiter on a subsequent flush. When null
-    /// (the default), <see cref="PipeScheduler.ThreadPool"/> is used.
-    /// Init-only: chosen once at pipe construction. See the BCL
-    /// <see cref="PipeScheduler"/> contract. Mirrors
-    /// <see cref="System.IO.Pipelines.PipeOptions.ReaderScheduler"/>.
+    /// Cap on the number of <see cref="BufferSegment"/>s the writer keeps in
+    /// each per-pipe freelist for reuse. Pipely-specific; no BCL analogue.
     /// </summary>
-    public PipeScheduler? ReaderScheduler { get; init; }
-
-    /// <summary>
-    /// Routes the writer's parked <c>FlushAsync</c> continuations to a thread of
-    /// the scheduler's choosing. Used when the writer is paused at the
-    /// pause-writer threshold and the reader advances past resume, signaling the
-    /// flush awaiter. When null (the default), <see cref="PipeScheduler.ThreadPool"/>
-    /// is used. Init-only: chosen once at pipe construction. See the BCL
-    /// <see cref="PipeScheduler"/> contract. Mirrors
-    /// <see cref="System.IO.Pipelines.PipeOptions.WriterScheduler"/>.
-    /// </summary>
-    public PipeScheduler? WriterScheduler { get; init; }
-
-    /// <summary>
-    /// When true (the default), parked read/flush continuations honor a non-default
-    /// <see cref="SynchronizationContext"/> captured at the await site, dispatching the
-    /// continuation via <see cref="SynchronizationContext.Post"/> instead of the configured
-    /// <see cref="ReaderScheduler"/>/<see cref="WriterScheduler"/>. When false, the configured
-    /// PipeScheduler always runs the continuation. The default base SynchronizationContext
-    /// (i.e. one whose runtime type is exactly <see cref="SynchronizationContext"/>) is treated
-    /// as "no SC" and falls through to the PipeScheduler. Init-only: chosen once at pipe
-    /// construction. Mirrors <see cref="System.IO.Pipelines.PipeOptions.UseSynchronizationContext"/>.
-    /// </summary>
-    public bool UseSynchronizationContext { get; init; } = true;
+    public int MaxFreelistSegments { get; }
 
     public PipeOptions(
         MemoryPool<byte>? pool = null,
-        int  minimumSegmentSize    = 4096,
-        long pauseWriterThreshold  = 65536,
-        long resumeWriterThreshold = 32768,
-        int  maxFreelistSegments   = 256)
+        PipeScheduler? readerScheduler = null,
+        PipeScheduler? writerScheduler = null,
+        long pauseWriterThreshold = 65536L,
+        long resumeWriterThreshold = 32768L,
+        int minimumSegmentSize = 4096,
+        bool useSynchronizationContext = true,
+        int maxFreelistSegments = 256)
+        : base(
+            pool: pool,
+            readerScheduler: readerScheduler,
+            writerScheduler: writerScheduler,
+            pauseWriterThreshold: pauseWriterThreshold,
+            resumeWriterThreshold: resumeWriterThreshold,
+            minimumSegmentSize: minimumSegmentSize,
+            useSynchronizationContext: useSynchronizationContext)
     {
-        if (minimumSegmentSize <= 0) throw new ArgumentOutOfRangeException(nameof(minimumSegmentSize));
-        if (pauseWriterThreshold < 0) throw new ArgumentOutOfRangeException(nameof(pauseWriterThreshold));
-        if (resumeWriterThreshold < 0) throw new ArgumentOutOfRangeException(nameof(resumeWriterThreshold));
-        if (pauseWriterThreshold > 0 && resumeWriterThreshold > pauseWriterThreshold)
-            throw new ArgumentException("ResumeWriterThreshold must be <= PauseWriterThreshold.", nameof(resumeWriterThreshold));
         if (maxFreelistSegments < 0) throw new ArgumentOutOfRangeException(nameof(maxFreelistSegments));
-
-        Pool = pool ?? MemoryPool<byte>.Shared;
-        MinimumSegmentSize    = minimumSegmentSize;
-        PauseWriterThreshold  = pauseWriterThreshold;
-        ResumeWriterThreshold = resumeWriterThreshold;
-        MaxFreelistSegments   = maxFreelistSegments;
+        MaxFreelistSegments = maxFreelistSegments;
     }
 
-    public static PipeOptions Default { get; } = new();
+    public static new PipeOptions Default { get; } = new();
 }

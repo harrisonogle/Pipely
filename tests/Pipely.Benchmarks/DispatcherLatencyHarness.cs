@@ -36,11 +36,9 @@ internal static class DispatcherLatencyHarness
     {
         if (messageBytes < 8) throw new ArgumentException("messageBytes must be >= 8 (timestamp prefix)");
 
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
-        {
-            ReaderScheduler = dispatcher,
-            WriterScheduler = dispatcher,
-        });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
+            readerScheduler: dispatcher,
+            writerScheduler: dispatcher));
 
         var samples = new long[messageCount];
         // Pre-touch every 4 KiB page to commit physical memory before the timed run.

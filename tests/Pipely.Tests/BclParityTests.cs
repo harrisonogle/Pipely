@@ -48,7 +48,7 @@ public class BclParityTests
                 var bcl = new Pipe(new PipeOptions(useSynchronizationContext: useSyncCtx));
                 return (bcl.Reader, bcl.Writer, NoOpDisposable.Instance);
             case PipeKind.Pipely:
-                var spsc = new Pipely.Pipe(new Pipely.PipeOptions { UseSynchronizationContext = useSyncCtx });
+                var spsc = new Pipely.Pipe(new Pipely.PipeOptions(useSynchronizationContext: useSyncCtx));
                 return (spsc.Reader, spsc.Writer, spsc);
             default:
                 throw new ArgumentOutOfRangeException(nameof(kind));
@@ -234,8 +234,8 @@ public class BclParityTests
     {
         Assert.True(Pipely.PipeOptions.Default.UseSynchronizationContext);
         Assert.True(new Pipely.PipeOptions().UseSynchronizationContext);
-        Assert.True(new Pipely.PipeOptions { UseSynchronizationContext = true }.UseSynchronizationContext);
-        Assert.False(new Pipely.PipeOptions { UseSynchronizationContext = false }.UseSynchronizationContext);
+        Assert.True(new Pipely.PipeOptions(useSynchronizationContext: true).UseSynchronizationContext);
+        Assert.False(new Pipely.PipeOptions(useSynchronizationContext: false).UseSynchronizationContext);
     }
 
     [Theory]

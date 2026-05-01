@@ -55,7 +55,7 @@ var consumer = Task.Run(async () =>
 await Task.WhenAll(producer, consumer);
 ```
 
-`Pipely.PipeOptions` mirrors the BCL options (`MinimumSegmentSize`, `PauseWriterThreshold`, `ResumeWriterThreshold`, `ReaderScheduler`, `WriterScheduler`, `UseSynchronizationContext`); the defaults match `PipeOptions.Default`.
+`Pipely.PipeOptions` extends `System.IO.Pipelines.PipeOptions` — it inherits every BCL knob (`Pool`, `MinimumSegmentSize`, `PauseWriterThreshold`, `ResumeWriterThreshold`, `ReaderScheduler`, `WriterScheduler`, `UseSynchronizationContext`) with the same defaults, and adds `MaxFreelistSegments` for Pipely's per-pipe segment freelist.
 
 ## Design
 
