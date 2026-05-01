@@ -799,8 +799,6 @@ public class PipeContinuationDispatcherTests
     [Fact]
     public async Task SynchronizationContext_AtAwait_Honored_ContinuationViaSCPost_ReadAsync()
     {
-        int testThreadId = Environment.CurrentManagedThreadId;
-
         // Use a recording dispatcher with a counter so we can assert it was NOT consulted
         // for the parked-read continuation.
         int dispatcherScheduleCount = 0;
@@ -852,7 +850,7 @@ public class PipeContinuationDispatcherTests
         int dispatcherScheduleCount = 0;
         var dispatcher = new RecordingDispatcher(_ => Interlocked.Increment(ref dispatcherScheduleCount));
 
-        // Pause threshold is small so the FlushAsync parks deterministically.
+        // Pre-write past PauseWriterThreshold (default 65536) below so the FlushAsync parks deterministically.
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions
         {
             ReaderScheduler = dispatcher,
