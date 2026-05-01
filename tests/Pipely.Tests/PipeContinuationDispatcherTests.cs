@@ -603,11 +603,10 @@ public class PipeContinuationDispatcherTests
     // ---------- D.1 — SynchronizationContext at await site is NOT honored ----------
 
     /// <summary>
-    /// A non-default SynchronizationContext set at the await site is NOT honored: the
-    /// continuation runs on the dispatcher's chosen thread, NOT on the SC's thread. The
-    /// new Pipely.PipelyAwaiter.OnCompleted strips UseSchedulingContext from the flags forwarded
-    /// to _core.OnCompleted, so MRVTSC does not capture the SC. The captured SC's
-    /// PostCount stays 0; the continuation thread name is the dispatcher's thread.
+    /// With <see cref="Pipely.PipeOptions.UseSynchronizationContext"/> = false, a non-default
+    /// SynchronizationContext set at the await site is NOT honored: the continuation runs on
+    /// the dispatcher's chosen thread, NOT on the SC's thread. The captured SC's PostCount
+    /// stays 0; the continuation thread name is the dispatcher's thread.
     /// </summary>
     [Fact]
     public async Task SynchronizationContext_AtAwait_NotHonored_ContinuationOnDispatcherThread()
@@ -621,7 +620,7 @@ public class PipeContinuationDispatcherTests
         int? observedThreadId = null;
 
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher, UseSynchronizationContext = false });
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
@@ -648,7 +647,7 @@ public class PipeContinuationDispatcherTests
             SynchronizationContext.SetSynchronizationContext(prev);
         }
 
-        // Captured SC was bypassed — PostCount stays 0.
+        // UseSynchronizationContext = false → captured SC is bypassed. PostCount stays 0.
         Assert.Equal(0, Volatile.Read(ref sc.PostCount));
         // Continuation ran on the dispatcher's worker thread, not the test/SC thread.
         Assert.Equal(nameof(DedicatedThreadDispatcher), observedThreadName);
@@ -658,11 +657,14 @@ public class PipeContinuationDispatcherTests
     // ---------- D.2 — TaskScheduler at await site is NOT honored ----------
 
     /// <summary>
-    /// A non-default TaskScheduler captured by the consumer's await (here, via
+    /// With <see cref="Pipely.PipeOptions.UseSynchronizationContext"/> = false, a non-default
+    /// TaskScheduler captured by the consumer's await (here, via
     /// TaskScheduler.FromCurrentSynchronizationContext on a custom SC) is NOT honored.
-    /// Same mechanism as D.1: stripping UseSchedulingContext in OnCompleted prevents
-    /// MRVTSC from capturing the scheduler. The continuation runs on the dispatcher's
-    /// chosen thread, not the scheduler's thread.
+    /// The continuation runs on the dispatcher's chosen thread, not the scheduler's thread.
+    ///
+    /// (Even with the option set to true, Pipely never captures TaskScheduler.Current —
+    /// only SynchronizationContext.Current. This test happens to also verify that side
+    /// of the design via the SC.Post-based TaskScheduler.FromCurrentSynchronizationContext.)
     ///
     /// Note on test structure: Task.Factory.StartNew with a custom TaskScheduler
     /// (derived from CurrentSynchronizationContext) routes through SC.Post to queue
@@ -680,7 +682,7 @@ public class PipeContinuationDispatcherTests
         int testThreadId = Environment.CurrentManagedThreadId;
 
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher, UseSynchronizationContext = false });
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
@@ -730,13 +732,11 @@ public class PipeContinuationDispatcherTests
     // ---------- D.3 — ConfigureAwait(true) vs ConfigureAwait(false) parity ----------
 
     /// <summary>
-    /// With the new source-side EC-capture wiring, ConfigureAwait(true) and
-    /// ConfigureAwait(false) produce identical observable behavior on a Pipe await:
-    /// both run the continuation on the dispatcher's chosen thread regardless of the
-    /// consumer's captured SC/TaskScheduler. This was the original Mechanism A pin —
-    /// the BDN deadlock disappeared when ConfigureAwait(false) was added; with the
-    /// new wiring, both directions are equivalent because the SC is never captured
-    /// (UseSchedulingContext is stripped in OnCompleted).
+    /// With <see cref="Pipely.PipeOptions.UseSynchronizationContext"/> = false,
+    /// ConfigureAwait(true) and ConfigureAwait(false) produce identical observable behavior on
+    /// a Pipe await: both run the continuation on the dispatcher's chosen thread regardless of
+    /// the consumer's captured SC. The SC is never captured (UseSynchronizationContext = false
+    /// suppresses it), so the ConfigureAwait flag has no effect on dispatch.
     /// </summary>
     [Theory]
     [InlineData(true)]
@@ -750,7 +750,7 @@ public class PipeContinuationDispatcherTests
         int testThreadId = Environment.CurrentManagedThreadId;
 
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher, UseSynchronizationContext = false });
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
