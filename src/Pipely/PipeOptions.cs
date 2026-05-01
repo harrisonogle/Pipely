@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.IO.Pipelines;
+using System.Threading;
 
 namespace Pipely;
 
@@ -32,6 +33,18 @@ public sealed class PipeOptions
     /// <see cref="System.IO.Pipelines.PipeOptions.WriterScheduler"/>.
     /// </summary>
     public PipeScheduler? WriterScheduler { get; init; }
+
+    /// <summary>
+    /// When true (the default), parked read/flush continuations honor a non-default
+    /// <see cref="SynchronizationContext"/> captured at the await site, dispatching the
+    /// continuation via <see cref="SynchronizationContext.Post"/> instead of the configured
+    /// <see cref="ReaderScheduler"/>/<see cref="WriterScheduler"/>. When false, the configured
+    /// PipeScheduler always runs the continuation. The default base SynchronizationContext
+    /// (i.e. one whose runtime type is exactly <see cref="SynchronizationContext"/>) is treated
+    /// as "no SC" and falls through to the PipeScheduler. Init-only: chosen once at pipe
+    /// construction. Mirrors <see cref="System.IO.Pipelines.PipeOptions.UseSynchronizationContext"/>.
+    /// </summary>
+    public bool UseSynchronizationContext { get; init; } = true;
 
     public PipeOptions(
         MemoryPool<byte>? pool = null,

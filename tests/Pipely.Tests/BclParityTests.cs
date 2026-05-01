@@ -202,4 +202,13 @@ public class BclParityTests
             Assert.Equal(0L, writer.UnflushedBytes);
         }
     }
+
+    [Fact]
+    public void UseSynchronizationContext_DefaultIsTrue()
+    {
+        Assert.True(Pipely.PipeOptions.Default.UseSynchronizationContext);
+        Assert.True(new Pipely.PipeOptions().UseSynchronizationContext);
+        Assert.True(new Pipely.PipeOptions { UseSynchronizationContext = true }.UseSynchronizationContext);
+        Assert.False(new Pipely.PipeOptions { UseSynchronizationContext = false }.UseSynchronizationContext);
+    }
 }
