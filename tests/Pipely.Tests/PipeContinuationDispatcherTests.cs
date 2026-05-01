@@ -787,6 +787,57 @@ public class PipeContinuationDispatcherTests
         Assert.NotEqual(testThreadId, observedThreadId);
     }
 
+    // ---------- D.4 — SC honored when UseSynchronizationContext = true (default, ReadAsync) ----------
+
+    /// <summary>
+    /// With <see cref="Pipely.PipeOptions.UseSynchronizationContext"/> = true (the default),
+    /// a non-default SynchronizationContext set at the await site IS honored: the parked
+    /// ReadAsync continuation dispatches via SC.Post (PostCount > 0) rather than through the
+    /// configured ReaderScheduler. The continuation observes the SC's chosen thread, not the
+    /// dispatcher's worker thread.
+    /// </summary>
+    [Fact]
+    public async Task SynchronizationContext_AtAwait_Honored_ContinuationViaSCPost_ReadAsync()
+    {
+        int testThreadId = Environment.CurrentManagedThreadId;
+
+        // Use a recording dispatcher with a counter so we can assert it was NOT consulted
+        // for the parked-read continuation.
+        int dispatcherScheduleCount = 0;
+        var dispatcher = new RecordingDispatcher(_ => Interlocked.Increment(ref dispatcherScheduleCount));
+
+        // Default options: UseSynchronizationContext = true.
+        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions { ReaderScheduler = dispatcher, WriterScheduler = dispatcher });
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+
+        try
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(50);
+                var mem = pipe.Writer.GetMemory(5);
+                mem.Span.Clear();
+                pipe.Writer.Advance(5);
+                await pipe.Writer.FlushAsync();
+            });
+
+            var rr = await pipe.Reader.ReadAsync();
+            pipe.Reader.AdvanceTo(rr.Buffer.End);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+
+        // SC.Post was called exactly once for the parked-read continuation.
+        Assert.Equal(1, Volatile.Read(ref sc.PostCount));
+        // The configured dispatcher was NOT consulted for that continuation.
+        Assert.Equal(0, Volatile.Read(ref dispatcherScheduleCount));
+    }
+
     // ---------- E.1 — SetResult-fires-first race (direct-awaiter, N-iteration stress) ----------
 
     /// <summary>
