@@ -159,6 +159,9 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
 
     public override bool CanGetUnflushedBytes => true;
 
+    public override long UnflushedBytes
+        => _pipe._totalWritten - _pipe._lastPublishedWriterState.TotalWritten;
+
     private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
     {
         _pipe._flushAwaiter._ctr.Dispose();        // R5b cleanup
