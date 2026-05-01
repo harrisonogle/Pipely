@@ -940,6 +940,63 @@ public class PipeContinuationDispatcherTests
         Assert.Equal(nameof(DedicatedThreadDispatcher), observedThreadName);
     }
 
+    // ---------- D.7 — UseSchedulingContext stripped at await site → SC not captured ----------
+
+    /// <summary>
+    /// Even with <see cref="Pipely.PipeOptions.UseSynchronizationContext"/> = true, if the
+    /// consumer's await suppresses <see cref="ValueTaskSourceOnCompletedFlags.UseSchedulingContext"/>
+    /// (which is what <c>ConfigureAwait(false)</c> does on a ValueTask-returning method), the SC is
+    /// NOT captured and the continuation falls through to the configured dispatcher.
+    /// Drives the awaiter directly to control the flags precisely (the high-level
+    /// <c>ConfigureAwait(false)</c>-via-Pipe path is also covered indirectly by D.3).
+    /// </summary>
+    [Fact]
+    public async Task SynchronizationContext_FlagSuppressed_NotCaptured()
+    {
+        using var dispatcher = new ForwardingDispatcher();
+        var awaiter = new Pipely.PipelyAwaiter<int>(dispatcher, useSynchronizationContext: true);
+
+        var sc = new CapturingSynchronizationContext();
+        var prev = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(sc);
+
+        try
+        {
+            // Producer signals first; consumer registers without UseSchedulingContext flag.
+            // s_dispatch fires (via TP queue, since SetResult was first), reads _capturedSC,
+            // sees null (because we suppressed the flag), and routes through dispatcher → TP.
+            // SC.Post is NEVER called.
+            awaiter._core.SetResult(42);
+
+            var tcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            awaiter.OnCompleted(_ =>
+            {
+                try { tcs.SetResult(awaiter._core.GetResult(awaiter.Version)); }
+                catch (Exception ex) { tcs.SetException(ex); }
+            },
+            state: null,
+            awaiter.Version,
+            // FlowExecutionContext is set, but UseSchedulingContext is NOT — this is the
+            // moral equivalent of ConfigureAwait(false) at the awaiter level.
+            ValueTaskSourceOnCompletedFlags.FlowExecutionContext);
+
+            // Clear the SC before awaiting tcs.Task so that the await on tcs.Task itself
+            // doesn't cause SC.Post to be called (we're only testing that our PipelyAwaiter
+            // didn't capture the SC, not that all awaits in the test don't use the SC).
+            SynchronizationContext.SetSynchronizationContext(prev);
+
+            int result = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(42, result);
+        }
+        finally
+        {
+            // Restore in case the above didn't execute (exception path).
+            SynchronizationContext.SetSynchronizationContext(prev);
+        }
+
+        Assert.Equal(0, Volatile.Read(ref sc.PostCount));
+    }
+
     // ---------- E.1 — SetResult-fires-first race (direct-awaiter, N-iteration stress) ----------
 
     /// <summary>
