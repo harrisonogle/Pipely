@@ -130,4 +130,19 @@ public class PipeWriterUnflushedBytesTests
         await pipe.Writer.FlushAsync();
         Assert.Equal(0L, pipe.Writer.UnflushedBytes);
     }
+
+    [Fact]
+    public void UnflushedBytes_AfterDispose_ReturnsLastValue_NoThrow()
+    {
+        var pipe = new Pipely.Pipe();
+        pipe.Writer.GetMemory(100);
+        pipe.Writer.Advance(40);
+        Assert.Equal(40L, pipe.Writer.UnflushedBytes);
+
+        pipe.Dispose();
+
+        // Matches BCL: pure accessor, no validation, returns whatever the
+        // underlying field state holds. Dispose does not mutate either field.
+        Assert.Equal(40L, pipe.Writer.UnflushedBytes);
+    }
 }
