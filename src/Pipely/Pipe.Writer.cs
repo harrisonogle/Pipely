@@ -162,6 +162,15 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
     public override long UnflushedBytes
         => _pipe._totalWritten - _pipe._lastPublishedWriterState.TotalWritten;
 
+    // ---------- BufferedBytes (Pipely extension) ----------
+    // Everything currently held in pipe buffers: staging (unflushed) plus
+    // published-but-not-yet-consumed by the reader. UnflushedBytes ⊂ BufferedBytes.
+    // Writer-thread-only, pure accessor with no acquire side-effect — TotalConsumed
+    // freshness is bounded by flush cadence (refreshed inside FlushAsync).
+
+    public long BufferedBytes
+        => _pipe._totalWritten - _pipe._lastAcquiredReaderState.TotalConsumed;
+
     private ValueTask<FlushResult> ParkFlushAwaiter(CancellationToken ct)
     {
         _pipe._flushAwaiter._ctr.Dispose();        // R5b cleanup
