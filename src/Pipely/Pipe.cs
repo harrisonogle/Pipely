@@ -1,11 +1,17 @@
 using System.Buffers;
 using System.IO.Pipelines;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace Pipely;
 
+[StructLayout(LayoutKind.Sequential)]
 public sealed partial class Pipe : IDisposable
 {
+    [InlineArray(128)]
+    private struct CacheLinePad { private byte _b; }
+
     internal readonly System.IO.Pipelines.PipeOptions _options;
     internal readonly int _maxFreelistSegments;
     internal readonly TripleBuffer<WriterState> _writerTb = new();
@@ -13,7 +19,11 @@ public sealed partial class Pipe : IDisposable
     internal readonly PipelyAwaiter<ReadResult>  _readAwaiter;
     internal readonly PipelyAwaiter<FlushResult> _flushAwaiter;
 
-    // Writer-side cursors (writer thread only).
+#pragma warning disable CS0169  // unused field; intentional cache-line padding
+    private CacheLinePad _padBeforeWriterFields;
+#pragma warning restore CS0169
+
+    // Writer-side cursors (writer thread only). Isolated on its own cache lines.
     internal BufferSegment? _chainHead;
     internal BufferSegment? _writingHead;
     internal int  _writingHeadBytesBuffered;
@@ -26,7 +36,11 @@ public sealed partial class Pipe : IDisposable
     internal ReaderState _lastAcquiredReaderState;
     internal bool _writerCompleted;
 
-    // Reader-side cursors (reader thread only).
+#pragma warning disable CS0169
+    private CacheLinePad _padBetweenWriterAndReader;
+#pragma warning restore CS0169
+
+    // Reader-side cursors (reader thread only). Isolated on its own cache lines.
     internal BufferSegment? _readHead;
     internal int _readHeadIdx;
     internal BufferSegment? _readTail;
