@@ -5,7 +5,8 @@ using System.CommandLine;
 // Subcommand-style routing:
 //   (no args, or BDN args like --filter / --job)  → BenchmarkSwitcher (BDN auto-discovery)
 //   latency                                       → BCL-vs-Pipe latency harness
-if (args.Length == 0 || args[0] != "latency")
+//   cache-bench                                   → pinned busy-poll harness for `perf c2c`
+if (args.Length == 0 || (args[0] != "latency" && args[0] != "cache-bench"))
 {
     BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);
     return 0;
@@ -14,6 +15,7 @@ if (args.Length == 0 || args[0] != "latency")
 var rootCommand = new RootCommand("Benchmark harness")
 {
     BuildLatencyCommand(),
+    BuildCacheBenchCommand(),
 };
 
 return await rootCommand.Parse(args).InvokeAsync();
@@ -88,6 +90,125 @@ static Command BuildLatencyCommand()
     });
 
     return latencyCommand;
+}
+
+static Command BuildCacheBenchCommand()
+{
+    var pipeOption = new Option<string>("--pipe")
+    {
+        Description = "Pipe implementation: bcl or pipely",
+        DefaultValueFactory = _ => "pipely",
+    };
+
+    var producerCoreOption = new Option<int>("--producer-core")
+    {
+        Description = "CPU index for the producer thread",
+        DefaultValueFactory = _ => 0,
+    };
+
+    var consumerCoreOption = new Option<int>("--consumer-core")
+    {
+        Description = "CPU index for the consumer thread",
+        DefaultValueFactory = _ => 2,
+    };
+
+    var durationOption = new Option<int>("--duration")
+    {
+        Description = "Run duration in seconds",
+        DefaultValueFactory = _ => 10,
+    };
+
+    var totalBytesOption = new Option<int>("--total-bytes")
+    {
+        Description = "Bytes transferred per cycle",
+        DefaultValueFactory = _ => 1 << 20,
+    };
+
+    var chunkOption = new Option<int>("--chunk")
+    {
+        Description = "Chunk size in bytes",
+        DefaultValueFactory = _ => 4096,
+    };
+
+    var waitForAttachOption = new Option<bool>("--wait-for-attach")
+    {
+        Description = "Print PID then wait for Enter before running. Use to attach `perf c2c record -p <pid>` before the run.",
+        DefaultValueFactory = _ => false,
+    };
+
+    var cmd = new Command("cache-bench", "Run a pinned busy-poll workload for `perf c2c` cache-line attribution (BCL or Pipely)")
+    {
+        pipeOption,
+        producerCoreOption,
+        consumerCoreOption,
+        durationOption,
+        totalBytesOption,
+        chunkOption,
+        waitForAttachOption,
+    };
+
+    cmd.SetAction(parseResult =>
+    {
+        string pipe = parseResult.GetValue(pipeOption) ?? "pipely";
+        int producerCore = parseResult.GetValue(producerCoreOption);
+        int consumerCore = parseResult.GetValue(consumerCoreOption);
+        int duration     = parseResult.GetValue(durationOption);
+        int totalBytes   = parseResult.GetValue(totalBytesOption);
+        int chunkSize    = parseResult.GetValue(chunkOption);
+        bool waitForAttach = parseResult.GetValue(waitForAttachOption);
+
+        return RunCacheBench(pipe, producerCore, consumerCore, duration, totalBytes, chunkSize, waitForAttach);
+    });
+
+    return cmd;
+}
+
+static int RunCacheBench(string pipe, int producerCore, int consumerCore, int duration, int totalBytes, int chunkSize, bool waitForAttach)
+{
+    using IPipeAdapter adapter = pipe.ToLowerInvariant() switch
+    {
+        "bcl" => new BclPipeAdapter(new System.IO.Pipelines.PipeOptions(
+            readerScheduler:           System.IO.Pipelines.PipeScheduler.Inline,
+            writerScheduler:           System.IO.Pipelines.PipeScheduler.Inline,
+            pauseWriterThreshold:      0,
+            resumeWriterThreshold:     0,
+            useSynchronizationContext: false)),
+        "pipely" => new PipelyPipeAdapter(new Pipely.PipeOptions(
+            readerScheduler:           System.IO.Pipelines.PipeScheduler.Inline,
+            writerScheduler:           System.IO.Pipelines.PipeScheduler.Inline,
+            pauseWriterThreshold:      0,
+            resumeWriterThreshold:     0,
+            useSynchronizationContext: false)),
+        _ => throw new ArgumentException($"--pipe must be 'bcl' or 'pipely', was '{pipe}'"),
+    };
+
+    using var runner = new PinnedPipeRunner(adapter, producerCore, consumerCore, totalBytes, chunkSize);
+
+    Console.WriteLine($"PID: {Environment.ProcessId}");
+    Console.WriteLine($"Pipe: {pipe}  Producer cpu: {producerCore} (observed {runner.ProducerObservedCpu})  Consumer cpu: {consumerCore} (observed {runner.ConsumerObservedCpu})");
+    Console.WriteLine($"Cycle: {totalBytes} bytes / {chunkSize}-byte chunks   Duration: {duration}s");
+
+    if (waitForAttach)
+    {
+        Console.WriteLine("Attach `perf c2c record -p <PID>` (or similar) now, then press Enter to begin...");
+        Console.ReadLine();
+    }
+
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    long cycles = 0;
+    var deadline = TimeSpan.FromSeconds(duration);
+    while (sw.Elapsed < deadline)
+    {
+        runner.RunOnce();
+        cycles++;
+    }
+    sw.Stop();
+
+    double seconds = sw.Elapsed.TotalSeconds;
+    double mibPerSec = (cycles * (double)totalBytes) / (1024 * 1024) / seconds;
+    Console.WriteLine($"Cycles: {cycles}   Elapsed: {seconds:F3}s   Throughput: {mibPerSec:F1} MiB/s");
+
+    return 0;
 }
 
 static async Task RunLatencyBenchmarks(int count, int size, int trials, int warmup, bool continuous)
