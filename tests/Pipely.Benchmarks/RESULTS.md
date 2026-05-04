@@ -179,3 +179,110 @@ P99 line for that trial only.)
   implemented.
 - **`Min` is a single sample.** Over 100K iterations one is bound to land at the floor; treat Min
   as a noise indicator, not a steady-state quantity.
+
+## Cache-line padding (commit `a92c020`, 2026-05-04)
+
+`Pipe` instance fields were unpadded between the writer-thread-only block
+(`_chainHead`, `_writingHead`, `_totalWritten`, `_lastPublishedWriterState`,
+`_writerCompleted`, …) and the reader-thread-only block (`_readHead`,
+`_totalConsumed`, `_lastPublishedReaderState`, `_readerCompleted`,
+`_readPending`, …), leaving false sharing on the cache line that bridged
+them — most acutely on the bool flags, which packed `_writerCompleted` /
+`_readerCompleted` / `_readPending` / `_disposed` within a few bytes of each
+other. (`TripleBuffer<T>` was already 128 B-padded; this patch extends the
+same discipline to the `Pipe` class itself.) Commit `a92c020` adds
+`[StructLayout(LayoutKind.Sequential)]` on `Pipe` and inserts two
+`[InlineArray(128)]` `CacheLinePad` fields — one before the writer-side
+block, one between the writer-side and reader-side blocks.
+
+### Pinned busy-poll benchmark
+
+`PinnedThroughputBenchmarks` (introduced in commit `1c169dc`) drives the
+SPSC steady-state path with raw threads pinned via `sched_setaffinity`
+(Linux), `PipeScheduler.Inline`, and backpressure disabled
+(`pauseWriterThreshold: 0`) so the producer never parks and the consumer
+busy-polls on `TryRead`. This isolates data-structure contention from
+`Task.Run` / `Task.WhenAll` / awaiter overhead. Producer pinned to CPU 2,
+consumer to CPU 4 (distinct physical cores; `lscpu -e` confirms separate
+L1/L2, shared L3).
+
+| Method                | Mean      | Error    | StdDev   | Ratio | Allocated |
+|---------------------- |----------:|---------:|---------:|------:|----------:|
+| BCL_PinnedBusyPoll    | 109.48 μs | 1.178 μs | 1.102 μs |  1.00 |         - |
+| Pipely_PinnedBusyPoll |  76.17 μs | 0.516 μs | 0.482 μs |  0.70 |         - |
+
+Both pipes are alloc-free per iteration in steady state on this path:
+`TryRead` is synchronous, `FlushAsync` returns a sync-completed `ValueTask`
+with backpressure disabled, and the pinned threads are reused across BDN
+iterations.
+
+### Cache-line bouncing (perf c2c, same session)
+
+A standalone harness (`dotnet run -- cache-bench --pipe pipely
+--producer-core 2 --consumer-core 4 --duration 20`, wrapped in
+`perf c2c record`) attributes HITM events to specific cache lines and
+fields. Both runs are on the same hardware, same session, only the
+patch differs:
+
+| Pipely (cache-bench, perf c2c) | Pre-patch | Post-patch |        Δ |
+|------------------------------- |----------:|-----------:|---------:|
+| Throughput                     | 10,460 MiB/s | 13,522 MiB/s | **+29%** |
+| Total Local HITM               |     1,285 |        849 | **−34%** |
+| HITM per GiB transferred       |        ~6 |         ~3 | **−50%** |
+| Bool-flag line HITM (`0x...7c0`) |    167 |         41 | **−75%** |
+
+For reference, on the same harness BCL transfers ~9.1 GiB/s with ~14.6
+HITM/GiB — ~5× more cache-line bouncing per byte than padded Pipely.
+
+The residual hot lines align with `WriterState` fields inside a
+`TripleBuffer` slot (`TotalWritten` at offset 0x18, `IsCompleted` at 0x20,
+`CompletionException` at 0x28), with `TripleBuffer<WriterState>::Publish()`
+directly attributed at offset 0x38 of the slot-swap line. That's the
+*intended* SPSC handoff (true sharing of the slot's data) — not false
+sharing — and isn't reducible without changing the architecture.
+
+### Effect on default async/TP path
+
+On the `Task.Run + await + Pipe`-on-ThreadPool shape (the headline
+`SchedulerBenchmarks.Pipely_ThreadPool` row), the patch is performance-
+neutral within noise:
+
+- `Pipely_ThreadPool` post-patch: **74.65 μs**
+- `Pipely_ProduceAndDrain` (≡ `Pipely_ThreadPool`) pre-patch headline:
+  **74.64 μs** (2026-04-30, above)
+
+The bottleneck on that path is `Task.Run` / `Task.WhenAll` / async state
+machines + TP wakeup latency, not data-line bouncing, so the patch doesn't
+move the needle.
+
+### Per-`Pipe` allocation cost
+
+The two 128 B pads add ~256 B per `Pipe` instance. In
+`FreshPipeSchedulerBenchmarks` (one fresh `Pipe` per iteration), this
+shows up as +~210-290 B per op:
+
+| Method            | Pre-patch alloc (2026-04-30) | Post-patch alloc (2026-05-04) |      Δ |
+|------------------ |---------------------------:|-----------------------------:|-------:|
+| Pipely_ThreadPool |                    8.85 KB |                      9.14 KB | +290 B |
+| Pipely_Inline     |                    8.65 KB |                      8.86 KB | +210 B |
+
+For long-lived pipes (the production shape captured by the headline rows)
+the cost amortizes to zero per op.
+
+### Notes / caveats
+
+- **JIT symbol resolution.** `perf c2c` requires `DOTNET_EnableWriteXorExecute=0`
+  to attribute samples to JIT'd .NET methods via `/tmp/perf-PID.map`. .NET
+  8+'s default W^X mode places JIT'd code in a `memfd:doublemapper` region
+  that `perf` treats as a DSO, bypassing the perfmap. Disabling W^X is for
+  the recording only; production layout and cache behavior are unchanged.
+- **Same-session comparison.** The cache-bench numbers above were recorded
+  back-to-back in the same session. The BDN absolute numbers shifted ~5%
+  across the session (BCL baseline 103 → 109 μs over a few hours, even
+  though BCL was untouched), consistent with thermal / governor variance —
+  comparable to BDN measurement noise. Cross-day comparisons are
+  unreliable.
+- **Padding constant.** 128 B matches the value already chosen by
+  `TripleBuffer<T>` (see `TripleBuffer.CacheLineSize`); the comment there
+  notes it covers x86-64 / Graviton and is also the right value for Apple
+  Silicon. `Pipe`'s pad uses the same value inline.
