@@ -119,6 +119,32 @@ public sealed partial class Pipe : IDisposable
     public PipeWriter Writer => _writerInstance;
     public PipeReader Reader => _readerInstance;
 
+    /// <summary>
+    /// Restores the pipe to its post-construction state so the instance can be reused
+    /// (e.g. from a pool). Both Reader.Complete and Writer.Complete must have been
+    /// called first. Throws otherwise.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The pipe's lifecycle owner is responsible for calling Reset, on the same thread,
+    /// only after establishing a happens-before edge with the writer and reader threads
+    /// — typically by awaiting the producer/consumer tasks before calling Reset. The
+    /// SPSC contract is not violated by Reset itself: the writer/reader threads must
+    /// already be quiescent (both have completed and observed any in-flight ValueTask
+    /// via GetResult) before Reset runs.
+    /// </para>
+    /// <para>
+    /// State preserved across Reset: PipeOptions, schedulers, the rented-segment
+    /// freelist, and the donated-shell freelist. Everything else is restored to its
+    /// post-construction value. Matches BCL Pipe.Reset semantics.
+    /// </para>
+    /// </remarks>
+    public void Reset()
+    {
+        if (!_writer.WriterCompleted || !_reader.ReaderCompleted)
+            throw new InvalidOperationException("Both completion routines must be called before resetting the pipe.");
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

@@ -418,7 +418,7 @@ Modify `src/Pipely/Pipe.cs`. Add this method directly above the existing `Dispos
     /// </remarks>
     public void Reset()
     {
-        if (!(_writer.WriterCompleted && _reader.ReaderCompleted))
+        if (!_writer.WriterCompleted || !_reader.ReaderCompleted)
             throw new InvalidOperationException("Both completion routines must be called before resetting the pipe.");
     }
 ```
@@ -630,7 +630,7 @@ Replace the `Reset()` method body in `src/Pipely/Pipe.cs` with the full implemen
     /// </remarks>
     public void Reset()
     {
-        if (!(_writer.WriterCompleted && _reader.ReaderCompleted))
+        if (!_writer.WriterCompleted || !_reader.ReaderCompleted)
             throw new InvalidOperationException("Both completion routines must be called before resetting the pipe.");
 
         // Walk the chain and dispatch each segment to its appropriate freelist.
