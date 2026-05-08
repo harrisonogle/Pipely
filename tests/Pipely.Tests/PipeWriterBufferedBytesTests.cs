@@ -7,14 +7,14 @@ public class PipeWriterBufferedBytesTests
     [Fact]
     public void BufferedBytes_ZeroOnFreshPipe()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         Assert.Equal(0L, pipe.Writer.BufferedBytes);
     }
 
     [Fact]
     public void BufferedBytes_ReflectsAdvanceCount_BeforeFlush()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         Assert.Equal(40L, pipe.Writer.BufferedBytes);
@@ -26,7 +26,7 @@ public class PipeWriterBufferedBytesTests
     [Fact]
     public async Task BufferedBytes_RemainsAfterFlush_WhenReaderHasNotConsumed()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         Assert.Equal(40L, pipe.Writer.BufferedBytes);
@@ -40,7 +40,7 @@ public class PipeWriterBufferedBytesTests
     [Fact]
     public async Task BufferedBytes_DropsAfterReaderConsumes_AndWriterFlushes()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         await pipe.Writer.FlushAsync();
@@ -60,7 +60,7 @@ public class PipeWriterBufferedBytesTests
     [Fact]
     public async Task BufferedBytes_StaleUntilNextFlush_BoundedByFlushCadence()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         await pipe.Writer.FlushAsync();
@@ -78,7 +78,7 @@ public class PipeWriterBufferedBytesTests
     [Fact]
     public void BufferedBytes_NonZeroAfterCompleteWithoutFlush_WhenReaderHasNotConsumed()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         Assert.Equal(40L, pipe.Writer.BufferedBytes);
@@ -92,7 +92,7 @@ public class PipeWriterBufferedBytesTests
     [Fact]
     public void BufferedBytes_ReflectsSpliceLength_OnEmptyPipe()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
 
         pipe.Writer.Splice(owner);
@@ -102,7 +102,7 @@ public class PipeWriterBufferedBytesTests
     [Fact]
     public void BufferedBytes_AccumulatesAcrossAdvanceAndSplice()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(20);
         Assert.Equal(20L, pipe.Writer.BufferedBytes);
@@ -119,7 +119,7 @@ public class PipeWriterBufferedBytesTests
     [Fact]
     public async Task BufferedBytes_SupersetOfUnflushedBytes()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         await pipe.Writer.FlushAsync();
@@ -134,18 +134,4 @@ public class PipeWriterBufferedBytesTests
         Assert.True(pipe.Writer.BufferedBytes >= pipe.Writer.UnflushedBytes);
     }
 
-    [Fact]
-    public void BufferedBytes_AfterDispose_ReturnsLastValue_NoThrow()
-    {
-        var pipe = new Pipely.Pipe();
-        pipe.Writer.GetMemory(100);
-        pipe.Writer.Advance(40);
-        Assert.Equal(40L, pipe.Writer.BufferedBytes);
-
-        pipe.Dispose();
-
-        // Pure accessor, no validation. Dispose does not touch _totalWritten or
-        // _lastAcquiredReaderState, so the last value is still observable.
-        Assert.Equal(40L, pipe.Writer.BufferedBytes);
-    }
 }

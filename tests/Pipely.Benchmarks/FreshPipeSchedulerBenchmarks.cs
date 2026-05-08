@@ -35,7 +35,7 @@ public class FreshPipeSchedulerBenchmarks
     [Benchmark]
     public async Task Pipely_ThreadPool()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
             readerScheduler: PipeScheduler.ThreadPool,
             writerScheduler: PipeScheduler.ThreadPool));
         await ProduceAndDrain(pipe.Reader, pipe.Writer);
@@ -44,7 +44,7 @@ public class FreshPipeSchedulerBenchmarks
     [Benchmark]
     public async Task Pipely_Inline()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
             readerScheduler: PipeScheduler.Inline,
             writerScheduler: PipeScheduler.Inline));
         await ProduceAndDrain(pipe.Reader, pipe.Writer);

@@ -7,21 +7,21 @@ public class PipeWriterUnflushedBytesTests
     [Fact]
     public void CanGetUnflushedBytes_IsTrue()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         Assert.True(pipe.Writer.CanGetUnflushedBytes);
     }
 
     [Fact]
     public void UnflushedBytes_ZeroOnFreshPipe()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         Assert.Equal(0L, pipe.Writer.UnflushedBytes);
     }
 
     [Fact]
     public void UnflushedBytes_ReflectsAdvanceCount()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         Assert.Equal(40L, pipe.Writer.UnflushedBytes);
@@ -33,7 +33,7 @@ public class PipeWriterUnflushedBytesTests
     [Fact]
     public async Task UnflushedBytes_ZeroAfterFlushAsync()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         Assert.Equal(40L, pipe.Writer.UnflushedBytes);
@@ -45,7 +45,7 @@ public class PipeWriterUnflushedBytesTests
     [Fact]
     public async Task UnflushedBytes_ResumesAfterPostFlushAdvance()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         await pipe.Writer.FlushAsync();
@@ -59,7 +59,7 @@ public class PipeWriterUnflushedBytesTests
     [Fact]
     public void UnflushedBytes_ZeroAfterCompleteWithoutFlush()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
         Assert.Equal(40L, pipe.Writer.UnflushedBytes);
@@ -73,7 +73,7 @@ public class PipeWriterUnflushedBytesTests
     [Fact]
     public void UnflushedBytes_ZeroAfterCompleteWithException()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(40);
 
@@ -84,7 +84,7 @@ public class PipeWriterUnflushedBytesTests
     [Fact]
     public void UnflushedBytes_ReflectsSpliceLength_NoArg_OnEmptyPipe()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
 
         pipe.Writer.Splice(owner);
@@ -94,7 +94,7 @@ public class PipeWriterUnflushedBytesTests
     [Fact]
     public void UnflushedBytes_ReflectsSpliceLength_ThreeArg_OnEmptyPipe()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(256);
 
         pipe.Writer.Splice(owner, start: 100, length: 50);
@@ -104,7 +104,7 @@ public class PipeWriterUnflushedBytesTests
     [Fact]
     public void UnflushedBytes_AccumulatesAcrossAdvanceAndSplice()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(100);
         pipe.Writer.Advance(20);
         Assert.Equal(20L, pipe.Writer.UnflushedBytes);
@@ -121,7 +121,7 @@ public class PipeWriterUnflushedBytesTests
     [Fact]
     public async Task UnflushedBytes_ZeroAfterFlush_FollowingSplice()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
 
         pipe.Writer.Splice(owner);
@@ -131,18 +131,4 @@ public class PipeWriterUnflushedBytesTests
         Assert.Equal(0L, pipe.Writer.UnflushedBytes);
     }
 
-    [Fact]
-    public void UnflushedBytes_AfterDispose_ReturnsLastValue_NoThrow()
-    {
-        var pipe = new Pipely.Pipe();
-        pipe.Writer.GetMemory(100);
-        pipe.Writer.Advance(40);
-        Assert.Equal(40L, pipe.Writer.UnflushedBytes);
-
-        pipe.Dispose();
-
-        // Matches BCL: pure accessor, no validation, returns whatever the
-        // underlying field state holds. Dispose does not mutate either field.
-        Assert.Equal(40L, pipe.Writer.UnflushedBytes);
-    }
 }

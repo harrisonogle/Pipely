@@ -25,7 +25,6 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
 
     public override ValueTask<ReadResult> ReadAsync(CancellationToken ct = default)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._reader.ReaderCompleted) throw new InvalidOperationException("Reading is completed.");
         if (_pipe._reader.ReadPending) throw new InvalidOperationException("Reading is in progress.");
 
@@ -64,7 +63,6 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
 
     public override bool TryRead(out ReadResult result)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._reader.ReaderCompleted) throw new InvalidOperationException("Reading is completed.");
         if (_pipe._reader.ReadPending) throw new InvalidOperationException("Reading is in progress.");
 
@@ -105,7 +103,6 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
 
     public override void AdvanceTo(SequencePosition consumed, SequencePosition examined)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._reader.ReaderCompleted) throw new InvalidOperationException("Reading is completed.");
         _pipe._reader.ReadPending = false;
 
@@ -161,7 +158,6 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
     /// </remarks>
     public override void Complete(Exception? exception = null)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._reader.ReaderCompleted) return;
         _pipe._reader.ReaderCompleted = true;
 
@@ -185,7 +181,6 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
     /// </summary>
     public override void CancelPendingRead()
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         int oldV = Interlocked.Or(ref _pipe._readAwaiter._state, PipelyAwaiter<ReadResult>.CancelFlag);
         if ((oldV & PipelyAwaiter<ReadResult>.StateMask) == PipelyAwaiter<ReadResult>.Pending
             && Interlocked.CompareExchange(

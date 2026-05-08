@@ -1008,9 +1008,9 @@ Replace `Dispose_ClearsShellFreelist` (around line 560) with:
         pipe.Reader.Complete();
         pipe.Reset();
 
-        // Shell freelist preserved (entry from earlier recycle is still there); the
-        // active tail (donated2) was added on Reset, so count should be at least 2.
-        Assert.True(pipe._writer.DonatedShellFreelistCount >= 1);
+        // Shell freelist preserved: the entry from the earlier recycle (donated1's shell)
+        // remains, and Reset added the active tail (donated2's shell), so exactly 2.
+        Assert.Equal(2, pipe._writer.DonatedShellFreelistCount);
     }
 ```
 

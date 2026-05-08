@@ -10,32 +10,21 @@ public class PipeWriterSpliceTests
     [Fact]
     public void Splice_NullBuffer_NoArg_Throws_ArgumentNull()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         Assert.Throws<ArgumentNullException>(() => pipe.Writer.Splice(null!));
     }
 
     [Fact]
     public void Splice_NullBuffer_ThreeArg_Throws_ArgumentNull()
     {
-        using var pipe = new Pipely.Pipe();
-        Assert.Throws<ArgumentNullException>(() => pipe.Writer.Splice(null!, 0, 0));
-    }
-
-    [Fact]
-    public void Splice_DisposedPipe_Throws_ObjectDisposed_CallerStillOwns()
-    {
         var pipe = new Pipely.Pipe();
-        pipe.Dispose();
-
-        var owner = new TrackingMemoryOwner(64);
-        Assert.Throws<ObjectDisposedException>(() => pipe.Writer.Splice(owner));
-        Assert.Equal(0, owner.DisposeCount);   // pipe did NOT dispose; caller still owns
+        Assert.Throws<ArgumentNullException>(() => pipe.Writer.Splice(null!, 0, 0));
     }
 
     [Fact]
     public void Splice_CompletedWriter_Throws_InvalidOp_CallerStillOwns()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe._writer.WriterCompleted = true;          // simulate post-Complete state (internal flag)
 
         var owner = new TrackingMemoryOwner(64);
@@ -50,7 +39,7 @@ public class PipeWriterSpliceTests
     [InlineData(64, 1)]    // start past end + positive length
     public void Splice_RangeViolation_Throws_OutOfRange_CallerStillOwns(int start, int length)
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
         Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Splice(owner, start, length));
         Assert.Equal(0, owner.DisposeCount);
@@ -59,7 +48,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public void Splice_ValidationThrows_PipeStateUntouched()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         // Establish a known state.
         pipe.Writer.GetMemory(40);
         pipe.Writer.Advance(40);
@@ -81,7 +70,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public void Splice_ZeroLength_ThreeArg_DisposesAndReturns_NoChainMutation()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
 
         long totalWrittenBefore = pipe._writer.TotalWritten;
@@ -101,7 +90,7 @@ public class PipeWriterSpliceTests
     {
         // Memory.Length == 0 routes through the no-arg overload to the 3-arg overload
         // with length=0; same accept-and-dispose outcome.
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(0);
 
         pipe.Writer.Splice(owner);
@@ -116,7 +105,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public void Splice_NoArg_OnEmptyPipe_BootstrapsChainHeadEqualsWritingHead()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var bytes = new byte[64];
         for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i + 1);
         var owner = new TrackingMemoryOwner(bytes);
@@ -143,7 +132,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public void Splice_ThreeArg_OnEmptyPipe_PublishedSliceMatchesStartAndLength()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var bytes = new byte[1024];
         for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i & 0xFF);
         var owner = new TrackingMemoryOwner(bytes);
@@ -165,7 +154,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public void Splice_AfterPartialFill_FreezesPreviousTailAndSplicesDonated()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         // Establish a partially-filled rented tail.
         var rentedMem = pipe.Writer.GetMemory(64);
         for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
@@ -209,7 +198,7 @@ public class PipeWriterSpliceTests
         // Spec §2.2: when the previous _writer.WritingHead is itself donated, the steady-state
         // Freeze(filled, newDonated) call writes End/base.Memory to the same values they
         // already held; only Next changes meaningfully.
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
 
         var owner1 = new TrackingMemoryOwner(30);
         var owner2 = new TrackingMemoryOwner(50);
@@ -241,7 +230,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public void Splice_WithStartOffset_SplicesOnlyTheSelectedSlice()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var bytes = new byte[1024];
         for (int i = 0; i < bytes.Length; i++) bytes[i] = (byte)(i & 0xFF);
         var owner = new TrackingMemoryOwner(bytes);
@@ -259,7 +248,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public void GetMemory_AfterSplice_TransitionsToFreshRentedTail()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(owner);
         var donated = pipe._writer.WritingHead!;
@@ -279,7 +268,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public void Advance_AfterSplice_ThrowsArgumentOutOfRange()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(owner);
 
@@ -291,7 +280,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public async Task FlushAsync_AfterSplice_PublishesDonatedAsTailSegment()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(50);
         pipe.Writer.Splice(owner);
         var donated = pipe._writer.WritingHead!;
@@ -310,7 +299,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public async Task FlushAsync_AfterMixedWriteAndSplice_PublishesCorrectChain()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         var rentedMem = pipe.Writer.GetMemory(64);
         for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
         pipe.Writer.Advance(40);
@@ -334,7 +323,7 @@ public class PipeWriterSpliceTests
         // Spec §8: "After GetMemory + Advance(0) (zero buffered)" → previous tail is frozen
         // with End=0; donated is spliced after. The empty rented segment is harmless and
         // recycles to freelist on drain.
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         pipe.Writer.GetMemory(64);
         pipe.Writer.Advance(0);
         var prevTail = pipe._writer.WritingHead!;
@@ -356,7 +345,7 @@ public class PipeWriterSpliceTests
     public async Task LargeSplice_DoesNotPark_SubsequentFlushAsyncParksWhenOverThreshold()
     {
         // Spec §4.4: Splice doesn't gate on PauseWriterThreshold; FlushAsync does.
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
             pauseWriterThreshold: 1024, resumeWriterThreshold: 512));
 
         var owner = new TrackingMemoryOwner(8 * 1024);   // well over the pause threshold
@@ -381,7 +370,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public void BackToBackSplices_NoEmptyRentedTailsBetweenDonations()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var o1 = new TrackingMemoryOwner(10);
         var o2 = new TrackingMemoryOwner(20);
         var o3 = new TrackingMemoryOwner(30);
@@ -417,7 +406,7 @@ public class PipeWriterSpliceTests
         // is exact: zero donated segments should land in the rented freelist regardless of
         // the recycle path's behavior on rented segments. Donated shells go to the
         // separate _donatedShellFreelist instead.
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var donated1 = new TrackingMemoryOwner(30);
         var donated2 = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(donated1);
@@ -448,7 +437,7 @@ public class PipeWriterSpliceTests
     {
         // Same-pipe AdvanceTo to a SequencePosition inside a donated segment must work
         // (R4-7 pipe-identity check at Pipe.Reader.cs:113 sees OwnerToken == pipe).
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(40);
         pipe.Writer.Splice(owner);
 
@@ -463,7 +452,7 @@ public class PipeWriterSpliceTests
     public async Task RecyclePath_RentedSegmentStillFreelisted_RegressionGuard()
     {
         // Existing rented-segment recycle behavior must be preserved.
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         // Two rented segments in chain.
         pipe.Writer.GetMemory(64); pipe.Writer.Advance(64);
         pipe.Writer.GetMemory(64); pipe.Writer.Advance(50);
@@ -478,7 +467,7 @@ public class PipeWriterSpliceTests
     }
 
     [Fact]
-    public async Task DisposePipe_WithMixedChain_DisposesAllOwners()
+    public async Task ResetPipe_WithMixedChain_DisposesAllDonatedOwners()
     {
         var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
 
@@ -491,7 +480,9 @@ public class PipeWriterSpliceTests
         await pipe.Writer.FlushAsync();
         // Don't drain — chain is full of un-consumed segments.
 
-        pipe.Dispose();
+        pipe.Writer.Complete();
+        pipe.Reader.Complete();
+        pipe.Reset();
 
         Assert.Equal(1, donated1.DisposeCount);
         Assert.Equal(1, donated2.DisposeCount);
@@ -503,7 +494,7 @@ public class PipeWriterSpliceTests
         // After a donated segment recycles into the shell freelist, the next Splice
         // pops that shell instead of allocating a new BufferSegment. The popped shell
         // gets fully reinitialized via AdoptFrom — caller cannot distinguish from fresh.
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var donated1 = new TrackingMemoryOwner(30);
         var donated2 = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(donated1);
@@ -535,7 +526,7 @@ public class PipeWriterSpliceTests
         // We don't have a public way to observe GC drops directly, but we can assert
         // the freelist count never exceeds the cap.
         var options = new Pipely.PipeOptions(maxFreelistSegments: 2);
-        using var pipe = new Pipely.Pipe(options);
+        var pipe = new Pipely.Pipe(options);
 
         // Cycle: append + flush + drain + flush, repeated, with a final donated tail
         // each cycle that doesn't get recycled (so the chain has > 2 recyclable donateds).
@@ -558,27 +549,32 @@ public class PipeWriterSpliceTests
     }
 
     [Fact]
-    public void Dispose_ClearsShellFreelist()
+    public async Task ResetPipe_PreservesShellFreelist()
     {
-        // After Dispose, the shell freelist is reset. No IMemoryOwners to dispose
-        // (those were released in RecycleDrainedSegments before pooling); just clear
-        // the head + count.
+        // Reset preserves the donated-shell freelist (matches BCL preserving its segment pool).
+        // The pre-existing shell entries from prior recycles are NOT disposed/dropped.
         var pipe = new Pipely.Pipe();
         var donated1 = new TrackingMemoryOwner(8);
         var donated2 = new TrackingMemoryOwner(8);
         pipe.Writer.Splice(donated1);
         pipe.Writer.Splice(donated2);
         // Force at least one recycle so the shell freelist has an entry.
-        pipe.Writer.FlushAsync().GetAwaiter().GetResult();
-        var rr = pipe.Reader.ReadAsync().GetAwaiter().GetResult();
+        await pipe.Writer.FlushAsync();
+        var rr = await pipe.Reader.ReadAsync();
         pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(8));
-        pipe.Writer.FlushAsync().GetAwaiter().GetResult();
+        await pipe.Writer.FlushAsync();
         Assert.Equal(1, pipe._writer.DonatedShellFreelistCount);
 
-        pipe.Dispose();
+        // Drain the rest of the chain, complete both sides, Reset.
+        var rr2 = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(rr2.Buffer.End);
+        pipe.Writer.Complete();
+        pipe.Reader.Complete();
+        pipe.Reset();
 
-        Assert.Null(pipe._writer.DonatedShellFreelistHead);
-        Assert.Equal(0, pipe._writer.DonatedShellFreelistCount);
+        // Shell freelist preserved: the entry from the earlier recycle (donated1's shell)
+        // remains, and Reset added the active tail (donated2's shell), so exactly 2.
+        Assert.Equal(2, pipe._writer.DonatedShellFreelistCount);
     }
 
     [Fact]
@@ -593,7 +589,7 @@ public class PipeWriterSpliceTests
         // Two segments are required to trigger a recycle: donated1 is frozen (no longer
         // _writer.WritingHead) once donated2 is appended, so RecycleDrainedSegments can recycle it.
         // With only one segment, _writer.ChainHead == _writer.WritingHead and the recycle loop never fires.
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var donated1 = new TrackingMemoryOwner(8);
         var donated2 = new TrackingMemoryOwner(8);
         pipe.Writer.Splice(donated1);
@@ -615,7 +611,7 @@ public class PipeWriterSpliceTests
     [Fact]
     public async Task ReadResultBufferContent_IncludesDonatedBytes_InCorrectPosition()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
 
         // Rented [0..3] = 0x01,0x02,0x03,0x04
         var rentedMem = pipe.Writer.GetMemory(64);

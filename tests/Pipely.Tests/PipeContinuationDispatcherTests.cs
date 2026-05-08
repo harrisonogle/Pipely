@@ -147,7 +147,7 @@ public class PipeContinuationDispatcherTests
     {
         int dispatchCount = 0;
         var dispatcher = new RecordingDispatcher(_ => Interlocked.Increment(ref dispatchCount));
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         var readTask = pipe.Reader.ReadAsync().AsTask();
         Assert.False(readTask.IsCompleted);
@@ -172,7 +172,7 @@ public class PipeContinuationDispatcherTests
     {
         var asyncLocal = new AsyncLocal<int>();
         using var dispatcher = new ForwardingDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         asyncLocal.Value = 42;
 
@@ -208,7 +208,7 @@ public class PipeContinuationDispatcherTests
         var dispatcherLocal = new AsyncLocal<int>();
         using var dispatcher = new DedicatedThreadDispatcher(
             setupOnThread: () => dispatcherLocal.Value = 999);
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         consumerLocal.Value = 42;
 
@@ -254,7 +254,7 @@ public class PipeContinuationDispatcherTests
             captureBeforeCallback:  () => observedOnDispatcherThreadBeforeCallback = dispatcherLocal.Value,
             captureAfterCallback:   () => observedOnDispatcherThreadAfterCallback  = dispatcherLocal.Value);
 
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         var consumerLocal = new AsyncLocal<int>();
         consumerLocal.Value = 42;
@@ -304,7 +304,7 @@ public class PipeContinuationDispatcherTests
     {
         // A "bad" dispatcher that uses ThreadPool.QueueUserWorkItem (captures EC).
         var badDispatcher = new BadEcCapturingDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: badDispatcher, writerScheduler: badDispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: badDispatcher, writerScheduler: badDispatcher));
 
         var consumerLocal = new AsyncLocal<int>();
         var producerLocal = new AsyncLocal<int>();
@@ -358,7 +358,7 @@ public class PipeContinuationDispatcherTests
     public async Task CustomDispatcher_ContinuationException_DoesNotKillDispatcherThread()
     {
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         // First read: producer fires in background, consumer parks on ReadAsync, the
         // dispatcher resumes the continuation on its dedicated thread. The continuation
@@ -411,7 +411,7 @@ public class PipeContinuationDispatcherTests
     public async Task CustomDispatcher_RapidParkResumeCycles_NoVersionMismatch()
     {
         using var dispatcher = new ForwardingDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         const int totalCycles  = 1000;
         const int messageBytes = 8;
@@ -451,7 +451,7 @@ public class PipeContinuationDispatcherTests
     public async Task CustomDispatcher_SetResultBeforeOnCompleted_RaceHandled()
     {
         using var dispatcher = new ForwardingDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         // Producer writes BEFORE consumer awaits. The consumer's ReadAsync should return
         // synchronously (sync data return — no dispatcher hop, no continuation, no parking).
@@ -495,7 +495,7 @@ public class PipeContinuationDispatcherTests
     {
         var asyncLocal = new AsyncLocal<int>();
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         asyncLocal.Value = 42;
 
@@ -561,7 +561,7 @@ public class PipeContinuationDispatcherTests
     public async Task SuppressFlow_AtAwait_NoCapturedEC_BranchExercisedCleanly()
     {
         using var dispatcher = new ForwardingDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         _ = Task.Run(async () =>
         {
@@ -620,7 +620,7 @@ public class PipeContinuationDispatcherTests
         int? observedThreadId = null;
 
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher, useSynchronizationContext: false));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher, useSynchronizationContext: false));
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
@@ -682,7 +682,7 @@ public class PipeContinuationDispatcherTests
         int testThreadId = Environment.CurrentManagedThreadId;
 
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher, useSynchronizationContext: false));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher, useSynchronizationContext: false));
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
@@ -750,7 +750,7 @@ public class PipeContinuationDispatcherTests
         int testThreadId = Environment.CurrentManagedThreadId;
 
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher, useSynchronizationContext: false));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher, useSynchronizationContext: false));
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
@@ -805,7 +805,7 @@ public class PipeContinuationDispatcherTests
         var dispatcher = new RecordingDispatcher(_ => Interlocked.Increment(ref dispatcherScheduleCount));
 
         // Default options: UseSynchronizationContext = true.
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         var sc = new CapturingSynchronizationContext();
         var prev = SynchronizationContext.Current;
@@ -852,7 +852,7 @@ public class PipeContinuationDispatcherTests
 
         // Pre-write past PauseWriterThreshold (default 65536) below so the FlushAsync parks deterministically.
         // UseSynchronizationContext defaults to true.
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         // Pre-fill the pipe so the next Write+Flush will park at the pause threshold.
         // PipeOptions.PauseWriterThreshold default is 65536; write that much to push the
@@ -901,7 +901,7 @@ public class PipeContinuationDispatcherTests
     public async Task SynchronizationContext_DefaultBaseType_NotHonored_FallsThroughToDispatcher()
     {
         using var dispatcher = new DedicatedThreadDispatcher();
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(readerScheduler: dispatcher, writerScheduler: dispatcher));
 
         // Install the default base SynchronizationContext (NOT a derived type). The
         // OnCompleted SC-capture branch sees this and rejects it via the GetType() check.
@@ -1005,7 +1005,7 @@ public class PipeContinuationDispatcherTests
     [Fact]
     public async Task EC_PreservedAcrossSCPost_AsyncLocalVisibleInContinuation()
     {
-        using var pipe = new Pipely.Pipe(); // default options → UseSynchronizationContext = true
+        var pipe = new Pipely.Pipe(); // default options → UseSynchronizationContext = true
 
         var local = new AsyncLocal<int>();
         local.Value = 0;

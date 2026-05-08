@@ -60,7 +60,7 @@ public class SchedulerBenchmarks
     {
         _pipelyTp!.Writer.Complete();
         _pipelyTp.Reader.Complete();
-        _pipelyTp.Dispose();
+        _pipelyTp = null;   // Pipely.Pipe no longer IDisposable; let GC reclaim.
     }
 
     [GlobalSetup(Target = nameof(Pipely_Inline))]
@@ -73,7 +73,7 @@ public class SchedulerBenchmarks
     {
         _pipelyInline!.Writer.Complete();
         _pipelyInline.Reader.Complete();
-        _pipelyInline.Dispose();
+        _pipelyInline = null;
     }
 
     [Benchmark(Baseline = true)]

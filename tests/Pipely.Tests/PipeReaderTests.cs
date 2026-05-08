@@ -8,7 +8,7 @@ public class PipeReaderTests
     [Fact]
     public async Task ReadAsync_AfterFlushedData_ReturnsBuffer()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var mem = pipe.Writer.GetMemory(5);
         mem.Span[0] = 1; mem.Span[1] = 2; mem.Span[2] = 3; mem.Span[3] = 4; mem.Span[4] = 5;
         pipe.Writer.Advance(5);
@@ -25,14 +25,14 @@ public class PipeReaderTests
     [Fact]
     public void TryRead_NoData_ReturnsFalse()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         Assert.False(pipe.Reader.TryRead(out var result));
     }
 
     [Fact]
     public async Task ReadAsync_AfterWriterCompletedNull_ReturnsIsCompletedTrue()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         // Simulate Writer.Complete(null) by direct WriterState publish (real Complete in Task 9).
         pipe._writerTb.ProducerSlot() = new Pipely.WriterState { IsCompleted = true };
         pipe._writerTb.Publish();
@@ -45,7 +45,7 @@ public class PipeReaderTests
     [Fact]
     public async Task ReadAsync_AfterWriterCompletedWithEx_Throws()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var ex = new InvalidOperationException("from writer");
         pipe._writerTb.ProducerSlot() = new Pipely.WriterState { IsCompleted = true, CompletionException = ex };
         pipe._writerTb.Publish();
@@ -57,7 +57,7 @@ public class PipeReaderTests
     [Fact]
     public async Task ReadAsync_ParksWhenNoData_ResumesOnFlush()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var readTask = pipe.Reader.ReadAsync().AsTask();
         Assert.False(readTask.IsCompleted);
 

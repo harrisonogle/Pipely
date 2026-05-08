@@ -7,7 +7,7 @@ public class PipeReadInProgressTests
     [Fact]
     public async Task ReadAsync_TwiceWithoutAdvanceTo_Throws()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(5); pipe.Writer.Advance(5);
         await pipe.Writer.FlushAsync();
 
@@ -19,7 +19,7 @@ public class PipeReadInProgressTests
     [Fact]
     public async Task TryRead_AfterReadAsyncWithoutAdvanceTo_Throws()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(5); pipe.Writer.Advance(5);
         await pipe.Writer.FlushAsync();
 
@@ -31,7 +31,7 @@ public class PipeReadInProgressTests
     [Fact]
     public async Task ReadAsync_AfterReadAsyncAndAdvanceTo_Works()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(5); pipe.Writer.Advance(5);
         await pipe.Writer.FlushAsync();
 
@@ -48,7 +48,7 @@ public class PipeReadInProgressTests
     [Fact]
     public void TryRead_ReturnsFalse_DoesNotMarkInProgress()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         Assert.False(pipe.Reader.TryRead(out _));
         Assert.False(pipe.Reader.TryRead(out _));   // would throw if first call had set the flag
     }
@@ -56,7 +56,7 @@ public class PipeReadInProgressTests
     [Fact]
     public async Task TryRead_ReturnsTrue_MarksInProgress()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(5); pipe.Writer.Advance(5);
         await pipe.Writer.FlushAsync();
 
@@ -67,7 +67,7 @@ public class PipeReadInProgressTests
     [Fact]
     public async Task ReadAsync_TokenCancelsWhileParked_NextReadAsyncWorks()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var cts = new CancellationTokenSource();
         var t = pipe.Reader.ReadAsync(cts.Token).AsTask();
         Assert.False(t.IsCompleted);
@@ -87,7 +87,7 @@ public class PipeReadInProgressTests
     [Fact]
     public async Task ReadAsync_WriterCompleteWithExWhileParked_NextReadAsyncStillThrowsViaEntryGuard()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var t = pipe.Reader.ReadAsync().AsTask();
         Assert.False(t.IsCompleted);
 
@@ -107,7 +107,7 @@ public class PipeReadInProgressTests
     [Fact]
     public async Task CancelPendingRead_DeliversCanceled_NextReadRequiresAdvanceTo()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var t = pipe.Reader.ReadAsync().AsTask();
         Assert.False(t.IsCompleted);
 
@@ -122,7 +122,7 @@ public class PipeReadInProgressTests
     [Fact]
     public async Task ReadAsync_StickyCancelSyncReturn_RequiresAdvanceTo()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Reader.CancelPendingRead();   // sets sticky cancel; no parked awaiter
 
         var r = await pipe.Reader.ReadAsync();

@@ -7,7 +7,7 @@ public class PipeWriterTests
     [Fact]
     public void GetMemory_ReturnsAtLeastSizeHint_AndAdvanceTracksBytes()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         var mem = pipe.Writer.GetMemory(100);
         Assert.True(mem.Length >= 100);
         for (int i = 0; i < 100; i++) mem.Span[i] = (byte)i;
@@ -21,7 +21,7 @@ public class PipeWriterTests
     [Fact]
     public void GetMemory_TransitionsToNewSegmentWhenSizeHintExceedsRemaining()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         var mem1 = pipe.Writer.GetMemory(64);
         pipe.Writer.Advance(50);
 
@@ -32,7 +32,7 @@ public class PipeWriterTests
     [Fact]
     public void Advance_BeyondCapacity_Throws()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(1);
         Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Advance(int.MaxValue));
     }
@@ -40,7 +40,7 @@ public class PipeWriterTests
     [Fact]
     public void GetMemory_AfterComplete_Throws()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         // Manually set the internal flag to test the entry guard. Complete is wired in Task 9.
         // Pipely.Tests has InternalsVisibleTo, so direct field access works.
         pipe._writer.WriterCompleted = true;
@@ -49,17 +49,9 @@ public class PipeWriterTests
     }
 
     [Fact]
-    public void GetMemory_AfterDispose_Throws()
-    {
-        var pipe = new Pipely.Pipe();
-        pipe.Dispose();
-        Assert.Throws<ObjectDisposedException>(() => pipe.Writer.GetMemory(0));
-    }
-
-    [Fact]
     public async Task FlushAsync_NoBackpressure_ReturnsImmediatelyNotCompleted()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(10);
         pipe.Writer.Advance(10);
 
@@ -71,7 +63,7 @@ public class PipeWriterTests
     [Fact]
     public async Task FlushAsync_AfterReaderCompletedNull_ReturnsIsCompletedTrue()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         // Manually publish a reader-completed state via the readerTb (proxy for Reader.Complete which is Task 9).
         pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
         var readerSnap = new Pipely.ReaderState { IsCompleted = true, CompletionException = null };
@@ -86,7 +78,7 @@ public class PipeWriterTests
     [Fact]
     public async Task FlushAsync_AfterReaderCompletedException_Throws()
     {
-        using var pipe = new Pipely.Pipe();
+        var pipe = new Pipely.Pipe();
         pipe.Writer.GetMemory(10); pipe.Writer.Advance(10);
         var ex = new InvalidOperationException("from reader");
         pipe._readerTb.ProducerSlot() = new Pipely.ReaderState { IsCompleted = true, CompletionException = ex };
@@ -99,7 +91,7 @@ public class PipeWriterTests
     [Fact]
     public async Task FlushAsync_ParksOnBackpressure_ResumesOnAdvance()
     {
-        using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(
             pauseWriterThreshold: 100,
             resumeWriterThreshold: 50));
 

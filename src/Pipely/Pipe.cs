@@ -18,7 +18,7 @@ namespace Pipely;
 // containing object — enough to guarantee disjoint cache lines under any heap
 // alignment. The Sequential attribute is retained as documentation of intent and on
 // the off chance a future runtime honors it; the isolation does not depend on it.
-public sealed partial class Pipe : IDisposable
+public sealed partial class Pipe
 {
     [InlineArray(128)]
     private struct CacheLinePad { private byte _b; }
@@ -86,9 +86,6 @@ public sealed partial class Pipe : IDisposable
 
     internal WriterFields _writer;
     internal ReaderFields _reader;
-
-    // Pipe-level (mutated by Dispose only).
-    internal bool _disposed;
 
     private readonly PipeWriter _writerInstance;
     private readonly PipeReader _readerInstance;
@@ -190,43 +187,6 @@ public sealed partial class Pipe : IDisposable
         _readerTb.Reset();
         _readAwaiter.Reset();
         _flushAwaiter.Reset();
-    }
-
-    public void Dispose()
-    {
-        if (_disposed) return;
-        _disposed = true;
-
-        // R4-1: dispose leftover CTRs (idempotent on default).
-        _readAwaiter._ctr.Dispose();
-        _flushAwaiter._ctr.Dispose();
-
-        // Walk the chain.
-        var seg = _writer.ChainHead;
-        while (seg != null)
-        {
-            var next = seg.Next;
-            seg.DisposeOwned();
-            seg = next;
-        }
-        _writer.ChainHead = null;
-        _writer.WritingHead = null;
-
-        // Walk the freelist.
-        var fl = _writer.FreelistHead;
-        while (fl != null)
-        {
-            var next = fl.Next;
-            fl.DisposeOwned();
-            fl = next;
-        }
-        _writer.FreelistHead = null;
-        _writer.FreelistCount = 0;
-
-        // Donated-shell freelist: shells have no IMemoryOwner (released in RecycleDrainedSegments
-        // before pooling). Just clear the head and count; nothing to dispose.
-        _writer.DonatedShellFreelistHead = null;
-        _writer.DonatedShellFreelistCount = 0;
     }
 
     internal BufferSegment RentSegment(int sizeHint, long runningIndex)

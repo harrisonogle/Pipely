@@ -45,14 +45,22 @@ public class SpliceBenchmarks
     public Task Pipely_GetSpan()
     {
         var pipe = new Pipely.Pipe(PipelyOptions);
-        return RunGetSpan(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
+        return RunGetSpan(pipe.Writer, pipe.Reader, completePipe: () =>
+        {
+            pipe.Writer.Complete();
+            pipe.Reader.Complete();
+        });
     }
 
     [Benchmark]
     public Task Pipely_Splice()
     {
         var pipe = new Pipely.Pipe(PipelyOptions);
-        return RunSplice(pipe.Writer, pipe.Reader, completePipe: () => pipe.Dispose());
+        return RunSplice(pipe.Writer, pipe.Reader, completePipe: () =>
+        {
+            pipe.Writer.Complete();
+            pipe.Reader.Complete();
+        });
     }
 
     private async Task RunGetSpan(PipeWriter writer, PipeReader reader, Action completePipe)
@@ -79,7 +87,7 @@ public class SpliceBenchmarks
             await writer.CompleteAsync();
         });
 
-        await DrainAndDispose(reader, producer, completePipe);
+        await DrainAndComplete(reader, producer, completePipe);
     }
 
     private async Task RunSplice(Pipely.PipeWriter writer, PipeReader reader, Action completePipe)
@@ -104,10 +112,10 @@ public class SpliceBenchmarks
             await writer.CompleteAsync();
         });
 
-        await DrainAndDispose(reader, producer, completePipe);
+        await DrainAndComplete(reader, producer, completePipe);
     }
 
-    private static async Task DrainAndDispose(PipeReader reader, Task producer, Action completePipe)
+    private static async Task DrainAndComplete(PipeReader reader, Task producer, Action completePipe)
     {
         var consumer = Task.Run(async () =>
         {

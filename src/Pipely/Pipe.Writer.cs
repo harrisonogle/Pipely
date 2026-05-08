@@ -26,7 +26,6 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
 
     public override Memory<byte> GetMemory(int sizeHint = 0)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writer.WriterCompleted) throw new InvalidOperationException("Writing is completed.");
         if (sizeHint < 0) throw new ArgumentOutOfRangeException(nameof(sizeHint));
         if (sizeHint == 0) sizeHint = 1;
@@ -58,7 +57,6 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
 
     public override void Advance(int bytes)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writer.WriterCompleted) throw new InvalidOperationException("Writing is completed.");
         if (_pipe._writer.WritingHead == null) throw new InvalidOperationException("Advance without prior GetMemory.");
         if (_pipe._writer.WritingHeadBytesBuffered + bytes > _pipe._writer.WritingHead.AvailableMemory.Length)
@@ -69,7 +67,6 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
 
     public override ValueTask<FlushResult> FlushAsync(CancellationToken ct = default)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writer.WriterCompleted) throw new InvalidOperationException("Writing is completed.");
 
         // Throw-first: refresh reader state, then throw if reader-completed-with-ex.
@@ -137,7 +134,6 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
     /// </remarks>
     public override void Complete(Exception? exception = null)
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writer.WriterCompleted) return;     // double-Complete coalesces
         _pipe._writer.WriterCompleted = true;
 
@@ -163,7 +159,6 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
     /// </summary>
     public override void CancelPendingFlush()
     {
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         int oldV = Interlocked.Or(ref _pipe._flushAwaiter._state, PipelyAwaiter<FlushResult>.CancelFlag);
         if ((oldV & PipelyAwaiter<FlushResult>.StateMask) == PipelyAwaiter<FlushResult>.Pending
             && Interlocked.CompareExchange(
@@ -290,7 +285,6 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
     public void Splice(IMemoryOwner<byte> buffer, int start, int length)
     {
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
-        if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
         if (_pipe._writer.WriterCompleted) throw new InvalidOperationException("Writing is completed.");
 
         var mem = buffer.Memory;

@@ -17,7 +17,7 @@ internal sealed class PipelyPipeAdapter : IPipeAdapter
     public PipelyPipeAdapter(Pipely.PipeOptions? options = null) => _pipe = new Pipely.Pipe(options ?? Pipely.PipeOptions.Default);
     public PipeReader Reader => _pipe.Reader;
     public PipeWriter Writer => _pipe.Writer;
-    public void Dispose() => _pipe.Dispose();
+    public void Dispose() { /* Pipely.Pipe is no longer IDisposable; nothing to clean up here. */ }
 
     // Snapshot of read-awaiter counters (read after Run completes — no concurrent writers,
     // so plain reads of the long fields are sufficient on 64-bit platforms).

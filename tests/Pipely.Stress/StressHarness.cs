@@ -16,7 +16,7 @@ internal sealed class StressHarness
         var owners = new System.Collections.Concurrent.ConcurrentBag<StressOwner>();
         StressResult result;
         {
-            using var pipe = new Pipely.Pipe(_options);
+            var pipe = new Pipely.Pipe(_options);
             var producerRng = new Random(seed);
             var consumerRng = new Random(seed ^ 0x5A5A_5A5A);
 
