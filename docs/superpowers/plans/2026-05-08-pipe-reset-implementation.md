@@ -507,21 +507,35 @@ Append the following tests to `tests/Pipely.Tests/PipeResetTests.cs` (inside the
     public async Task Reset_PreservesRentedSegmentFreelist()
     {
         // Force the pipe to recycle a rented segment to the freelist.
+        // RecycleDrainedSegments only advances past a segment once the reader's
+        // published HeadSegment is strictly ahead of ChainHead. That requires the
+        // reader to advance to a position on seg2, which happens after the second read.
+        // A third flush then runs RecycleDrainedSegments with readerHead=seg2 > ChainHead=seg1.
         var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
-        pipe.Writer.GetMemory(60); pipe.Writer.Advance(60);
+
+        // Round 1: write + read + advance past seg1.
+        pipe.Writer.GetMemory(60); pipe.Writer.Advance(60);   // seg1 (64-byte slot, 60 used)
         await pipe.Writer.FlushAsync();
         var r1 = await pipe.Reader.ReadAsync();
-        pipe.Reader.AdvanceTo(r1.Buffer.End);
+        pipe.Reader.AdvanceTo(r1.Buffer.End);                 // ReadHead = seg1
 
-        pipe.Writer.GetMemory(60); pipe.Writer.Advance(60);   // forces a fresh segment
-        await pipe.Writer.FlushAsync();                        // recycles the now-drained head
+        // Round 2: write + read + advance past seg2. ReadHead moves to seg2.
+        pipe.Writer.GetMemory(60); pipe.Writer.Advance(60);   // seg2 (seg1 has 4 bytes left < 60)
+        await pipe.Writer.FlushAsync();
+        var r2 = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(r2.Buffer.End);                 // ReadHead = seg2
+
+        // Round 3: third flush triggers RecycleDrainedSegments with readerHead=seg2,
+        // recycling seg1 (ChainHead) into the freelist.
+        pipe.Writer.GetMemory(60); pipe.Writer.Advance(60);   // seg3
+        await pipe.Writer.FlushAsync();                       // seg1 now recycled to freelist
 
         int freelistBefore = pipe._writer.FreelistCount;
         Assert.True(freelistBefore > 0, "Test setup error: rented freelist should be populated.");
 
         // Drain the chain so post-Reset only the freelist matters.
-        var r2 = await pipe.Reader.ReadAsync();
-        pipe.Reader.AdvanceTo(r2.Buffer.End);
+        var r3 = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(r3.Buffer.End);
 
         pipe.Writer.Complete();
         pipe.Reader.Complete();

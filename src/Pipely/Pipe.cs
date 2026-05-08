@@ -143,6 +143,53 @@ public sealed partial class Pipe : IDisposable
     {
         if (!_writer.WriterCompleted || !_reader.ReaderCompleted)
             throw new InvalidOperationException("Both completion routines must be called before resetting the pipe.");
+
+        // Walk the chain and dispatch each segment to its appropriate freelist.
+        // Donated segments: dispose the foreign IMemoryOwner, push the shell to
+        // the donated-shell freelist (over-cap drops to GC, matching existing semantics).
+        // Rented segments: push to the rented-segment freelist (over-cap → DisposeOwned).
+        var seg = _writer.ChainHead;
+        while (seg != null)
+        {
+            var next = seg.Next;
+            if (seg.IsDonated)
+            {
+                seg.DisposeOwned();
+                PushDonatedShellFreelist(seg);
+            }
+            else
+            {
+                PushFreelist(seg);
+            }
+            seg = next;
+        }
+
+        // Clear writer-side fields. Freelist head/count preserved.
+        _writer.ChainHead = null;
+        _writer.WritingHead = null;
+        _writer.WritingHeadBytesBuffered = 0;
+        _writer.TotalWritten = 0;
+        _writer.LastPublishedWriterState = default;
+        _writer.LastAcquiredReaderState = default;
+        _writer.WriterCompleted = false;
+
+        // Clear reader-side fields.
+        _reader.ReadHead = null;
+        _reader.ReadHeadIdx = 0;
+        _reader.ReadTail = null;
+        _reader.ReadTailIdx = 0;
+        _reader.TotalConsumed = 0;
+        _reader.TotalExamined = 0;
+        _reader.LastPublishedReaderState = default;
+        _reader.LastAcquiredWriterState = default;
+        _reader.ReaderCompleted = false;
+        _reader.ReadPending = false;
+
+        // Reset triple buffers and awaiters.
+        _writerTb.Reset();
+        _readerTb.Reset();
+        _readAwaiter.Reset();
+        _flushAwaiter.Reset();
     }
 
     public void Dispose()
