@@ -43,7 +43,7 @@ public class PipeWriterTests
         using var pipe = new Pipely.Pipe();
         // Manually set the internal flag to test the entry guard. Complete is wired in Task 9.
         // Pipely.Tests has InternalsVisibleTo, so direct field access works.
-        pipe._writerCompleted = true;
+        pipe._writer.WriterCompleted = true;
 
         Assert.Throws<InvalidOperationException>(() => pipe.Writer.GetMemory(0));
     }

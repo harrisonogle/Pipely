@@ -36,7 +36,7 @@ public class PipeWriterSpliceTests
     public void Splice_CompletedWriter_Throws_InvalidOp_CallerStillOwns()
     {
         using var pipe = new Pipely.Pipe();
-        pipe._writerCompleted = true;          // simulate post-Complete state (internal flag)
+        pipe._writer.WriterCompleted = true;          // simulate post-Complete state (internal flag)
 
         var owner = new TrackingMemoryOwner(64);
         Assert.Throws<InvalidOperationException>(() => pipe.Writer.Splice(owner));
@@ -63,16 +63,16 @@ public class PipeWriterSpliceTests
         // Establish a known state.
         pipe.Writer.GetMemory(40);
         pipe.Writer.Advance(40);
-        long totalWrittenBefore = pipe._totalWritten;
-        var writingHeadBefore = pipe._writingHead;
-        int bufferedBefore = pipe._writingHeadBytesBuffered;
+        long totalWrittenBefore = pipe._writer.TotalWritten;
+        var writingHeadBefore = pipe._writer.WritingHead;
+        int bufferedBefore = pipe._writer.WritingHeadBytesBuffered;
 
         var owner = new TrackingMemoryOwner(64);
         Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Splice(owner, -1, 0));
 
-        Assert.Equal(totalWrittenBefore, pipe._totalWritten);
-        Assert.Same(writingHeadBefore, pipe._writingHead);
-        Assert.Equal(bufferedBefore, pipe._writingHeadBytesBuffered);
+        Assert.Equal(totalWrittenBefore, pipe._writer.TotalWritten);
+        Assert.Same(writingHeadBefore, pipe._writer.WritingHead);
+        Assert.Equal(bufferedBefore, pipe._writer.WritingHeadBytesBuffered);
         Assert.Equal(0, owner.DisposeCount);
     }
 
@@ -84,16 +84,16 @@ public class PipeWriterSpliceTests
         using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(64);
 
-        long totalWrittenBefore = pipe._totalWritten;
-        var writingHeadBefore   = pipe._writingHead;
-        var chainHeadBefore     = pipe._chainHead;
+        long totalWrittenBefore = pipe._writer.TotalWritten;
+        var writingHeadBefore   = pipe._writer.WritingHead;
+        var chainHeadBefore     = pipe._writer.ChainHead;
 
         pipe.Writer.Splice(owner, start: 10, length: 0);
 
         Assert.Equal(1, owner.DisposeCount);
-        Assert.Equal(totalWrittenBefore, pipe._totalWritten);
-        Assert.Same(writingHeadBefore, pipe._writingHead);
-        Assert.Same(chainHeadBefore, pipe._chainHead);
+        Assert.Equal(totalWrittenBefore, pipe._writer.TotalWritten);
+        Assert.Same(writingHeadBefore, pipe._writer.WritingHead);
+        Assert.Same(chainHeadBefore, pipe._writer.ChainHead);
     }
 
     [Fact]
@@ -107,8 +107,8 @@ public class PipeWriterSpliceTests
         pipe.Writer.Splice(owner);
 
         Assert.Equal(1, owner.DisposeCount);
-        Assert.Equal(0, pipe._totalWritten);
-        Assert.Null(pipe._writingHead);
+        Assert.Equal(0, pipe._writer.TotalWritten);
+        Assert.Null(pipe._writer.WritingHead);
     }
 
     // ---------- Bootstrap: empty pipe + Splice ----------
@@ -123,12 +123,12 @@ public class PipeWriterSpliceTests
 
         pipe.Writer.Splice(owner);
 
-        Assert.NotNull(pipe._chainHead);
-        Assert.Same(pipe._chainHead, pipe._writingHead);
-        Assert.Equal(64, pipe._writingHeadBytesBuffered);
-        Assert.Equal(64, pipe._totalWritten);
+        Assert.NotNull(pipe._writer.ChainHead);
+        Assert.Same(pipe._writer.ChainHead, pipe._writer.WritingHead);
+        Assert.Equal(64, pipe._writer.WritingHeadBytesBuffered);
+        Assert.Equal(64, pipe._writer.TotalWritten);
 
-        var seg = pipe._chainHead!;
+        var seg = pipe._writer.ChainHead!;
         Assert.Equal(0, seg.RunningIndex);
         Assert.True(seg.IsDonated);
         Assert.Same(pipe, seg.OwnerToken);
@@ -150,14 +150,14 @@ public class PipeWriterSpliceTests
 
         pipe.Writer.Splice(owner, start: 100, length: 50);
 
-        Assert.NotNull(pipe._chainHead);
-        var seg = pipe._chainHead!;
+        Assert.NotNull(pipe._writer.ChainHead);
+        var seg = pipe._writer.ChainHead!;
         Assert.Equal(50, seg.End);
         Assert.Equal(50, seg.AvailableMemory.Length);
         // Bytes 100..149 of the underlying array are exposed.
         Assert.Equal((byte)100, seg.AvailableMemory.Span[0]);
         Assert.Equal((byte)149, seg.AvailableMemory.Span[49]);
-        Assert.Equal(50, pipe._totalWritten);
+        Assert.Equal(50, pipe._writer.TotalWritten);
     }
 
     // ---------- Steady-state splice ----------
@@ -170,7 +170,7 @@ public class PipeWriterSpliceTests
         var rentedMem = pipe.Writer.GetMemory(64);
         for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
         pipe.Writer.Advance(40);
-        var prevTail = pipe._writingHead!;
+        var prevTail = pipe._writer.WritingHead!;
 
         // Now Splice a donated buffer.
         var donatedBytes = new byte[20];
@@ -185,7 +185,7 @@ public class PipeWriterSpliceTests
         Assert.False(prevTail.IsDonated);
 
         // The donated segment is the new writing head.
-        var donated = pipe._writingHead!;
+        var donated = pipe._writer.WritingHead!;
         Assert.NotSame(prevTail, donated);
         Assert.Same(donated, prevTail.Next);
         Assert.True(donated.IsDonated);
@@ -195,18 +195,18 @@ public class PipeWriterSpliceTests
         Assert.Null(donated.Next);
 
         // Counters
-        Assert.Equal(20, pipe._writingHeadBytesBuffered);
-        Assert.Equal(60, pipe._totalWritten);
+        Assert.Equal(20, pipe._writer.WritingHeadBytesBuffered);
+        Assert.Equal(60, pipe._writer.TotalWritten);
 
         // Chain head is still the original prevTail (not donated).
-        Assert.Same(prevTail, pipe._chainHead);
+        Assert.Same(prevTail, pipe._writer.ChainHead);
         Assert.Equal(0, owner.DisposeCount);
     }
 
     [Fact]
     public void Splice_AfterSplice_PreviousDonatedTailIsLinkedIdempotently()
     {
-        // Spec §2.2: when the previous _writingHead is itself donated, the steady-state
+        // Spec §2.2: when the previous _writer.WritingHead is itself donated, the steady-state
         // Freeze(filled, newDonated) call writes End/base.Memory to the same values they
         // already held; only Next changes meaningfully.
         using var pipe = new Pipely.Pipe();
@@ -215,12 +215,12 @@ public class PipeWriterSpliceTests
         var owner2 = new TrackingMemoryOwner(50);
 
         pipe.Writer.Splice(owner1);
-        var donated1 = pipe._writingHead!;
+        var donated1 = pipe._writer.WritingHead!;
         int  end1Before    = donated1.End;
         int  memLenBefore  = ((System.Buffers.ReadOnlySequenceSegment<byte>)donated1).Memory.Length;
 
         pipe.Writer.Splice(owner2);
-        var donated2 = pipe._writingHead!;
+        var donated2 = pipe._writer.WritingHead!;
 
         // donated1's End/base.Memory unchanged (idempotent Freeze write — spec §2.2).
         Assert.Equal(end1Before,    donated1.End);
@@ -231,11 +231,11 @@ public class PipeWriterSpliceTests
         Assert.Equal(50, donated2.End);
         Assert.Equal(30, donated2.RunningIndex);   // donated1.RunningIndex(0) + donated1.End(30)
 
-        Assert.Equal(50, pipe._writingHeadBytesBuffered);
-        Assert.Equal(80, pipe._totalWritten);
+        Assert.Equal(50, pipe._writer.WritingHeadBytesBuffered);
+        Assert.Equal(80, pipe._writer.TotalWritten);
 
         // Chain head is donated1 (the very first segment).
-        Assert.Same(donated1, pipe._chainHead);
+        Assert.Same(donated1, pipe._writer.ChainHead);
     }
 
     [Fact]
@@ -248,7 +248,7 @@ public class PipeWriterSpliceTests
 
         pipe.Writer.Splice(owner, start: 200, length: 100);
 
-        var seg = pipe._writingHead!;
+        var seg = pipe._writer.WritingHead!;
         Assert.Equal(100, seg.End);
         Assert.Equal((byte)200, seg.AvailableMemory.Span[0]);
         Assert.Equal((byte)((200 + 99) & 0xFF), seg.AvailableMemory.Span[99]);
@@ -262,17 +262,17 @@ public class PipeWriterSpliceTests
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(owner);
-        var donated = pipe._writingHead!;
+        var donated = pipe._writer.WritingHead!;
 
         var mem = pipe.Writer.GetMemory(64);
 
-        // _writingHead should have moved off the donated segment to a fresh rented tail.
-        Assert.NotSame(donated, pipe._writingHead);
-        Assert.False(pipe._writingHead!.IsDonated);
+        // _writer.WritingHead should have moved off the donated segment to a fresh rented tail.
+        Assert.NotSame(donated, pipe._writer.WritingHead);
+        Assert.False(pipe._writer.WritingHead!.IsDonated);
         // The donated segment is now linked as a non-tail chain segment.
-        Assert.Same(pipe._writingHead, donated.Next);
-        // _writingHeadBytesBuffered resets to 0 for the new tail.
-        Assert.Equal(0, pipe._writingHeadBytesBuffered);
+        Assert.Same(pipe._writer.WritingHead, donated.Next);
+        // _writer.WritingHeadBytesBuffered resets to 0 for the new tail.
+        Assert.Equal(0, pipe._writer.WritingHeadBytesBuffered);
         Assert.True(mem.Length >= 64);
     }
 
@@ -283,7 +283,7 @@ public class PipeWriterSpliceTests
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(owner);
 
-        // _writingHead.AvailableMemory.Length == _writingHeadBytesBuffered, so any positive
+        // _writer.WritingHead.AvailableMemory.Length == _writer.WritingHeadBytesBuffered, so any positive
         // Advance fails the existing bounds check at Pipe.Writer.cs:52.
         Assert.Throws<ArgumentOutOfRangeException>(() => pipe.Writer.Advance(1));
     }
@@ -294,13 +294,13 @@ public class PipeWriterSpliceTests
         using var pipe = new Pipely.Pipe();
         var owner = new TrackingMemoryOwner(50);
         pipe.Writer.Splice(owner);
-        var donated = pipe._writingHead!;
+        var donated = pipe._writer.WritingHead!;
 
         var fr = await pipe.Writer.FlushAsync();
         Assert.False(fr.IsCanceled);
         Assert.False(fr.IsCompleted);
 
-        var snap = pipe._lastPublishedWriterState;
+        var snap = pipe._writer.LastPublishedWriterState;
         Assert.Same(donated, snap.TailSegment);
         Assert.Equal(50, snap.TailWritten);
         Assert.Equal(50, snap.TotalWritten);
@@ -314,15 +314,15 @@ public class PipeWriterSpliceTests
         var rentedMem = pipe.Writer.GetMemory(64);
         for (int i = 0; i < 40; i++) rentedMem.Span[i] = (byte)i;
         pipe.Writer.Advance(40);
-        var rented = pipe._writingHead!;
+        var rented = pipe._writer.WritingHead!;
 
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(owner);
 
         await pipe.Writer.FlushAsync();
-        var snap = pipe._lastPublishedWriterState;
+        var snap = pipe._writer.LastPublishedWriterState;
         Assert.Same(rented, snap.HeadSegment);
-        Assert.Same(pipe._writingHead, snap.TailSegment);
+        Assert.Same(pipe._writer.WritingHead, snap.TailSegment);
         Assert.True(snap.TailSegment!.IsDonated);
         Assert.Equal(20, snap.TailWritten);
         Assert.Equal(60, snap.TotalWritten);
@@ -337,7 +337,7 @@ public class PipeWriterSpliceTests
         using var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
         pipe.Writer.GetMemory(64);
         pipe.Writer.Advance(0);
-        var prevTail = pipe._writingHead!;
+        var prevTail = pipe._writer.WritingHead!;
 
         var owner = new TrackingMemoryOwner(20);
         pipe.Writer.Splice(owner);
@@ -346,10 +346,10 @@ public class PipeWriterSpliceTests
         Assert.False(prevTail.IsDonated);
         Assert.NotNull(prevTail.Next);
         Assert.True(prevTail.Next!.IsDonated);
-        Assert.Same(prevTail.Next, pipe._writingHead);
-        Assert.Equal(20, pipe._writingHead!.End);
-        Assert.Equal(0, pipe._writingHead.RunningIndex);
-        Assert.Equal(20, pipe._totalWritten);
+        Assert.Same(prevTail.Next, pipe._writer.WritingHead);
+        Assert.Equal(20, pipe._writer.WritingHead!.End);
+        Assert.Equal(0, pipe._writer.WritingHead.RunningIndex);
+        Assert.Equal(20, pipe._writer.TotalWritten);
     }
 
     [Fact]
@@ -362,7 +362,7 @@ public class PipeWriterSpliceTests
         var owner = new TrackingMemoryOwner(8 * 1024);   // well over the pause threshold
         pipe.Writer.Splice(owner);   // synchronous, never parks; no exception
 
-        Assert.Equal(8 * 1024, pipe._totalWritten);
+        Assert.Equal(8 * 1024, pipe._writer.TotalWritten);
 
         // FlushAsync should park because unconsumed >= PauseWriterThreshold.
         var flushTask = pipe.Writer.FlushAsync().AsTask();
@@ -391,7 +391,7 @@ public class PipeWriterSpliceTests
         pipe.Writer.Splice(o3);
 
         // Walk the chain and verify three donated segments back-to-back.
-        var s = pipe._chainHead!;
+        var s = pipe._writer.ChainHead!;
         Assert.True(s.IsDonated);
         Assert.Equal(10, s.End);
         s = s.Next!;
@@ -404,8 +404,8 @@ public class PipeWriterSpliceTests
         Assert.Equal(30, s.End);
         Assert.Null(s.Next);
 
-        Assert.Same(s, pipe._writingHead);
-        Assert.Equal(60, pipe._totalWritten);
+        Assert.Same(s, pipe._writer.WritingHead);
+        Assert.Equal(60, pipe._writer.TotalWritten);
     }
 
     // ---------- Recycle path: donated -> DisposeOwned + drop; rented -> freelist (unchanged) ----------
@@ -423,12 +423,12 @@ public class PipeWriterSpliceTests
         pipe.Writer.Splice(donated1);
         pipe.Writer.Splice(donated2);
 
-        int rentedFreelistBefore = pipe._freelistCount;
-        int shellFreelistBefore  = pipe._donatedShellFreelistCount;
+        int rentedFreelistBefore = pipe._writer.FreelistCount;
+        int shellFreelistBefore  = pipe._writer.DonatedShellFreelistCount;
 
         await pipe.Writer.FlushAsync();
         var rr = await pipe.Reader.ReadAsync();
-        // Drain past donated1 (consume the first 30 bytes; donated2 stays as _writingHead).
+        // Drain past donated1 (consume the first 30 bytes; donated2 stays as _writer.WritingHead).
         pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(30));
 
         // Next FlushAsync runs RecycleDrainedSegments and recycles donated1.
@@ -437,8 +437,8 @@ public class PipeWriterSpliceTests
         // donated1 is foreign-owner: must be Disposed, must NOT enter the rented freelist,
         // must enter the donated-shell freelist.
         Assert.Equal(1, donated1.DisposeCount);
-        Assert.Equal(rentedFreelistBefore, pipe._freelistCount);
-        Assert.Equal(shellFreelistBefore + 1, pipe._donatedShellFreelistCount);
+        Assert.Equal(rentedFreelistBefore, pipe._writer.FreelistCount);
+        Assert.Equal(shellFreelistBefore + 1, pipe._writer.DonatedShellFreelistCount);
         // donated2 is still the active tail; not yet recycled.
         Assert.Equal(0, donated2.DisposeCount);
     }
@@ -456,7 +456,7 @@ public class PipeWriterSpliceTests
         var rr = await pipe.Reader.ReadAsync();
         // Mid-segment position (5 bytes into a 40-byte donated segment).
         pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(5));
-        Assert.Equal(5L, pipe._totalConsumed);
+        Assert.Equal(5L, pipe._reader.TotalConsumed);
     }
 
     [Fact]
@@ -471,10 +471,10 @@ public class PipeWriterSpliceTests
         var rr = await pipe.Reader.ReadAsync();
         pipe.Reader.AdvanceTo(rr.Buffer.End);
 
-        int freelistBefore = pipe._freelistCount;
+        int freelistBefore = pipe._writer.FreelistCount;
         await pipe.Writer.FlushAsync();
         // The first segment is recycled to the freelist (or disposed if cap-overflow).
-        Assert.True(pipe._freelistCount > freelistBefore);
+        Assert.True(pipe._writer.FreelistCount > freelistBefore);
     }
 
     [Fact]
@@ -515,17 +515,17 @@ public class PipeWriterSpliceTests
         await pipe.Writer.FlushAsync();
 
         // Now donated1's shell is on the shell freelist.
-        Assert.Equal(1, pipe._donatedShellFreelistCount);
+        Assert.Equal(1, pipe._writer.DonatedShellFreelistCount);
 
         // Splice a third donation. The shell freelist should drain.
         var donated3 = new TrackingMemoryOwner(15);
         pipe.Writer.Splice(donated3);
 
-        Assert.Equal(0, pipe._donatedShellFreelistCount);
+        Assert.Equal(0, pipe._writer.DonatedShellFreelistCount);
         // The new tail is donated and correctly initialized via AdoptFrom.
-        Assert.True(pipe._writingHead!.IsDonated);
-        Assert.Same(pipe, pipe._writingHead.OwnerToken);
-        Assert.Equal(15, pipe._writingHead.End);
+        Assert.True(pipe._writer.WritingHead!.IsDonated);
+        Assert.Same(pipe, pipe._writer.WritingHead.OwnerToken);
+        Assert.Equal(15, pipe._writer.WritingHead.End);
     }
 
     [Fact]
@@ -554,7 +554,7 @@ public class PipeWriterSpliceTests
         await pipe.Writer.FlushAsync();
 
         // 4 donated segments were recycled; only 2 fit in the shell freelist.
-        Assert.Equal(2, pipe._donatedShellFreelistCount);
+        Assert.Equal(2, pipe._writer.DonatedShellFreelistCount);
     }
 
     [Fact]
@@ -573,12 +573,12 @@ public class PipeWriterSpliceTests
         var rr = pipe.Reader.ReadAsync().GetAwaiter().GetResult();
         pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(8));
         pipe.Writer.FlushAsync().GetAwaiter().GetResult();
-        Assert.Equal(1, pipe._donatedShellFreelistCount);
+        Assert.Equal(1, pipe._writer.DonatedShellFreelistCount);
 
         pipe.Dispose();
 
-        Assert.Null(pipe._donatedShellFreelistHead);
-        Assert.Equal(0, pipe._donatedShellFreelistCount);
+        Assert.Null(pipe._writer.DonatedShellFreelistHead);
+        Assert.Equal(0, pipe._writer.DonatedShellFreelistCount);
     }
 
     [Fact]
@@ -591,8 +591,8 @@ public class PipeWriterSpliceTests
         // pop logic (e.g., reset-on-pop) doesn't accidentally regress.
         //
         // Two segments are required to trigger a recycle: donated1 is frozen (no longer
-        // _writingHead) once donated2 is appended, so RecycleDrainedSegments can recycle it.
-        // With only one segment, _chainHead == _writingHead and the recycle loop never fires.
+        // _writer.WritingHead) once donated2 is appended, so RecycleDrainedSegments can recycle it.
+        // With only one segment, _writer.ChainHead == _writer.WritingHead and the recycle loop never fires.
         using var pipe = new Pipely.Pipe();
         var donated1 = new TrackingMemoryOwner(8);
         var donated2 = new TrackingMemoryOwner(8);
@@ -602,12 +602,12 @@ public class PipeWriterSpliceTests
         var rr = await pipe.Reader.ReadAsync();
         pipe.Reader.AdvanceTo(rr.Buffer.GetPosition(8));  // drain past donated1 only
         await pipe.Writer.FlushAsync();
-        Assert.Equal(1, pipe._donatedShellFreelistCount);
+        Assert.Equal(1, pipe._writer.DonatedShellFreelistCount);
 
         var donated3 = new TrackingMemoryOwner(8);
         pipe.Writer.Splice(donated3);
 
-        var seg = pipe._writingHead!;
+        var seg = pipe._writer.WritingHead!;
         Assert.True(seg.IsDonated);
         Assert.Same(pipe, seg.OwnerToken);
     }

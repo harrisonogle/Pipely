@@ -26,17 +26,17 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
     public override ValueTask<ReadResult> ReadAsync(CancellationToken ct = default)
     {
         if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
-        if (_pipe._readerCompleted) throw new InvalidOperationException("Reading is completed.");
-        if (_pipe._readPending) throw new InvalidOperationException("Reading is in progress.");
+        if (_pipe._reader.ReaderCompleted) throw new InvalidOperationException("Reading is completed.");
+        if (_pipe._reader.ReadPending) throw new InvalidOperationException("Reading is in progress.");
 
         if (_pipe._writerTb.TryAcquire())
         {
-            _pipe._lastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
+            _pipe._reader.LastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
             _pipe.IntegrateAcquiredWriterState();
         }
 
-        if (_pipe._lastAcquiredWriterState.IsCompleted && _pipe._lastAcquiredWriterState.CompletionException != null)
-            ExceptionDispatchInfo.Throw(_pipe._lastAcquiredWriterState.CompletionException);
+        if (_pipe._reader.LastAcquiredWriterState.IsCompleted && _pipe._reader.LastAcquiredWriterState.CompletionException != null)
+            ExceptionDispatchInfo.Throw(_pipe._reader.LastAcquiredWriterState.CompletionException);
 
         while (true)
         {
@@ -45,7 +45,7 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
             int desired = oldV & ~PipelyAwaiter<ReadResult>.CancelFlag;
             if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
             {
-                _pipe._readPending = true;
+                _pipe._reader.ReadPending = true;
                 return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: true));
             }
         }
@@ -53,9 +53,9 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
         if (ct.IsCancellationRequested)
             return ValueTask.FromCanceled<ReadResult>(ct);
 
-        if (_pipe.HasReadableProgress() || _pipe._lastAcquiredWriterState.IsCompleted)
+        if (_pipe.HasReadableProgress() || _pipe._reader.LastAcquiredWriterState.IsCompleted)
         {
-            _pipe._readPending = true;
+            _pipe._reader.ReadPending = true;
             return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: false));
         }
 
@@ -65,17 +65,17 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
     public override bool TryRead(out ReadResult result)
     {
         if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
-        if (_pipe._readerCompleted) throw new InvalidOperationException("Reading is completed.");
-        if (_pipe._readPending) throw new InvalidOperationException("Reading is in progress.");
+        if (_pipe._reader.ReaderCompleted) throw new InvalidOperationException("Reading is completed.");
+        if (_pipe._reader.ReadPending) throw new InvalidOperationException("Reading is in progress.");
 
         if (_pipe._writerTb.TryAcquire())
         {
-            _pipe._lastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
+            _pipe._reader.LastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
             _pipe.IntegrateAcquiredWriterState();
         }
 
-        if (_pipe._lastAcquiredWriterState.IsCompleted && _pipe._lastAcquiredWriterState.CompletionException != null)
-            ExceptionDispatchInfo.Throw(_pipe._lastAcquiredWriterState.CompletionException);
+        if (_pipe._reader.LastAcquiredWriterState.IsCompleted && _pipe._reader.LastAcquiredWriterState.CompletionException != null)
+            ExceptionDispatchInfo.Throw(_pipe._reader.LastAcquiredWriterState.CompletionException);
 
         while (true)
         {
@@ -84,15 +84,15 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
             int desired = oldV & ~PipelyAwaiter<ReadResult>.CancelFlag;
             if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
             {
-                _pipe._readPending = true;
+                _pipe._reader.ReadPending = true;
                 result = _pipe.BuildReadResult(isCanceled: true);
                 return true;
             }
         }
 
-        if (_pipe.HasReadableProgress() || _pipe._lastAcquiredWriterState.IsCompleted)
+        if (_pipe.HasReadableProgress() || _pipe._reader.LastAcquiredWriterState.IsCompleted)
         {
-            _pipe._readPending = true;
+            _pipe._reader.ReadPending = true;
             result = _pipe.BuildReadResult(isCanceled: false);
             return true;
         }
@@ -106,8 +106,8 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
     public override void AdvanceTo(SequencePosition consumed, SequencePosition examined)
     {
         if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
-        if (_pipe._readerCompleted) throw new InvalidOperationException("Reading is completed.");
-        _pipe._readPending = false;
+        if (_pipe._reader.ReaderCompleted) throw new InvalidOperationException("Reading is completed.");
+        _pipe._reader.ReadPending = false;
 
         var consumedSeg = consumed.GetObject() as BufferSegment;
         var examinedSeg = examined.GetObject() as BufferSegment;
@@ -133,22 +133,22 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
         // Refresh writer state for upper-bound validation.
         if (_pipe._writerTb.TryAcquire())
         {
-            _pipe._lastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
+            _pipe._reader.LastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
             _pipe.IntegrateAcquiredWriterState();
         }
 
-        if (consumedAbs < _pipe._totalConsumed
-            || examinedAbs < _pipe._totalExamined
+        if (consumedAbs < _pipe._reader.TotalConsumed
+            || examinedAbs < _pipe._reader.TotalExamined
             || consumedAbs > examinedAbs
-            || examinedAbs > _pipe._lastAcquiredWriterState.TotalWritten)
+            || examinedAbs > _pipe._reader.LastAcquiredWriterState.TotalWritten)
         {
             throw new InvalidOperationException("AdvanceTo position out of range");
         }
 
-        _pipe._readHead      = consumedSeg;
-        _pipe._readHeadIdx   = consumedIdx;
-        _pipe._totalConsumed = consumedAbs;
-        _pipe._totalExamined = examinedAbs;
+        _pipe._reader.ReadHead      = consumedSeg;
+        _pipe._reader.ReadHeadIdx   = consumedIdx;
+        _pipe._reader.TotalConsumed = consumedAbs;
+        _pipe._reader.TotalExamined = examinedAbs;
 
         _pipe.PublishReaderState();
     }
@@ -162,20 +162,20 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
     public override void Complete(Exception? exception = null)
     {
         if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
-        if (_pipe._readerCompleted) return;
-        _pipe._readerCompleted = true;
+        if (_pipe._reader.ReaderCompleted) return;
+        _pipe._reader.ReaderCompleted = true;
 
         var snapshot = new ReaderState
         {
             HeadSegment         = null,           // S4: terminal publish
-            TotalConsumed       = _pipe._totalConsumed,
-            TotalExamined       = _pipe._totalExamined,
+            TotalConsumed       = _pipe._reader.TotalConsumed,
+            TotalExamined       = _pipe._reader.TotalExamined,
             IsCompleted         = true,
             CompletionException = exception,
         };
         _pipe._readerTb.ProducerSlot() = snapshot;
         _pipe._readerTb.Publish();
-        _pipe._lastPublishedReaderState = snapshot;
+        _pipe._reader.LastPublishedReaderState = snapshot;
 
         _pipe.SignalFlushAwaiterIfPending();
     }
@@ -203,7 +203,7 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
                 : new ReadOnlySequence<byte>(head, _pipe._readAwaiter._stashHeadIdx, tail!, _pipe._readAwaiter._stashTailIdx);
 
             Interlocked.Increment(ref _pipe._readAwaiter._cancelPendingWonCount);
-            _pipe._readPending = true;
+            _pipe._reader.ReadPending = true;
             _pipe._readAwaiter._core.SetResult(new ReadResult(buffer, isCanceled: true, isCompleted: false));
         }
     }
@@ -214,10 +214,10 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
         _pipe._readAwaiter._core.Reset();
         _pipe._readAwaiter._token = ct;
 
-        _pipe._readAwaiter._stashHead    = _pipe._readHead;
-        _pipe._readAwaiter._stashHeadIdx = _pipe._readHeadIdx;
-        _pipe._readAwaiter._stashTail    = _pipe._readTail;
-        _pipe._readAwaiter._stashTailIdx = _pipe._readTailIdx;
+        _pipe._readAwaiter._stashHead    = _pipe._reader.ReadHead;
+        _pipe._readAwaiter._stashHeadIdx = _pipe._reader.ReadHeadIdx;
+        _pipe._readAwaiter._stashTail    = _pipe._reader.ReadTail;
+        _pipe._readAwaiter._stashTailIdx = _pipe._reader.ReadTailIdx;
 
         while (true)
         {
@@ -234,10 +234,10 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
         // Lost-wakeup re-check (throw-first).
         if (_pipe._writerTb.TryAcquire())
         {
-            _pipe._lastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
+            _pipe._reader.LastAcquiredWriterState = _pipe._writerTb.ConsumerSlot();
             _pipe.IntegrateAcquiredWriterState();
 
-            if (_pipe._lastAcquiredWriterState.IsCompleted && _pipe._lastAcquiredWriterState.CompletionException != null)
+            if (_pipe._reader.LastAcquiredWriterState.IsCompleted && _pipe._reader.LastAcquiredWriterState.CompletionException != null)
             {
                 while (true)
                 {
@@ -247,13 +247,13 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
                     if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
                     {
                         Interlocked.Increment(ref _pipe._readAwaiter._lostWakeupResolvedCount);
-                        _pipe._readAwaiter._core.SetException(_pipe._lastAcquiredWriterState.CompletionException);
+                        _pipe._readAwaiter._core.SetException(_pipe._reader.LastAcquiredWriterState.CompletionException);
                         return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
                     }
                 }
             }
 
-            if (_pipe.HasReadableProgress() || _pipe._lastAcquiredWriterState.IsCompleted)
+            if (_pipe.HasReadableProgress() || _pipe._reader.LastAcquiredWriterState.IsCompleted)
             {
                 while (true)
                 {
@@ -263,7 +263,7 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
                     if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
                     {
                         Interlocked.Increment(ref _pipe._readAwaiter._lostWakeupResolvedCount);
-                        _pipe._readPending = true;
+                        _pipe._reader.ReadPending = true;
                         return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: false));
                     }
                 }
@@ -280,7 +280,7 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
                == (PipelyAwaiter<ReadResult>.Pending | PipelyAwaiter<ReadResult>.CancelFlag))
         {
             Interlocked.Increment(ref _pipe._readAwaiter._lostCancelResolvedCount);
-            _pipe._readPending = true;
+            _pipe._reader.ReadPending = true;
             _pipe._readAwaiter._core.SetResult(_pipe.BuildReadResult(isCanceled: true));
             return new ValueTask<ReadResult>(_pipe._readAwaiter, _pipe._readAwaiter.Version);
         }

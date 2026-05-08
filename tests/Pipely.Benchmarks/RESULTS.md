@@ -286,3 +286,60 @@ the cost amortizes to zero per op.
   `TripleBuffer<T>` (see `TripleBuffer.CacheLineSize`); the comment there
   notes it covers x86-64 / Graviton and is also the right value for Apple
   Silicon. `Pipe`'s pad uses the same value inline.
+
+## Cache-line padding revisited — runtime layout reality (2026-05-08)
+
+After commit `a92c020`, an offset probe (using `Ldflda` per field on a live
+`Pipe` instance and `Unsafe.SizeOf<T>` for sizes) revealed that the previous
+patch's source-level intent did not match the runtime layout. Two findings,
+both empirically verified on .NET 10.0.7 / x86-64 RyuJIT:
+
+1. **`[StructLayout(LayoutKind.Sequential)]` on a class is a marshaling hint,
+   not a managed-layout guarantee.** On a class with mixed reference and value
+   fields, the CLR hoists references to the front of the object for
+   GC-bitmap efficiency regardless of the attribute. The `_padBeforeWriterFields`
+   field declared between the writer-block source comments did *not* land
+   between the writer-block and the reader-block — it landed at offset +156
+   (of the class), with hot writer/reader cursors interleaved on shared
+   cache lines elsewhere.
+
+   Concretely, under the `a92c020` layout: `_totalWritten` (writer-mut,
+   offset +104) and `_totalConsumed` (reader-mut, offset +112) sat on the
+   same cache line; `_writingHeadBytesBuffered` (offset +132) and
+   `_readHeadIdx` (offset +144) sat on the same cache line. The `perf c2c`
+   75% HITM drop on the bool-flag line was real but reflected the bools
+   being shoved to a less-trafficked line by the runtime's reordering, not
+   the source-level discipline the comments described.
+
+2. **`Sequential` is also reordered on structs containing reference fields.**
+   Refactoring the writer-block and reader-block into two
+   `Sequential` structs (`WriterFields`, `ReaderFields`) with explicit
+   `_padBefore` / `_padAfter` fields did *not* place those pads at the start
+   and end of the struct. The runtime applied the same hoist-references-first
+   policy inside the struct: refs at offsets 0–24, value primitives at 32–52,
+   `_padBefore` at +53, the larger nested structs at +184/+224, `_padAfter`
+   at +264. Field declaration order is not preserved.
+
+**Why the struct-encapsulation refactor still works** — the cache-line
+isolation is now guaranteed by the *total size* of each padded struct, not
+by the position of the pads within it. Each struct carries 256 B of padding
+(two `CacheLinePad` fields, 128 B each) plus the bulk of its hot-path fields
+(~136 B), totaling ~390 B per struct. The two structs are placed back-to-back
+in the class (`_writer` at offset +64, `_reader` at offset +456). Writer's
+last hot byte is at offset +327 (end of `LastAcquiredReaderState`); reader's
+first hot byte is at offset +456 (`ReadHead`). The 129-byte gap between them
+guarantees they fall on different cache lines under any heap-object
+alignment, with at least one entirely-empty cache line between the two
+hot regions.
+
+So the false-sharing fix that the prior commit *believed* it was making is
+now genuinely realized. The `Sequential` attribute is retained as
+documentation of intent and on the off chance a future runtime honors it;
+the isolation does not depend on it.
+
+**Verifier.** Future maintainers altering the `Pipe` field layout can
+re-derive the offsets with a small probe (`DynamicMethod` + `Ldflda` per
+field on a live `Pipe` instance) and confirm no writer-mutated field shares
+a 64 B cache line with any reader-mutated field. The transcript above
+covers .NET 10.0.7 / x86-64 RyuJIT; results may differ on other runtimes
+or JITs.

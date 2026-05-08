@@ -83,7 +83,7 @@ public class PipeLifecycleTests
         // Writer's next FlushAsync should recycle the entire chain (HeadSegment=null + IsCompleted=true).
         await pipe.Writer.FlushAsync();
 
-        // _chainHead should equal _writingHead (only the active tail remains).
-        Assert.Same(pipe._writingHead, pipe._chainHead);
+        // _writer.ChainHead should equal _writer.WritingHead (only the active tail remains).
+        Assert.Same(pipe._writer.WritingHead, pipe._writer.ChainHead);
     }
 }
