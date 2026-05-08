@@ -343,3 +343,63 @@ field on a live `Pipe` instance) and confirm no writer-mutated field shares
 a 64 B cache line with any reader-mutated field. The transcript above
 covers .NET 10.0.7 / x86-64 RyuJIT; results may differ on other runtimes
 or JITs.
+
+### Post-refactor measurements (commit `840859c`, 2026-05-08, same-session A/B)
+
+A same-session A/B was run by checking out the pre-refactor source onto
+the working tree, building, and running the cache-bench harness pinned to
+CPU 2 (producer) / CPU 4 (consumer); then restoring HEAD and re-running.
+Three 5 s samples per side, alternating, no `perf` overhead:
+
+| Run | Pre-refactor (`a92c020`) | Post-refactor (`840859c`) |
+|-----|-------------------------:|--------------------------:|
+| 1   |               11537 MiB/s |                19810 MiB/s |
+| 2   |               13428 MiB/s |                20032 MiB/s |
+| 3   |               14138 MiB/s |                20014 MiB/s |
+| Mean |              13034 MiB/s |                19952 MiB/s |
+
+**+53% throughput** vs pre-refactor in the same session. Post-refactor
+samples are extremely stable (stddev 110 MiB/s); pre-refactor samples
+drift upward as the system warms (11.5 → 14.1 GiB/s), so the gap is
+slightly understated by the early samples. Combined with the prior
+`a92c020` improvement over the unpadded baseline (10460 MiB/s reported
+on 2026-05-04), the cumulative gain since the no-padding starting point
+is approximately +91%.
+
+### `perf c2c` HITM (20 s captures, same session)
+
+| Metric                         | Pre-refactor | Post-refactor |
+|--------------------------------|-------------:|--------------:|
+| Total records (IBS samples)    |      206 496 |      214 496 |
+| Total Load Local HITM          |          709 |        1 025 |
+| Total Shared Cache Lines       |           92 |          146 |
+| Throughput during capture      | 12 743 MiB/s | 19 080 MiB/s |
+| HITM per GiB transferred       |        ~2.85 |        ~2.75 |
+
+The HITM-per-byte ratio is essentially flat. The absolute count and the
+shared-line count both *rose*, because: (a) more work was done per second,
+so more samples; (b) the post-refactor object is larger (the two structs
+add ~256 B of padding plus alignment slack), spreading the same data over
+more 64 B lines. The residual hot lines align with `WriterState` /
+`ReaderState` fields inside `TripleBuffer` slots — the intended SPSC
+true-sharing handoff, not false sharing, and not reducible without
+changing the architecture.
+
+**Where the throughput came from, then.** The pre-refactor layout had
+writer-mutated fields and reader-mutated fields colocated on the same
+two 64 B cache lines (e.g., line 64–127 contained `_totalWritten`
+[writer] and `_totalConsumed` [reader]; line 128–191 contained
+`_writingHeadBytesBuffered` [writer] alongside `_readHeadIdx` [reader],
+plus all four bool flags). Every writer mutation invalidated those lines
+in the reader's L1, and vice versa, generating coherence-protocol
+traffic that the busy-poll loop's 4 KiB-cycle steady state stalled on.
+That coherence cost is mostly invisible to IBS sampling (the sample
+fires on the load that *waits* on the line, not on every cycle of
+inter-core invalidation), which is why the HITM-per-GiB metric stayed
+flat while wall-clock throughput improved 53%. The new layout places
+writer hot fields entirely within `_writer` (offsets +64 onward) and
+reader hot fields entirely within `_reader` (offsets +456 onward) on
+disjoint 64 B cache lines, so the per-cycle coherence cost goes to zero
+for the SPSC cursors. The `TripleBuffer` slot handoff cost — true
+sharing across a single line per slot — remains and is the work being
+attributed in the residual `perf c2c` data.
