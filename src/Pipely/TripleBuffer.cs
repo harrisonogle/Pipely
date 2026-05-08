@@ -79,4 +79,20 @@ public sealed class TripleBuffer<T> where T : struct
             default: return ref _slot2.Data;
         }
     }
+
+    /// <summary>
+    /// Restores the triple buffer to its post-construction state. Caller must guarantee
+    /// no concurrent producer or consumer activity (Pipely.Pipe enforces this via its
+    /// SPSC contract: Reset runs on the lifecycle owner thread, after both
+    /// Reader.Complete and Writer.Complete have been observed).
+    /// </summary>
+    internal void Reset()
+    {
+        _state.Value = 1 << 1;
+        _producer.Value = 0;
+        _consumer.Value = 2;
+        _slot0.Data = default!;
+        _slot1.Data = default!;
+        _slot2.Data = default!;
+    }
 }
