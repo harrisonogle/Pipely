@@ -191,4 +191,106 @@ public class PipeResetTests
             pipe.Reset();
         }
     }
+
+    [Fact]
+    public async Task Reset_AfterWriterCompletedWithException_ClearsCompletionException()
+    {
+        var pipe = new Pipely.Pipe();
+        pipe.Writer.Complete(new InvalidOperationException("boom"));
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await pipe.Reader.ReadAsync());
+        pipe.Reader.Complete();
+
+        pipe.Reset();
+
+        // Post-Reset, no exception in the published writer state.
+        Assert.Null(pipe._writer.LastPublishedWriterState.CompletionException);
+        Assert.False(pipe._writer.LastPublishedWriterState.IsCompleted);
+
+        // And the pipe is fully usable: the writer state seen by the reader is fresh
+        // (no terminal IsCompleted=true sticking around in the triple buffer).
+        var mem = pipe.Writer.GetMemory(4); mem.Span.Fill(0x11); pipe.Writer.Advance(4);
+        await pipe.Writer.FlushAsync();
+        var r = await pipe.Reader.ReadAsync();
+        Assert.False(r.IsCompleted);   // Critical: the new reader observes a non-completed state.
+        Assert.Equal(4, r.Buffer.Length);
+        pipe.Reader.AdvanceTo(r.Buffer.End);
+    }
+
+    [Fact]
+    public void Reset_OnFreshlyConstructedPipeAfterBothComplete_NoThrow()
+    {
+        // No GetMemory, no FlushAsync — just complete and Reset.
+        var pipe = new Pipely.Pipe();
+        pipe.Writer.Complete();
+        pipe.Reader.Complete();
+        pipe.Reset();   // must not throw, must not crash on null ChainHead
+    }
+
+    [Fact]
+    public void Reset_WithDonatedTail_DisposesAndPoolsTail()
+    {
+        // The active WritingHead can itself be a donated segment.
+        var pipe = new Pipely.Pipe();
+        var donated = new TrackingMemoryOwner(40);
+        pipe.Writer.Splice(donated);
+        // No FlushAsync — the donated segment is the WritingHead.
+
+        pipe.Writer.Complete();
+        pipe.Reader.Complete();
+        pipe.Reset();
+
+        Assert.Equal(1, donated.DisposeCount);
+        Assert.Equal(1, pipe._writer.DonatedShellFreelistCount);
+    }
+
+    [Fact]
+    public async Task Reset_AfterParkedReadObservedWriterException_ReusableForNewRound()
+    {
+        // Exercises the live OnCompleted → SetException → Reset → next round path:
+        // the reader parks, writer.Complete(ex) signals via SetException, the reader's
+        // await re-throws, then we Reset and run a clean round. This is the integration
+        // counterpart to the awaiter-level Reset tests.
+        var pipe = new Pipely.Pipe();
+        var ex = new InvalidOperationException("first round error");
+
+        // Park a read with no data available.
+        var readTask = pipe.Reader.ReadAsync().AsTask();
+        Assert.False(readTask.IsCompleted);
+
+        pipe.Writer.Complete(ex);
+        var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await readTask);
+        Assert.Same(ex, thrown);
+
+        pipe.Reader.Complete();
+        pipe.Reset();
+
+        // Clean round 2: the awaiter has been Reset; new ValueTask tokens are valid.
+        var mem = pipe.Writer.GetMemory(8); mem.Span.Fill(0x55); pipe.Writer.Advance(8);
+        await pipe.Writer.FlushAsync();
+        var r = await pipe.Reader.ReadAsync();
+        Assert.False(r.IsCompleted);
+        Assert.Equal(8, r.Buffer.Length);
+        pipe.Reader.AdvanceTo(r.Buffer.End);
+    }
+
+    [Fact]
+    public async Task Reset_ReuseAcrossOptionsBoundaries_KeepsOriginalOptions()
+    {
+        // After Reset, the pipe still uses the options it was constructed with.
+        // We can't directly read pipe._options externally without InternalsVisibleTo,
+        // but we can verify behavior: the minimumSegmentSize knob is still in effect.
+        var pipe = new Pipely.Pipe(new Pipely.PipeOptions(minimumSegmentSize: 64));
+        pipe.Writer.GetMemory(1); pipe.Writer.Advance(1);
+        await pipe.Writer.FlushAsync();
+        var r1 = await pipe.Reader.ReadAsync();
+        pipe.Reader.AdvanceTo(r1.Buffer.End);
+        pipe.Writer.Complete();
+        pipe.Reader.Complete();
+        pipe.Reset();
+
+        // Asking for 1 byte after Reset still rents a >= 64-byte segment.
+        var mem = pipe.Writer.GetMemory(1);
+        Assert.True(mem.Length >= 64, $"Expected segment of at least 64 bytes; got {mem.Length}.");
+    }
 }
+

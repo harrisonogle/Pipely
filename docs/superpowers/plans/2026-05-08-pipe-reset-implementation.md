@@ -764,7 +764,7 @@ Append these to `PipeResetTests` (before the closing `}`):
     }
 
     [Fact]
-    public async Task Reset_WithDonatedTail_DisposesAndPoolsTail()
+    public void Reset_WithDonatedTail_DisposesAndPoolsTail()
     {
         // The active WritingHead can itself be a donated segment.
         var pipe = new Pipely.Pipe();
