@@ -5,6 +5,20 @@ using System.Threading;
 
 namespace Pipely;
 
+/// <summary>Writer side of a Pipely <see cref="Pipe"/>.</summary>
+/// <remarks>
+/// All members must be invoked on a single producer thread, including
+/// <see cref="Complete"/> and <see cref="Splice(System.Buffers.IMemoryOwner{byte})"/>.
+/// The sole exception is <see cref="CancelPendingFlush"/>, which is callable from any thread.
+/// <para>
+/// This is stricter than <see cref="System.IO.Pipelines.PipeWriter"/>. The BCL implementation
+/// is incidentally robust against cross-thread <c>Complete</c> because of an internal lock on
+/// its hot path; Pipely is lock-free and offers no such fallback. To trigger completion from a
+/// non-writer thread (timeout, cancellation token, downstream error), call
+/// <see cref="CancelPendingFlush"/> from that thread and let the writer thread observe the
+/// cancellation and call <see cref="Complete"/> itself.
+/// </para>
+/// </remarks>
 public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
 {
     private readonly Pipe _pipe;
@@ -114,6 +128,13 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
         return ParkFlushAwaiter(ct);
     }
 
+    /// <summary>Marks writing as complete and publishes the terminal writer state to the reader.</summary>
+    /// <remarks>
+    /// Must be called on the writer thread. Calling from any other thread is a contract violation;
+    /// see the type-level remarks on <see cref="PipeWriter"/> for the recommended migration from
+    /// BCL idioms that complete the writer from a timeout or cancellation handler. Repeat calls
+    /// coalesce — the second and subsequent calls are no-ops.
+    /// </remarks>
     public override void Complete(Exception? exception = null)
     {
         if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
@@ -136,6 +157,10 @@ public sealed class PipeWriter : System.IO.Pipelines.PipeWriter
         _pipe.SignalReadAwaiterIfPending();
     }
 
+    /// <summary>
+    /// Cancels a pending or future <see cref="FlushAsync"/>. Safe to call from any thread — this
+    /// is the only writer-side method that may be invoked outside the producer thread.
+    /// </summary>
     public override void CancelPendingFlush()
     {
         if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));

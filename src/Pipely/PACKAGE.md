@@ -50,6 +50,23 @@ The entire concurrency surface is:
 - **Two `TripleBuffer<T>`s** — a lock-free primitive that publishes a value from one thread to another through three padded slots and atomic indices. One carries the writer's published state to the reader; the other carries the reader's published state to the writer. Each side reads the other's most-recently-published state without blocking.
 - **Two awaiter state machines** (`PipelyAwaiter<ReadResult>` for the parked reader; `PipelyAwaiter<FlushResult>` for the back-pressured writer), each synchronized through `Interlocked` operations on a single `int` state field.
 
+## Threading
+
+The contract is single-producer / single-consumer for all data and lifecycle methods. `GetMemory`, `GetSpan`, `Advance`, `Splice`, `FlushAsync`, and `Writer.Complete` must be called on a single producer thread; `ReadAsync`, `TryRead`, `AdvanceTo`, and `Reader.Complete` on a single consumer thread.
+
+The only thread-safe-from-anywhere methods are `Writer.CancelPendingFlush` and `Reader.CancelPendingRead`. They are the migration path for code that currently calls `Writer.Complete` or `Reader.Complete` from a timeout, cancellation handler, or other non-owning thread:
+
+```csharp
+// BCL idiom — relies on the BCL's internal lock; not safe in Pipely.
+cts.Token.Register(() => pipe.Writer.Complete(new OperationCanceledException()));
+
+// Pipely equivalent.
+cts.Token.Register(() => pipe.Writer.CancelPendingFlush());
+// Writer thread observes IsCanceled in the FlushResult, then calls Complete(...) itself.
+```
+
+`System.IO.Pipelines.Pipe` documents the same SPSC data-plane contract but is incidentally robust against cross-thread `Complete` because of a lock on its hot path. Pipely is lock-free; the contract is real and load-bearing.
+
 ## Splice — zero-copy ownership transfer
 
 When you already hold a rented or pooled buffer (e.g. a payload received from a socket, a frame produced by another component), `Splice` hands it to the pipe without copying. The name is borrowed from Linux's [`splice(2)`](https://man7.org/linux/man-pages/man2/splice.2.html) — conceptually the same operation: transfer ownership of an existing buffer rather than copy bytes into a new one.

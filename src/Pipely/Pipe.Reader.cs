@@ -5,6 +5,19 @@ using System.Threading;
 
 namespace Pipely;
 
+/// <summary>Reader side of a Pipely <see cref="Pipe"/>.</summary>
+/// <remarks>
+/// All members must be invoked on a single consumer thread, including <see cref="Complete"/>.
+/// The sole exception is <see cref="CancelPendingRead"/>, which is callable from any thread.
+/// <para>
+/// This is stricter than <see cref="System.IO.Pipelines.PipeReader"/>. The BCL implementation
+/// is incidentally robust against cross-thread <c>Complete</c> because of an internal lock on
+/// its hot path; Pipely is lock-free and offers no such fallback. To trigger completion from a
+/// non-reader thread (timeout, cancellation token, upstream error), call
+/// <see cref="CancelPendingRead"/> from that thread and let the reader thread observe the
+/// cancellation and call <see cref="Complete"/> itself.
+/// </para>
+/// </remarks>
 public sealed class PipeReader : System.IO.Pipelines.PipeReader
 {
     private readonly Pipe _pipe;
@@ -139,6 +152,13 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
 
         _pipe.PublishReaderState();
     }
+    /// <summary>Marks reading as complete and publishes the terminal reader state to the writer.</summary>
+    /// <remarks>
+    /// Must be called on the reader thread. Calling from any other thread is a contract violation;
+    /// see the type-level remarks on <see cref="PipeReader"/> for the recommended migration from
+    /// BCL idioms that complete the reader from a timeout or cancellation handler. Repeat calls
+    /// coalesce — the second and subsequent calls are no-ops.
+    /// </remarks>
     public override void Complete(Exception? exception = null)
     {
         if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
@@ -159,6 +179,10 @@ public sealed class PipeReader : System.IO.Pipelines.PipeReader
 
         _pipe.SignalFlushAwaiterIfPending();
     }
+    /// <summary>
+    /// Cancels a pending or future <see cref="ReadAsync"/>. Safe to call from any thread — this
+    /// is the only reader-side method that may be invoked outside the consumer thread.
+    /// </summary>
     public override void CancelPendingRead()
     {
         if (_pipe._disposed) throw new ObjectDisposedException(nameof(Pipe));
