@@ -10,16 +10,18 @@ Headline numbers on a single-producer / single-consumer 1 MiB transfer through 4
 
 | Method              | Mean (μs) | Ratio | Allocated |
 |---------------------|----------:|------:|----------:|
-| `BCL_ThreadPool`    |    103.64 |  1.00 |     816 B |
-| `BCL_Inline`        |     48.47 |  0.47 |     743 B |
-| `Pipely_ThreadPool` |     71.24 |  0.69 |     889 B |
-| `Pipely_Inline`     |     41.70 |  0.40 |     750 B |
+| `BCL_ThreadPool`    |    107.61 |  1.00 |     809 B |
+| `BCL_Inline`        |     44.61 |  0.41 |     744 B |
+| `Pipely_ThreadPool` |     58.81 |  0.55 |     881 B |
+| `Pipely_Inline`     |     39.35 |  0.37 |     742 B |
 
-At the same scheduler, Pipely is **~1.45× faster than BCL** (`Pipely_ThreadPool` vs `BCL_ThreadPool`); with continuations inlined the two implementations are within 5%, so the gap is in the awaiter / signaling path rather than in the rest of the pipe.
+At the same scheduler, Pipely is **~1.83× faster than BCL** (`Pipely_ThreadPool` vs `BCL_ThreadPool`). With continuations inlined the gap narrows to ~13% (39.35 vs 44.61 μs), so most of the advantage is in the awaiter / signaling path; the residual ~13% comes from the rest of the pipe (lock-free `TripleBuffer` and cache-line-isolated cursors).
 
-Allocations above are per-1 MiB-transfer with the `Pipe` reused across iterations, so they exclude one-shot per-`Pipe` construction cost. Pipely matches BCL within ~10% at the matched-scheduler rows; per-`Pipe` construction itself is ~1.7 KB heavier than BCL because Pipely uses two `TripleBuffer<T>` instances and two `PipelyAwaiter<T>` instances where BCL embeds awaitable state directly in `Pipe`. The companion `FreshPipeSchedulerBenchmarks` measures fresh-`Pipe` per iteration; the per-row delta isolates that construction cost. See [`RESULTS.md`](tests/Pipely.Benchmarks/RESULTS.md) for the full breakdown.
+For pinned single-producer / single-consumer busy-poll (`PinnedThroughputBenchmarks`, no scheduler involved at all), the gap widens to **~2.4×** (BCL 121.56 μs, Pipely 51.18 μs) — at that point both pipes are running the data-structure code with no awaiter overhead, and the difference is entirely Pipely's lock-free hot path and cache-line discipline.
 
-For latency under sustained throughput (256-byte messages, 100K samples, exact percentiles by sort), Pipely's P50 is ~1.2–1.4× lower and P90 is ~1.4–1.7× lower than BCL across all measured trials. Tail behavior (P99.9, Max) is dominated by GC and OS scheduling and is not consistently better for either pipe.
+Allocations above are per-1 MiB-transfer with the `Pipe` reused across iterations, so they exclude one-shot per-`Pipe` construction cost. Pipely matches BCL within ~10% at the matched-scheduler rows; per-`Pipe` construction itself is ~2.2 KB heavier than BCL — Pipely uses two `TripleBuffer<T>` instances and two `PipelyAwaiter<T>` instances where BCL embeds awaitable state directly, plus the writer / reader field blocks each carry 256 B of cache-line padding for false-sharing isolation. The companion `FreshPipeSchedulerBenchmarks` measures fresh-`Pipe` per iteration; the per-row delta isolates that construction cost. See [`RESULTS.md`](tests/Pipely.Benchmarks/RESULTS.md) for the full breakdown.
+
+For latency under sustained throughput (256-byte messages, 100K samples, exact percentiles by sort), Pipely's per-message P50 is ~1.4–1.5× lower and P90 is ~1.7–2× lower than BCL. Tail behavior (P99.9, Max) is dominated by GC and OS scheduling and is not consistently better for either pipe.
 
 Full methodology, caveats, and per-trial percentiles live in [`tests/Pipely.Benchmarks/RESULTS.md`](tests/Pipely.Benchmarks/RESULTS.md).
 

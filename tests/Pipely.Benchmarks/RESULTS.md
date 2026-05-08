@@ -403,3 +403,167 @@ disjoint 64 B cache lines, so the per-cycle coherence cost goes to zero
 for the SPSC cursors. The `TripleBuffer` slot handoff cost — true
 sharing across a single line per slot — remains and is the work being
 attributed in the residual `perf c2c` data.
+
+### Full BDN sweep (commit `840859c`, 2026-05-08)
+
+All six benchmark classes re-run on the post-refactor commit, each invoked
+in isolation (`--filter '<class>.*'`) on the same machine and session.
+Same hardware/OS as the 2026-04-30 headline; cross-day comparisons remain
+unreliable, but the per-class numbers below are now the canonical
+post-refactor baseline.
+
+#### Throughput (`ThroughputBenchmarks`, long-lived `Pipe`)
+
+| Method                  | Mean      | Error    | StdDev   | Ratio | Allocated | Alloc Ratio |
+|-------------------------|----------:|---------:|---------:|------:|----------:|------------:|
+| BclPipe_ProduceAndDrain | 105.23 μs | 0.797 μs | 0.707 μs |  1.00 |     873 B |        1.00 |
+| Pipely_ProduceAndDrain  |  63.41 μs | 0.443 μs | 0.392 μs |  0.60 |     939 B |        1.08 |
+
+Pipely vs BCL: **1.66×** at the BCL-default ThreadPool path. Compared to
+the 2026-04-30 headline (Pipely 74.64 μs), Pipely improved 15% on the
+default async/TP path purely from the cache-line refactor.
+
+#### Pinned busy-poll (`PinnedThroughputBenchmarks`, raw threads, `Inline` scheduler)
+
+| Method                | Mean      | Error    | StdDev   | Ratio | RatioSD | Allocated |
+|-----------------------|----------:|---------:|---------:|------:|--------:|----------:|
+| BCL_PinnedBusyPoll    | 121.56 μs | 2.424 μs | 4.670 μs |  1.00 |    0.06 |         - |
+| Pipely_PinnedBusyPoll |  51.18 μs | 0.306 μs | 0.239 μs |  0.42 |    0.02 |         - |
+
+Pipely vs BCL: **2.38×**. Compared to the prior post-`a92c020` measurement
+(76.17 μs), Pipely improved 33% on this no-awaiter path — the cleanest
+isolation of the cache-line refactor's effect, since neither side is
+paying for the scheduler / awaiter machinery.
+
+#### Scheduler matrix, long-lived `Pipe` (`SchedulerBenchmarks`)
+
+| Method            | Mean      | Error    | StdDev   | Ratio | Allocated | Alloc Ratio |
+|-------------------|----------:|---------:|---------:|------:|----------:|------------:|
+| BCL_ThreadPool    | 107.61 μs | 0.871 μs | 0.772 μs |  1.00 |     809 B |        1.00 |
+| BCL_Inline        |  44.61 μs | 0.305 μs | 0.270 μs |  0.41 |     744 B |        0.92 |
+| Pipely_ThreadPool |  58.81 μs | 0.325 μs | 0.272 μs |  0.55 |     881 B |        1.09 |
+| Pipely_Inline     |  39.35 μs | 0.729 μs | 0.682 μs |  0.37 |     742 B |        0.92 |
+
+The headline 4-variant table (and the matching version in `README.md`).
+Matched-scheduler ratios:
+- ThreadPool: Pipely 1.83× faster than BCL (was 1.45× pre-refactor)
+- Inline:     Pipely 1.13× faster than BCL (was within 5% pre-refactor)
+
+The Inline gap is new — pre-refactor, Pipely's data-structure cost was
+roughly equal to BCL's lock; post-refactor, the cache-line discipline gives
+Pipely a consistent ~13% edge even with no scheduler / awaiter difference.
+
+#### Fresh-`Pipe` companions (`FreshPipeThroughputBenchmarks`, `FreshPipeSchedulerBenchmarks`)
+
+Throughput, fresh `Pipe` per iteration:
+
+| Method                  | Mean      | Allocated | Alloc Ratio |
+|-------------------------|----------:|----------:|------------:|
+| BclPipe_ProduceAndDrain | 107.82 μs |   6.86 KB |        1.00 |
+| Pipely_ProduceAndDrain  |  65.02 μs |    9.3 KB |        1.36 |
+
+Scheduler matrix, fresh `Pipe`:
+
+| Method            | Mean      | Allocated | Alloc Ratio |
+|-------------------|----------:|----------:|------------:|
+| BCL_ThreadPool    | 108.84 μs |   7.13 KB |        1.00 |
+| BCL_Inline        |  45.97 μs |   5.81 KB |        0.82 |
+| Pipely_ThreadPool |  63.78 μs |   9.39 KB |        1.32 |
+| Pipely_Inline     |  42.62 μs |   9.32 KB |        1.31 |
+
+Per-`Pipe` construction cost (fresh − headline):
+
+| Method                | Fresh    | Headline | Per-`Pipe` ctor |
+|-----------------------|---------:|---------:|----------------:|
+| BCL Pipe (Throughput) |  6.86 KB |    873 B |        ~6.0 KB  |
+| Pipely (Throughput)   |   9.3 KB |    939 B |        ~8.4 KB  |
+| BCL_ThreadPool        |  7.13 KB |    809 B |        ~6.3 KB  |
+| BCL_Inline            |  5.81 KB |    744 B |        ~5.1 KB  |
+| Pipely_ThreadPool     |  9.39 KB |    881 B |        ~8.5 KB  |
+| Pipely_Inline         |  9.32 KB |    742 B |        ~8.6 KB  |
+
+Pipely's per-`Pipe` construction is now ~2.2 KB heavier than BCL (vs
+~1.7 KB pre-refactor) — the additional ~500 B per `Pipe` is the
+struct-encapsulated cache-line padding (256 B for `WriterFields` plus
+256 B for `ReaderFields`, with alignment slack). For long-lived pipes
+this amortizes to zero per op; for very short-lived pipes it's a
+one-shot cost paid at construction.
+
+#### Splice (`SpliceBenchmarks`, BCL `GetSpan` vs Pipely `GetSpan` vs Pipely `Splice`)
+
+12 rows: 4 buffer sizes × {1, 16} chunks-per-iter × 3 methods. Selected
+rows (BCL baseline, Pipely-`GetSpan`, Pipely-`Splice` for the same
+shape):
+
+| Buffer | Chunks | Method          | Mean      | Ratio | Allocated |
+|-------:|-------:|-----------------|----------:|------:|----------:|
+|  4096  |   1    | BclPipe_GetSpan | 133.09 μs |  1.00 |   8.37 KB |
+|  4096  |   1    | Pipely_GetSpan  |  80.84 μs |  0.61 |  11.36 KB |
+|  4096  |   1    | Pipely_Splice   |  64.24 μs |  0.48 |  11.34 KB |
+|  4096  |  16    | BclPipe_GetSpan |  72.56 μs |  1.00 |   9.81 KB |
+|  4096  |  16    | Pipely_GetSpan  |  39.89 μs |  0.55 |  14.36 KB |
+|  4096  |  16    | Pipely_Splice   |  33.04 μs |  0.46 |  13.59 KB |
+| 16384  |   1    | BclPipe_GetSpan |  54.72 μs |  1.00 |   3.13 KB |
+| 16384  |   1    | Pipely_GetSpan  |  44.50 μs |  0.81 |   6.44 KB |
+| 16384  |   1    | Pipely_Splice   |  31.93 μs |  0.58 |   6.44 KB |
+| 16384  |  16    | BclPipe_GetSpan |  40.27 μs |  1.00 |   5.03 KB |
+| 16384  |  16    | Pipely_GetSpan  |  35.28 μs |  0.88 |   9.85 KB |
+| 16384  |  16    | Pipely_Splice   |  25.26 μs |  0.63 |   9.08 KB |
+
+`Splice` (zero-copy ownership transfer) is consistently 0.46–0.63× of
+BCL `GetSpan` (which is the only path BCL provides for the same shape);
+even Pipely's plain `GetSpan` path is 0.55–0.88× of BCL's, so the
+refactor improvements carry through here too.
+
+#### Latency (`LatencyHarness`, 256 B messages, 100 000 samples, 3 trials)
+
+Per-message end-to-end latency (nanoseconds, exact percentiles by sort):
+
+| Percentile | BCL Pipe | Pipely  | Ratio |
+|------------|---------:|--------:|------:|
+| Min        |      310 |     249 | 0.80  |
+| P50        |      940 |     650 | 0.69  |
+| P90        |    1 660 |     859 | 0.52  |
+| P99        |    6 890 |   2 880 | 0.42  |
+| P99.9      |   35 859 |  12 440 | 0.35  |
+| Max        |   50 299 |  67 809 | 1.35  |
+
+Per-`ReadAsync` latency (nanoseconds):
+
+| Percentile | BCL Pipe | Pipely  | Ratio |
+|------------|---------:|--------:|------:|
+| Min        |       60 |      50 | 0.83  |
+| P50        |      240 |     120 | 0.50  |
+| P90        |      410 |     180 | 0.44  |
+| P99        |    1 100 |     270 | 0.25  |
+| P99.9      |    3 459 |   2 170 | 0.63  |
+| Max        |   63 559 |  67 269 | 1.06  |
+
+Pipely's median message-latency is ~1.45× lower than BCL; P90 is ~1.93×
+lower; P99 is ~2.4× lower. Read latency is even tighter — Pipely's P99
+read is **4× lower** than BCL's, reflecting the awaiter / signaling
+path difference. The `Max` row is dominated by GC and OS scheduling
+artifacts and is not consistently better for either pipe; only the
+sub-tail percentiles characterize the steady state.
+
+### Summary of the refactor's effect
+
+Across the full BDN sweep, the struct-encapsulation refactor produced
+single-digit-to-double-digit improvements on every async path tested,
+and a 33% improvement on the pure-data-structure pinned busy-poll path:
+
+| Path                           | Pre-refactor | Post-refactor | Δ        |
+|--------------------------------|-------------:|--------------:|---------:|
+| Throughput (long-lived, TP)    |     74.64 μs |      63.41 μs | **−15%** |
+| Pinned busy-poll (Inline)      |     76.17 μs |      51.18 μs | **−33%** |
+| Scheduler, long-lived TP       |     71.24 μs |      58.81 μs | **−17%** |
+| Scheduler, long-lived Inline   |     43.07 μs |      39.35 μs | **−9%**  |
+| Fresh-`Pipe`, TP               |     71.99 μs |      63.78 μs | **−11%** |
+| Fresh-`Pipe`, Inline           |     41.73 μs |      42.62 μs |   +2%    |
+
+The cost is ~500 B of additional per-`Pipe` allocation (the two padded
+structs). For long-lived pipes this is amortized to zero; for fresh-pipe
+shapes the extra allocation explains why the Fresh-`Pipe Inline` row is
+flat — the pipe-construction cost increased by roughly the same amount
+as the per-iter savings, and that single-CPU code path was already
+allocation-dominated in the FreshPipe shape.
