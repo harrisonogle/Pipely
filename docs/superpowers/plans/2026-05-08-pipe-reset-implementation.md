@@ -268,9 +268,9 @@ Modify `src/Pipely/PipelyAwaiter.cs`. Add this method just before the closing br
     /// <remarks>
     /// _core.Reset bumps the internal version, invalidating any stale ValueTask
     /// tokens. If a consumer somehow holds a stale token and calls GetResult on it
-    /// afterward, MRVTSC throws InvalidOperationException("The version is not valid")
-    /// — louder than BCL's PipeAwaitable struct-overwrite, which silently abandons
-    /// the continuation and hangs the consumer.
+    /// afterward, MRVTSC throws InvalidOperationException — louder than BCL's
+    /// PipeAwaitable struct-overwrite, which silently abandons the continuation and
+    /// hangs the consumer.
     /// <para>
     /// The signaler paths (SignalReadAwaiterIfPending / SignalFlushAwaiterIfPending /
     /// CancelPendingRead / CancelPendingFlush) dispose _ctr before transitioning out

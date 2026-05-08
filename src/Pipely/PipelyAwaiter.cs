@@ -214,4 +214,52 @@ internal sealed class PipelyAwaiter<T> : IValueTaskSource<T>, IThreadPoolWorkIte
         awaiter._runState = null;
         cb(st);
     };
+
+    /// <summary>
+    /// Restores the awaiter to its post-construction state. Caller must guarantee no
+    /// concurrent consumer activity — specifically, the consumer must have observed
+    /// GetResult() on the previously-vended ValueTask before this is called. The
+    /// SPSC contract on Pipe.Reset establishes this happens-before edge.
+    /// </summary>
+    /// <remarks>
+    /// _core.Reset bumps the internal version, invalidating any stale ValueTask
+    /// tokens. If a consumer somehow holds a stale token and calls GetResult on it
+    /// afterward, MRVTSC throws InvalidOperationException — louder than BCL's
+    /// PipeAwaitable struct-overwrite, which silently abandons the continuation and
+    /// hangs the consumer.
+    /// <para>
+    /// The signaler paths (SignalReadAwaiterIfPending / SignalFlushAwaiterIfPending /
+    /// CancelPendingRead / CancelPendingFlush) dispose _ctr before transitioning out
+    /// of Pending, but the token-cancel paths (OnReadAwaiterTokenCancel /
+    /// OnFlushAwaiterTokenCancel) do not — the CTR is the *thing firing* there, and
+    /// the runtime cleans up after fire. We call Dispose defensively at the top of
+    /// Reset to cover that path; CancellationTokenRegistration.Dispose is idempotent
+    /// on default-valued / already-disposed registrations, so the call is safe in all
+    /// three states (live, disposed, never set).
+    /// </para>
+    /// </remarks>
+    internal void Reset()
+    {
+        _ctr.Dispose();          // idempotent on default / already-disposed; covers token-cancel-fired path.
+        _core.Reset();
+        _state = 0;
+        _token = default;
+        _ctr = default;
+        _stashHead = null;
+        _stashHeadIdx = 0;
+        _stashTail = null;
+        _stashTailIdx = 0;
+        _realContinuation = null;
+        _realState = null;
+        _capturedEC = null;
+        _capturedSC = null;
+        _runCb = null;
+        _runState = null;
+        _parkCount = 0;
+        _signalWonCount = 0;
+        _tokenCancelWonCount = 0;
+        _cancelPendingWonCount = 0;
+        _lostWakeupResolvedCount = 0;
+        _lostCancelResolvedCount = 0;
+    }
 }
