@@ -3,8 +3,8 @@
 #
 # Captures `perf c2c` HITM cache-line attribution for the Pipely cache-bench
 # harness, both BCL and Pipely arms back-to-back in the same session. Writes
-# the perf reports + harness stdout into a dated directory under
-# docs/superpowers/measurements/.
+# the perf reports + harness stdout into a dated directory under artifacts/
+# (gitignored, alongside BDN's own output).
 #
 # Intended invocation:
 #
@@ -21,7 +21,7 @@
 #     CONSUMER_CORE     CPU index for the consumer thread       (default 4)
 #     DURATION          Run duration per arm, seconds           (default 20)
 #     OUTPUT_DIR        Output directory                        (default
-#                       docs/superpowers/measurements/cache-bench-YYYY-MM-DD)
+#                       artifacts/cache-bench-YYYY-MM-DD)
 #
 # Pick producer/consumer cores that share L3 on your CPU. On Ryzen 7 8700F
 # (Zen 4, 8 cores in 2 CCDs of 4) cores 0/2 share an L3; the historical
@@ -65,7 +65,7 @@ PRODUCER_CORE=${PRODUCER_CORE:-2}
 CONSUMER_CORE=${CONSUMER_CORE:-4}
 DURATION=${DURATION:-20}
 DATE_STAMP=$(date -u +%Y-%m-%d)
-OUTPUT_DIR=${OUTPUT_DIR:-docs/superpowers/measurements/cache-bench-${DATE_STAMP}}
+OUTPUT_DIR=${OUTPUT_DIR:-artifacts/cache-bench-${DATE_STAMP}}
 
 mkdir -p "$OUTPUT_DIR"
 

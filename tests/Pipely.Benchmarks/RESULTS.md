@@ -758,5 +758,8 @@ vs **1 MiB / 110.20 µs ≈ 9.5 GB/s** for BCL on this hardware (1 GB = 10⁹ B,
 the convention used by the headline section above). Ratio against BCL: 2.07×.
 
 To re-run perf c2c HITM attribution alongside this BDN data, see
-`tools/cache-bench-perf-c2c.sh`. To re-run the BDN sweep itself, the invocations that
-generated the tables above are recorded in `docs/superpowers/measurements/post-reset-2026-05-09/`.
+`tools/cache-bench-perf-c2c.sh`. To re-run the BDN sweep itself, each class was invoked
+in isolation via `dotnet run -c Release --project tests/Pipely.Benchmarks -- --filter
+'*<ClassName>*' --exporters github`, with the latency harness via
+`dotnet run -c Release --project tests/Pipely.Benchmarks -- latency --count 100000 --size 256 --trials 3 --warmup 1`.
+BDN writes raw output under `BenchmarkDotNet.Artifacts/` (gitignored).
