@@ -567,3 +567,196 @@ shapes the extra allocation explains why the Fresh-`Pipe Inline` row is
 flat — the pipe-construction cost increased by roughly the same amount
 as the per-iter savings, and that single-CPU code path was already
 allocation-dominated in the FreshPipe shape.
+
+## Post-`Reset()` / IDisposable removal sweep (commit `72c0fea`, 2026-05-09)
+
+Re-measured after the `Pipe.Reset()` feature landed and `IDisposable`/`Dispose()`/`_disposed`
+were removed from `Pipely.Pipe`. The only hot-path edits in this feature were *deletions*:
+11 `if (_pipe._disposed) throw new ObjectDisposedException(...)` guards across `Pipe.Reader.cs`
+(5) and `Pipe.Writer.cs` (6). No new code on the producer/consumer hot path.
+
+**Read absolute numbers with care.** Prior comparison points for each class were captured
+on commit `840859c` (2026-05-08, one day earlier) on the same hardware. Per the existing
+"Cross-day comparisons are unreliable" caveat further up in this document, BCL absolute
+numbers drifted within a ~5–17% band across sessions even though no BCL code changed —
+likely thermal / governor variance. The most reliable signal is therefore the
+**Pipely-vs-BCL ratio within a session**, since both arms ride the same machine state.
+
+Same hardware/build as the prior sweep; each BDN class invoked via wildcard filter and run
+sequentially on a quiet machine.
+
+```
+BenchmarkDotNet v0.15.8, Linux Ubuntu 24.04.4 LTS (Noble Numbat)
+AMD Ryzen 7 8700F 4.04GHz, 1 CPU, 16 logical and 8 physical cores
+.NET SDK 10.0.107
+  [Host]     : .NET 10.0.7 (10.0.7, 10.0.726.21808), X64 RyuJIT x86-64-v4
+  DefaultJob : .NET 10.0.7 (10.0.7, 10.0.726.21808), X64 RyuJIT x86-64-v4
+```
+
+### Throughput (`ThroughputBenchmarks`, long-lived `Pipe`)
+
+| Method                  | Mean      | Error    | StdDev   | Ratio | Allocated | Alloc Ratio |
+|-------------------------|----------:|---------:|---------:|------:|----------:|------------:|
+| BclPipe_ProduceAndDrain | 110.20 us | 0.872 us | 0.816 us |  1.00 |     871 B |        1.00 |
+| Pipely_ProduceAndDrain  |  53.24 us | 0.438 us | 0.410 us |  0.48 |     927 B |        1.06 |
+
+Prior post-`840859c` (within-session) baseline:
+
+| Method                  | Prior Mean | Now Mean | Prior Ratio | Now Ratio |
+|-------------------------|-----------:|---------:|------------:|----------:|
+| BclPipe_ProduceAndDrain |  105.23 us | 110.20 us|        1.00 |      1.00 |
+| Pipely_ProduceAndDrain  |   63.41 us |  53.24 us|        0.60 |  **0.48** |
+
+The Pipely-vs-BCL ratio improved from 0.60 → 0.48, a ~20% relative gain. This is the
+class most affected by the deleted `_disposed` guards — `ProduceAndDrain` does ~256
+chunked round-trips per BDN iteration, hitting `GetMemory` / `Advance` / `FlushAsync` /
+`ReadAsync` / `AdvanceTo` thousands of times. The dominant cause is most likely the
+removed guards plus their cascading i-cache / layout effects, but absent a profiler
+diff we can't fully decompose the gain from session noise.
+
+Allocations 969 B → 927 B (-4%); within measurement-to-measurement variance.
+
+### Pinned busy-poll (`PinnedThroughputBenchmarks`, raw threads, `Inline` scheduler)
+
+| Method                | Mean      | Error    | StdDev   | Ratio | Allocated |
+|-----------------------|----------:|---------:|---------:|------:|----------:|
+| BCL_PinnedBusyPoll    | 100.36 us | 1.615 us | 1.658 us |  1.00 |         - |
+| Pipely_PinnedBusyPoll |  38.04 us | 0.490 us | 0.410 us |  0.38 |         - |
+
+Prior post-`840859c` baseline:
+
+| Method                | Prior Mean | Now Mean | Prior Ratio | Now Ratio |
+|-----------------------|-----------:|---------:|------------:|----------:|
+| BCL_PinnedBusyPoll    |  121.56 us | 100.36 us|        1.00 |      1.00 |
+| Pipely_PinnedBusyPoll |   51.18 us |  38.04 us|        0.42 |      0.38 |
+
+Both arms got faster in absolute terms (BCL −17%, Pipely −26%) — that's the session-noise
+signal; no BCL code changed between runs. Ratio improvement (0.42 → 0.38) is real but
+mild. Pinned uses `TryRead` plus the `Inline` scheduler, so the deleted `GetMemory` /
+`Advance` guards still apply but `ReadAsync` / `FlushAsync` ones don't, consistent with
+the smaller relative gain than long-lived `ProduceAndDrain`.
+
+### Scheduler matrix, long-lived `Pipe` (`SchedulerBenchmarks`)
+
+| Method            | Mean      | Error    | StdDev   | Ratio | Allocated |
+|-------------------|----------:|---------:|---------:|------:|----------:|
+| BCL_ThreadPool    | 107.64 us | 0.928 us | 0.823 us |  1.00 |     755 B |
+| BCL_Inline        |  43.61 us | 0.292 us | 0.259 us |  0.41 |     744 B |
+| Pipely_ThreadPool |  58.19 us | 0.358 us | 0.335 us |  0.54 |     862 B |
+| Pipely_Inline     |  38.26 us | 0.437 us | 0.409 us |  0.36 |     745 B |
+
+Prior post-`840859c` baseline:
+
+| Method            | Prior Mean | Now Mean | Prior Ratio | Now Ratio |
+|-------------------|-----------:|---------:|------------:|----------:|
+| BCL_ThreadPool    |  107.61 us | 107.64 us|        1.00 |      1.00 |
+| BCL_Inline        |   44.61 us |  43.61 us|        0.41 |      0.41 |
+| Pipely_ThreadPool |   58.81 us |  58.19 us|        0.55 |      0.54 |
+| Pipely_Inline     |   39.35 us |  38.26 us|        0.37 |      0.36 |
+
+All four ratios essentially unchanged — within-noise stable. These shapes do one
+round-trip per BDN iteration vs `ProduceAndDrain`'s ~256, so per-iteration savings from
+the deleted guards are smaller and lost in noise.
+
+### Fresh-`Pipe` companions
+
+`FreshPipeThroughputBenchmarks` (per-op `new Pipely.Pipe()` cost included):
+
+| Method                  | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
+|-------------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
+| BclPipe_ProduceAndDrain | 107.05 us | 1.069 us | 0.892 us |  1.00 | 0.2441 |    7.1 KB |        1.00 |
+| Pipely_ProduceAndDrain  |  64.68 us | 1.264 us | 1.405 us |  0.60 | 0.9766 |  39.18 KB |        5.52 |
+
+`FreshPipeSchedulerBenchmarks`:
+
+| Method            | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
+|-------------------|----------:|---------:|---------:|------:|-------:|----------:|------------:|
+| BCL_ThreadPool    | 108.13 us | 1.102 us | 1.031 us |  1.00 | 0.2441 |   7.14 KB |        1.00 |
+| BCL_Inline        |  43.16 us | 0.354 us | 0.314 us |  0.40 | 0.1221 |   5.78 KB |        0.81 |
+| Pipely_ThreadPool |  60.34 us | 0.255 us | 0.226 us |  0.56 | 1.4648 |  40.03 KB |        5.61 |
+| Pipely_Inline     |  42.02 us | 0.529 us | 0.494 us |  0.39 | 0.5493 |  21.04 KB |        2.95 |
+
+The fresh-`Pipe` allocation footprint (~39 KB/op vs BCL's ~7 KB) is exactly why `Reset()` exists:
+pooling the `Pipe` instance amortizes that cost to zero. The headline long-lived measurements
+above are the achievable steady-state shape.
+
+### Splice (`SpliceBenchmarks`, BCL `GetSpan` vs Pipely `GetSpan` vs Pipely `Splice`)
+
+| Method          | BufferSize | BuffersBeforeFlush | Mean      | Ratio | Allocated | Alloc Ratio |
+|-----------------|-----------:|-------------------:|----------:|------:|----------:|------------:|
+| BclPipe_GetSpan |        256 |                  1 | 606.06 us |  1.00 |  100052 B |        1.00 |
+| Pipely_GetSpan  |        256 |                  1 | 473.13 us |  0.78 |  116735 B |        1.17 |
+| Pipely_Splice   |        256 |                  1 | 579.44 us |  0.96 |  107901 B |        1.08 |
+| BclPipe_GetSpan |        256 |                 16 | 277.92 us |  1.00 |  100005 B |        1.00 |
+| Pipely_GetSpan  |        256 |                 16 | 170.45 us |  0.61 |  117606 B |        1.18 |
+| Pipely_Splice   |        256 |                 16 | 245.07 us |  0.88 |  107695 B |        1.08 |
+| BclPipe_GetSpan |       1024 |                  1 | 241.87 us |  1.00 |   26552 B |        1.00 |
+| Pipely_GetSpan  |       1024 |                  1 | 162.17 us |  0.67 |   48689 B |        1.83 |
+| Pipely_Splice   |       1024 |                  1 | 164.95 us |  0.68 |   34549 B |        1.30 |
+| BclPipe_GetSpan |       1024 |                 16 | 115.69 us |  1.00 |   26865 B |        1.00 |
+| Pipely_GetSpan  |       1024 |                 16 |  65.90 us |  0.57 |   67878 B |        2.53 |
+| Pipely_Splice   |       1024 |                 16 |  77.59 us |  0.67 |   36885 B |        1.37 |
+| BclPipe_GetSpan |       4096 |                  1 | 129.70 us |  1.00 |    8665 B |        1.00 |
+| Pipely_GetSpan  |       4096 |                  1 |  79.05 us |  0.61 |   37005 B |        4.27 |
+| Pipely_Splice   |       4096 |                  1 |  62.24 us |  0.48 |   22714 B |        2.62 |
+| BclPipe_GetSpan |       4096 |                 16 |  74.07 us |  1.00 |   10037 B |        1.00 |
+| Pipely_GetSpan  |       4096 |                 16 |  46.97 us |  0.63 |  150842 B |       15.03 |
+| Pipely_Splice   |       4096 |                 16 |  33.72 us |  0.46 |       0 B |        0.00 |
+| BclPipe_GetSpan |      16384 |                  1 |  53.31 us |  1.00 |    3212 B |        1.00 |
+| Pipely_GetSpan  |      16384 |                  1 |  47.11 us |  0.88 |   69008 B |       21.48 |
+| Pipely_Splice   |      16384 |                  1 |  32.35 us |  0.61 |   42966 B |       13.38 |
+| BclPipe_GetSpan |      16384 |                 16 |  39.33 us |  1.00 |    5157 B |        1.00 |
+| Pipely_GetSpan  |      16384 |                 16 |  74.02 us |  1.88 |  551649 B |      106.97 |
+| Pipely_Splice   |      16384 |                 16 |  30.19 us |  0.77 |  133604 B |       25.91 |
+
+Pre-existing outlier at 16384/16: `Pipely_GetSpan` is GC-bound (551 KB/op, multi-generation
+collections). `Pipely_Splice` at the same point is 0.77x BCL. Not a regression introduced by
+this feature.
+
+### Latency (`LatencyHarness`, 256 B messages, 100 000 samples, 3 trials)
+
+Per-message end-to-end latency in nanoseconds (exact percentiles via sort):
+
+| Percentile | Trial | BCL Pipe | Pipely | Ratio |
+|------------|------:|---------:|-------:|------:|
+| Min        |     1 |      320 |    240 |  0.75 |
+| Min        |     2 |      390 |    230 |  0.59 |
+| Min        |     3 |      340 |    250 |  0.74 |
+| P50        |     1 |      820 |    670 |  0.82 |
+| P50        |     2 |      890 |    600 |  0.67 |
+| P50        |     3 |      850 |    630 |  0.74 |
+| P90        |     1 |    1,470 |    920 |  0.63 |
+| P90        |     2 |    1,490 |    860 |  0.58 |
+| P90        |     3 |    1,410 |  1,110 |  0.79 |
+| P99        |     1 |    7,330 |  5,360 |  0.73 |
+| P99        |     2 |    9,439 |  6,480 |  0.69 |
+| P99        |     3 |    8,530 | 13,550 |  1.59 |
+
+P50/P90 hold the prior shape: Pipely consistently 0.6-0.8x BCL. P99 has trial-to-trial
+variance dominated by GC pauses (one trial each direction); the pattern is unchanged from
+the prior sweep.
+
+### Summary
+
+The `Reset()` feature added a public method, two internal helpers (`TripleBuffer<T>.Reset`,
+`PipelyAwaiter<T>.Reset`), and removed the entire `IDisposable` surface — net **−170 lines**
+across `src/`. Hot-path effect, ratio-based to control for cross-session drift:
+
+- **Long-lived `Throughput`** (the busiest hot path: ~256 round-trips/iter): ratio
+  0.60 → 0.48, a ~20% relative gain. Cleanest signal that the deleted `_disposed`
+  guards moved the needle.
+- **Pinned busy-poll**: ratio 0.42 → 0.38, mild gain. Half the deleted guards apply here.
+- **Scheduler / FreshPipe matrices**: ratios unchanged (≤1 percentage point). One
+  round-trip per iteration leaves no headroom for guard-removal savings to surface.
+- **Splice**: ratios unchanged from prior; the pre-existing 16384/16 GC-bound outlier
+  on `Pipely_GetSpan` is still there (not introduced by this change).
+- **Latency**: P50/P90 shape unchanged. P99 has trial-to-trial variance dominated by GC
+  pauses (one trial each direction); no signal at the tail.
+
+Steady-state producer→consumer throughput is **1 MiB / 53.24 µs ≈ 19.7 GB/s** for Pipely
+vs **1 MiB / 110.20 µs ≈ 9.5 GB/s** for BCL on this hardware (1 GB = 10⁹ B, matching
+the convention used by the headline section above). Ratio against BCL: 2.07×.
+
+To re-run perf c2c HITM attribution alongside this BDN data, see
+`tools/cache-bench-perf-c2c.sh`. To re-run the BDN sweep itself, the invocations that
+generated the tables above are recorded in `docs/superpowers/measurements/post-reset-2026-05-09/`.
