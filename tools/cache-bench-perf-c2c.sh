@@ -166,14 +166,30 @@ for arm in pipely bcl; do
 done
 echo
 
-echo "==> Total HITM (from perf c2c report header):"
+echo "==> HITM summary (from perf c2c report header):"
 for arm in pipely bcl; do
     f=$OUTPUT_DIR/c2c-${arm}.txt
-    line=$(grep -E "Load HITMs|Total HITM" "$f" 2>/dev/null | head -3 || true)
-    if [[ -n "$line" ]]; then
+    block=$(grep -E "^ +(Load LLC hit|Load Local HITM|Load Remote HITM|LLC hits on shared lines) +:" "$f" 2>/dev/null || true)
+    if [[ -n "$block" ]]; then
         echo "    $arm:"
-        echo "$line" | sed 's/^/      /'
+        echo "$block" | sed 's/^/      /'
     fi
 done
+
+echo
+echo "==> HITM per GiB transferred (lower = less cross-thread cache-line bouncing):"
+for arm in pipely bcl; do
+    so=$OUTPUT_DIR/c2c-${arm}-stdout.txt
+    rep=$OUTPUT_DIR/c2c-${arm}.txt
+    mibps=$(grep -oE "Throughput: [0-9.]+ MiB/s" "$so" 2>/dev/null | grep -oE "[0-9.]+" | head -1 || true)
+    secs=$(grep -oE "Elapsed: [0-9.]+s" "$so" 2>/dev/null | grep -oE "[0-9.]+" | head -1 || true)
+    hitm=$(grep -E "^ +Load Local HITM +:" "$rep" 2>/dev/null | grep -oE "[0-9]+" | tail -1 || true)
+    if [[ -n "$mibps" && -n "$secs" && -n "$hitm" ]]; then
+        # GiB transferred = MiB/s × seconds / 1024
+        per_gib=$(awk -v h="$hitm" -v m="$mibps" -v s="$secs" 'BEGIN{ printf "%.2f", h * 1024 / (m * s) }')
+        echo "    $arm:  $hitm HITM / ($mibps MiB/s × ${secs}s ÷ 1024) GiB  ≈  $per_gib HITM/GiB"
+    fi
+done
+
 echo
 echo "Tip: open the per-arm reports for the cache-line / field-level breakdown."
