@@ -736,6 +736,28 @@ P50/P90 hold the prior shape: Pipely consistently 0.6-0.8x BCL. P99 has trial-to
 variance dominated by GC pauses (one trial each direction); the pattern is unchanged from
 the prior sweep.
 
+### Cache-line discipline (`perf c2c`, same hardware, 2026-05-09)
+
+Captured via `tools/cache-bench-perf-c2c.sh` (cores 2/4, 20 s per arm,
+`DOTNET_EnableWriteXorExecute=0`). Pipely vs BCL on the cache-bench harness on the same
+Zen 4 hardware, single-CCD pinning so all HITM is local:
+
+| Metric                            |     Pipely |        BCL | Pipely / BCL |
+|-----------------------------------|-----------:|-----------:|-------------:|
+| Throughput                        | 19,449 MiB/s | 8,525 MiB/s |       **2.28×** |
+| Load Local HITM (count, 20 s run) |        937 |      2,583 |        0.36× |
+| Load LLC hit                      |      1,267 |      2,917 |        0.43× |
+| LLC hits on shared lines          |      1,148 |      2,896 |        0.40× |
+| Load Remote HITM                  |          0 |          0 |            — |
+| **HITM per GiB transferred**      |   **~2.5** |  **~15.5** |    **~0.16×** |
+
+Both arms run on the same cores via the same kernel scheduler, so the absolute HITM-count
+comparison undercounts Pipely's cache-line win — Pipely transferred 2.28× more data in
+the same wall time. The right comparison is per-GiB-transferred: Pipely sees ~6× fewer
+cross-thread cache-line bounces per byte, matching the post-refactor numbers in the
+"Cache-line padding revisited" section above. Confirms the `IDisposable` removal didn't
+disturb the cache-line discipline.
+
 ### Summary
 
 The `Reset()` feature added a public method, two internal helpers (`TripleBuffer<T>.Reset`,
@@ -752,6 +774,9 @@ across `src/`. Hot-path effect, ratio-based to control for cross-session drift:
   on `Pipely_GetSpan` is still there (not introduced by this change).
 - **Latency**: P50/P90 shape unchanged. P99 has trial-to-trial variance dominated by GC
   pauses (one trial each direction); no signal at the tail.
+- **Cache-line discipline (`perf c2c`)**: ~2.5 HITM/GiB for Pipely vs ~15.5 HITM/GiB for
+  BCL — ~6× fewer cross-thread bounces per byte, matching the post-cache-line-refactor
+  baseline. The `IDisposable` removal didn't disturb the cache-line layout.
 
 Steady-state producer→consumer throughput is **1 MiB / 53.24 µs ≈ 19.7 GB/s** for Pipely
 vs **1 MiB / 110.20 µs ≈ 9.5 GB/s** for BCL on this hardware (1 GB = 10⁹ B, matching
