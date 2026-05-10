@@ -49,6 +49,7 @@ The entire concurrency surface is:
 
 - **Two `TripleBuffer<T>`s** — a lock-free primitive that publishes a value from one thread to another through three padded slots and atomic indices. One carries the writer's published state to the reader; the other carries the reader's published state to the writer. Each side reads the other's most-recently-published state without blocking.
 - **Two awaiter state machines** (`PipelyAwaiter<ReadResult>` for the parked reader; `PipelyAwaiter<FlushResult>` for the back-pressured writer), each synchronized through `Interlocked` operations on a single `int` state field.
+- **Cache-line discipline** — the writer-mutated and reader-mutated cursors each live in a struct that carries 256 B of inline padding (two 128 B `CacheLinePad` fields wrapping the hot fields), so they land on disjoint cache lines regardless of CLR field reordering. Combined with the lock-free synchronization and snapshot-publication pattern, `perf c2c` measures Pipely at **~2.5 Load Local HITM per GiB transferred** vs BCL's **~15.5 HITM/GiB** on the same hardware — ~6× fewer cross-thread cache-line bounces per byte.
 
 ## Threading
 

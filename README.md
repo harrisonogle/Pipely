@@ -23,6 +23,8 @@ Allocations above are per-1 MiB-transfer with the `Pipe` reused across iteration
 
 For latency under sustained throughput (256-byte messages, 100K samples, exact percentiles by sort), Pipely's per-message P50 is ~1.4–1.5× lower and P90 is ~1.7–2× lower than BCL. Tail behavior (P99.9, Max) is dominated by GC and OS scheduling and is not consistently better for either pipe.
 
+Direct cache-line measurement via `perf c2c` (single-CCD pinning, 20 s per arm) confirms the discipline holds at the hardware level: Pipely averages **~2.5 Load Local HITM per GiB transferred** vs **~15.5 HITM/GiB for BCL** — ~6× fewer cross-thread cache-line bounces per byte. This isolates the architectural choices (lock-free synchronization, cache-line-padded writer/reader cursors, snapshot publication via `TripleBuffer<T>`) from scheduler / awaiter overhead and from BDN session noise. See `RESULTS.md` for the breakdown and a "why so much less HITM" walkthrough.
+
 Full methodology, caveats, and per-trial percentiles live in [`tests/Pipely.Benchmarks/RESULTS.md`](tests/Pipely.Benchmarks/RESULTS.md).
 
 ## Getting started

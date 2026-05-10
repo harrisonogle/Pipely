@@ -758,6 +758,46 @@ cross-thread cache-line bounces per byte, matching the post-refactor numbers in 
 "Cache-line padding revisited" section above. Confirms the `IDisposable` removal didn't
 disturb the cache-line discipline.
 
+#### Why so much less HITM?
+
+Three architectural choices in Pipely each reduce cross-thread cache-line traffic on a
+different axis:
+
+1. **Lock-free synchronization vs lock-based.** BCL's `Pipe` takes its internal `SyncObj`
+   lock on virtually every public method — `ReadAsync`, `FlushAsync`, `AdvanceTo`,
+   `Complete`, `CancelPendingFlush`. Each acquisition is a cross-thread CAS on the
+   monitor word: at least one HITM per call (the thread that last released holds the
+   line Modified; the new acquirer needs it Modified). Pipely is fully lock-free —
+   cross-thread atomics fire only at *publication* (producer's `_writerTb.Publish()`)
+   and *acquisition* (consumer's `_writerTb.TryAcquire()`), not per public call. A
+   producer that calls `GetMemory`, `Advance` 100×, then `FlushAsync` does *one*
+   cross-thread CAS, not 102.
+
+2. **Cache-line padding.** `WriterFields` and `ReaderFields` (`src/Pipely/Pipe.cs:30-78`)
+   each carry 256 B of inline padding — two 128 B `CacheLinePad` fields wrapping the hot
+   cursors. This guarantees writer-mutated and reader-mutated field clusters land on
+   disjoint cache lines regardless of CLR field reordering. BCL has no such discipline:
+   its writer-mutated and reader-mutated fields sit in declaration order on the `Pipe`
+   object, almost certainly sharing cache lines. The result is **false sharing** — the
+   consumer's load of e.g. `_unconsumedBytes` invalidates the line in the writer's L1
+   even though the writer cares only about adjacent `_unflushedBytes`, forcing a
+   coherency round-trip on the writer's next mutation.
+
+3. **Snapshot publication vs in-place mutation.** Pipely's `TripleBuffer<WriterState>`
+   rotates between three slots. The producer writes a complete `WriterState` snapshot
+   (head/tail segment, byte counts, completion bits) into a slot the consumer is
+   guaranteed not to be reading; the consumer pulls from a slot the producer is
+   guaranteed not to be writing. State-bearing cache lines stay *owned* by one thread
+   for their useful life — the only inherently cross-thread cache line is the `_state`
+   int that arbitrates current ownership, and that int sits on its own padded line.
+   BCL's lock-protected fields mutate in place, so the consumer reads bytes the
+   producer just wrote on the same cache line, forcing M→S→M transitions on every
+   read/write cycle.
+
+The 6× HITM/GiB ratio is what "everything except the unavoidable synchronization word"
+costs you. Each factor above shaves a different dimension of that incidental traffic;
+together they pin Pipely at ~2.5 HITM/GiB vs BCL's ~15.5.
+
 ### Summary
 
 The `Reset()` feature added a public method, two internal helpers (`TripleBuffer<T>.Reset`,
