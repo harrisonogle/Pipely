@@ -1,18 +1,20 @@
 # Cross-thread `Complete` — Design
 
-**Date:** 2026-05-10 (revised 2026-05-11)
+**Date:** 2026-05-10 (revised 2026-05-11, revised 2026-05-11)
 **Status:** Spec (pre-implementation). Relaxes the SPSC threading contract on `PipeWriter.Complete` and `PipeReader.Complete` to allow invocation from any thread, matching `System.IO.Pipelines` (BCL) behavior.
+
+**2026-05-11 revision (round 2)**: replaces the single `CompleteFlag` bit with two distinct flags `WriterCompleteFlag` / `ReaderCompleteFlag` so drains can distinguish self- vs peer-completion (caught by code review — a single bit on both awaiter words couldn't tell which side completed, leading to wrong dispatch and a null-deref on the unset `_*Completion` field). Also factors out a `DeliverReadResult` helper to match `DeliverFlushResult`, and corrects the `PipelyAwaiter._state` bit-layout description.
 
 ## Top-level key takeaways
 
 - `PipeWriter.Complete` and `PipeReader.Complete` may be invoked from any thread. The existing self-`Complete` (owner-thread) usage continues to work unchanged. All other members remain SPSC (single-producer / single-consumer).
 - First-call wins. Subsequent `Complete` calls are silent no-ops and discard their `exception` argument — same as BCL `PipeCompletion.TryComplete`.
 - Mechanism: one new ref-typed field per side (`_writerCompletion`, `_readerCompletion`) holds either an `ExceptionDispatchInfo` capture or a `s_completedSuccessfully` sentinel. `Complete` does `Interlocked.CompareExchange` against null — that CAS *is* the first-wins gate.
-- Wake/observation rides on the existing `PipelyAwaiter._state` machine. A new `CompleteFlag` bit (`0b100`, alongside `Inactive`/`Pending` and `CancelFlag`) is set via `Interlocked.Or` on both awaiter state words. Slow-path methods (`FlushAsync`, `ReadAsync`, `TryRead`) extend their existing CAS drain to drain `CompleteFlag` — no separate `Volatile.Read`. Lost-wakeup re-checks (`ParkFlushAwaiter`, `ParkReadAwaiter`) extend symmetrically.
+- Wake/observation rides on the existing `PipelyAwaiter._state` machine. Two new flag bits — `WriterCompleteFlag` (`0b100`) and `ReaderCompleteFlag` (`0b1000`), alongside the existing `Inactive`/`Pending` and `CancelFlag` — are set via `Interlocked.Or` on both awaiter state words. The two-flag design lets each drain distinguish self-completion ("my side") from peer-completion ("the other side"), dispatching to throw vs synthesized success accordingly. Slow-path methods (`FlushAsync`, `ReadAsync`, `TryRead`) extend their existing CAS drain to handle both flags — no separate `Volatile.Read`. Lost-wakeup re-checks (`ParkFlushAwaiter`, `ParkReadAwaiter`) extend symmetrically.
 - Three new `Volatile.Read` sites — at `GetMemory`, `Advance`, `Splice` gates on the writer side. These three methods have no Interlocked op anywhere in the body, so the gate read needs an explicit acquire fence. Every other gate either already runs after an Interlocked op (gate-after-fence is a plain read) or folds into an existing CAS drain. `Volatile.Read` use here is a deliberate exception to the project's general avoidance — comments at each site spell out *why* and warn against propagating the pattern.
 - `AdvanceTo` (reader) does not need `Volatile.Read`. Both branches gate after an Interlocked op already in the method: the trivial branch's gate sits after `_pipe.PublishReaderState()` (`Interlocked.Exchange` inside `TripleBuffer.Publish`); the non-trivial branch's gate sits after the `TryAcquire` block (`Volatile.Read` / `Interlocked.Exchange` inside `TripleBuffer.TryAcquire`).
 - The existing `if (WriterCompleted) throw` / `if (ReaderCompleted) throw` plain-bool gates at the top of every hot-path method (Pipe.Writer.cs:29, 60, 70, 288; Pipe.Reader.cs:28, 66, 106) are **removed**. They previously caught post-deferred-handler calls but cost one branch per call on the steady-state hot path; the post-fence Interlocked-or-Volatile-Read gates already cover those cases at no measurable hot-path cost. The `WriterCompleted` / `ReaderCompleted` plain-bool fields remain (the deferred handler still sets them, and `Pipe.Reset` reads them — see §5.3).
-- Terminal-state publication (the original `Complete` body's `LastPublished*State` and triple-buffer `Publish`) is no longer done synchronously inside `Complete`. It runs as a *deferred handler* on the owner thread's first post-Complete hot-path call, triggered by observing `CompleteFlag`. This lets `Complete` itself be uniform across all caller threads — no thread-identity tests, no race risk against in-flight owner-thread hot-path activity. Peers observe completion via `CompleteFlag` and `_completion`, not via the triple buffer's terminal state, so they never see a window where completion is requested but not published.
+- Terminal-state publication (the original `Complete` body's `LastPublished*State` and triple-buffer `Publish`) is no longer done synchronously inside `Complete`. It runs as a *deferred handler* on the owner thread's first post-Complete hot-path call, triggered by observing the relevant completion flag bit. This lets `Complete` itself be uniform across all caller threads — no thread-identity tests, no race risk against in-flight owner-thread hot-path activity. Peers observe completion via the completion flag bits and `_completion`, not via the triple buffer's terminal state, so they never see a window where completion is requested but not published.
 - `Pipe.PublishReaderState` and `Pipe.SignalFlushIfBackpressureRelieved` are **decoupled**. Today the former tail-calls the latter; the new design has each `AdvanceTo` branch call them independently. The trivial branch (both `SequencePosition`s null) calls only `PublishReaderState` — no signaling, since nothing was consumed and backpressure cannot have relieved. This removes the only path by which `SignalFlushIfBackpressureRelieved` would run post-completion-request via `AdvanceTo`. (Symmetric refactor on the writer side if needed; investigation deferred to implementation — see §5.1.)
 - `Pipe.DeliverFlushResult` and `Pipe.DeliverReadResult` (the signaler-side result-delivery helpers) consult `_readerCompletion` / `_writerCompletion` (post-fence plain read; the signaler paths have just executed an Interlocked op) and synthesize `IsCompleted=true` / rethrow the captured exception when set. This closes the residual race where a parked owner could be woken with a stale `IsCompleted=false` after a third-thread `Complete`.
 
@@ -70,9 +72,9 @@ The type-level remarks on `PipeWriter` and `PipeReader` (currently "All members 
 | Any thread may call `Complete` | ✓ | ✓ (new) |
 | First call wins; second call's exception discarded | ✓ via `TryComplete` | ✓ via `Interlocked.CompareExchange` |
 | Multiple concurrent `Complete` calls are serialized | ✓ via `lock` | ✓ via CAS first-wins |
-| Owner-side hot-path call after `Complete` throws | ✓ (lock-protected) | ✓ (gate observes `CompleteFlag` via Interlocked-fenced read) |
-| Peer call started after `Complete` returns observes completion | ✓ (lock release happens-before) | ✓ (`CompleteFlag` set before `Complete` returns; peer's hot-path gate observes via Interlocked drain) |
-| Parked owner is woken on `Complete` | ✓ (callbacks invoked under lock) | ✓ (existing signaler logic, extended to release-on-`CompleteFlag`) |
+| Owner-side hot-path call after `Complete` throws | ✓ (lock-protected) | ✓ (gate observes own-side completion flag via Interlocked-fenced read) |
+| Peer call started after `Complete` returns observes completion | ✓ (lock release happens-before) | ✓ (peer-side completion flag set before `Complete` returns; peer's hot-path gate observes via Interlocked drain) |
+| Parked owner is woken on `Complete` | ✓ (callbacks invoked under lock) | ✓ (existing signaler logic, extended to release on either completion flag) |
 | Original exception preserved with full stack via `ExceptionDispatchInfo` | ✓ | ✓ (same `ExceptionDispatchInfo.Capture` → `Throw` pattern) |
 
 No behavioral guarantee is lost.
@@ -102,32 +104,34 @@ internal sealed partial class Pipe
 }
 ```
 
-These fields are written rarely (once per pipe lifetime, by whichever thread wins the `Complete` race) and read only on the throw path (when a hot-path gate has already observed `CompleteFlag`). They are not on the steady-state hot path. Cache-line placement is therefore not load-bearing, but they should be grouped near other rarely-written shared state rather than embedded in `WriterFields` / `ReaderFields` (which are owner-thread-local hot regions).
+These fields are written rarely (once per pipe lifetime, by whichever thread wins the `Complete` race) and read only on the throw / dispatch path (when a hot-path gate has already observed a completion flag bit). They are not on the steady-state hot path. Cache-line placement is therefore not load-bearing, but they should be grouped near other rarely-written shared state rather than embedded in `WriterFields` / `ReaderFields` (which are owner-thread-local hot regions).
 
-### 3.2 — `CompleteFlag` bit in `PipelyAwaiter._state`
+### 3.2 — Completion flag bits in `PipelyAwaiter._state`
 
-The existing state-bit layout in `PipelyAwaiter`:
-
-```
-bit 0:    StateMask (0 = Inactive, 1 = Pending)
-bit 1:    CancelFlag (sticky cancel request)
-bit 2..n: ParkCount/version (unused for this change)
-```
-
-Add:
+The existing state-bit layout in `PipelyAwaiter` (verified against `PipelyAwaiter.cs:68-71`):
 
 ```
-bit 2:    CompleteFlag (sticky completion request)
+bit 0: StateMask (0 = Inactive, 1 = Pending)
+bit 1: CancelFlag (sticky cancel request)
 ```
 
-Bit assignment chosen to keep `CancelFlag` and `CompleteFlag` independently testable and CAS-drainable in the same word, mirroring the cancel-flag drain idiom already in `FlushAsync` / `ReadAsync` / `TryRead`.
+Bits 2+ are unused. `_parkCount` and the other diagnostic counters are separate `long` fields, not packed into `_state`.
 
-Both `_readAwaiter._state` and `_flushAwaiter._state` get the bit. A `Complete` from either side sets the bit on **both** awaiter state words:
+Add two new bits:
 
-- Reader-side `Complete` sets `CompleteFlag` in `_readAwaiter._state` (drained by `ReadAsync` / `TryRead` / `AdvanceTo` post-fence reads) and in `_flushAwaiter._state` (drained by `FlushAsync` / `ParkFlushAwaiter`'s CAS).
-- Writer-side `Complete` sets `CompleteFlag` in `_flushAwaiter._state` (drained by `FlushAsync` / `ParkFlushAwaiter`) and in `_readAwaiter._state` (drained by `ReadAsync` / `TryRead`).
+```
+bit 2: WriterCompleteFlag (sticky; set when Writer.Complete is called)
+bit 3: ReaderCompleteFlag (sticky; set when Reader.Complete is called)
+```
 
-The two `Interlocked.Or` calls are independent and need no ordering relative to each other — both bits are ultimately consulted, and each bit's setter ensures the corresponding CAS drain catches it.
+Two separate bits — not one — because each drain needs to distinguish *which side* completed in order to dispatch correctly. On the reader's `_readAwaiter._state`, observing `ReaderCompleteFlag` means "my own side has been completed; throw" (`_readerCompletion` is authoritative), while observing `WriterCompleteFlag` means "the peer completed; return `IsCompleted=true` or rethrow the peer's exception" (`_writerCompletion` is authoritative). A single bit cannot encode this, and the `_*Completion` field for the unset side is null on the relevant code path.
+
+Both `_readAwaiter._state` and `_flushAwaiter._state` carry both flag bits. A `Complete` from either side sets *its* flag (only) on **both** awaiter state words:
+
+- `Writer.Complete` sets `WriterCompleteFlag` in `_flushAwaiter._state` (writer-side self-throw via `FlushAsync` / `ParkFlushAwaiter`'s CAS; writer's `GetMemory`/`Advance`/`Splice` Volatile.Read gates) **and** in `_readAwaiter._state` (reader-side peer-completion via `ReadAsync` / `TryRead`'s CAS; wakes parked reader with `IsCompleted=true`).
+- `Reader.Complete` sets `ReaderCompleteFlag` in `_readAwaiter._state` (reader-side self-throw via `ReadAsync` / `TryRead`'s CAS, `AdvanceTo`'s post-Interlocked gate) **and** in `_flushAwaiter._state` (writer-side peer-completion via `FlushAsync` / `ParkFlushAwaiter`'s CAS; wakes parked writer with `IsCompleted=true`).
+
+The two `Interlocked.Or` calls per `Complete` are independent and need no ordering relative to each other.
 
 ### 3.3 — `Complete` body (uniform across all caller threads)
 
@@ -144,20 +148,22 @@ public override void Complete(Exception? exception = null)
     if (Interlocked.CompareExchange(ref _pipe._readerCompletion, captured, null) != null)
         return;
 
-    // We won. Publish CompleteFlag to both awaiter state words. The two Or's are
-    // independent; either order is correct.
-    Interlocked.Or(ref _pipe._readAwaiter._state,  PipelyAwaiter<ReadResult>.CompleteFlag);
-    Interlocked.Or(ref _pipe._flushAwaiter._state, PipelyAwaiter<FlushResult>.CompleteFlag);
+    // We won. Publish ReaderCompleteFlag to both awaiter state words. The two Or's
+    // are independent; either order is correct. (Writer.Complete would set
+    // WriterCompleteFlag instead — see §3.2 for the per-flag dispatch semantics.)
+    Interlocked.Or(ref _pipe._readAwaiter._state,  PipelyAwaiter<ReadResult>.ReaderCompleteFlag);
+    Interlocked.Or(ref _pipe._flushAwaiter._state, PipelyAwaiter<FlushResult>.ReaderCompleteFlag);
 
-    // Wake parked awaiters via the existing signal logic. CompleteFlag is a release-
+    // Wake parked awaiters via the existing signal logic. The flag bit is a release-
     // from-Pending reason; the signaler transitions Pending -> Inactive and delivers
-    // the result/exception to the parked task.
+    // the result/exception to the parked task (dispatched via _readerCompletion or
+    // _writerCompletion depending on which side called Complete — see §5.1.2).
     _pipe.SignalReadAwaiterIfPending();
     _pipe.SignalFlushAwaiterIfPending();
 }
 ```
 
-The writer-side `Complete` is symmetric: CAS into `_writerCompletion`, set `CompleteFlag` on both state words, signal both awaiters.
+The writer-side `Complete` is symmetric: CAS into `_writerCompletion`, set `WriterCompleteFlag` on both state words, signal both awaiters.
 
 Critical property: this body is safe to run from **any** thread because every memory mutation goes through `Interlocked` operations on Pipe-level shared state. It does **not** touch `_writer.*` or `_reader.*` fields (those are owner-thread-local), and it does **not** publish to `_writerTb` / `_readerTb` (those are SPSC and writing to them from a non-owner thread races with in-flight `FlushAsync` / `AdvanceTo`).
 
@@ -169,11 +175,11 @@ The original `Complete` body did three additional things that the new uniform bo
 2. Build a terminal `WriterState` / `ReaderState` snapshot from owner-thread-local state and write it to `ProducerSlot()`.
 3. Call `_writerTb.Publish()` / `_readerTb.Publish()`.
 
-These three steps are owner-thread-only — running them from a third thread races with concurrent owner-thread hot-path activity. They are now performed by a **deferred handler** that runs on the owner thread's first post-`Complete` hot-path call, triggered by the gate observing `CompleteFlag`.
+These three steps are owner-thread-only — running them from a third thread races with concurrent owner-thread hot-path activity. They are now performed by a **deferred handler** that runs on the owner thread's first post-`Complete` hot-path call, triggered by the gate observing the own-side completion flag.
 
 ```csharp
 // Reader-side deferred handler. Called by reader-side hot-path gates (post-fence)
-// when CompleteFlag is observed. Idempotent: the second observer sees
+// when ReaderCompleteFlag is observed. Idempotent: the second observer sees
 // ReaderCompleted == true and skips.
 internal void RunReaderDeferredHandlerIfNeeded()
 {
@@ -216,9 +222,9 @@ internal static void ThrowFromWriterCompletion(object completion)
 
 ### 3.5 — Why peers don't need terminal state to be published to observe completion
 
-Existing call sites that read `LastAcquiredReaderState.IsCompleted` / `.CompletionException` (e.g., `FlushAsync` line 76, `ParkFlushAwaiter` line 218) all currently return / throw based on those values. Under the new design, the writer's CAS drain on `_flushAwaiter._state` (extended to drain `CompleteFlag`) catches reader-completion **before** these triple-buffer-based checks are consulted. So even though the triple-buffer terminal state hasn't been published yet (deferred handler hasn't run), the writer correctly throws via `_readerCompletion` from the drain.
+Existing call sites that read `LastAcquiredReaderState.IsCompleted` / `.CompletionException` (e.g., `FlushAsync` line 76, `ParkFlushAwaiter` line 218) all currently return / throw based on those values. Under the new design, the writer's CAS drain on `_flushAwaiter._state` (extended to dispatch on `ReaderCompleteFlag` for peer-completion) catches reader-completion **before** these triple-buffer-based checks are consulted. So even though the triple-buffer terminal state hasn't been published yet (deferred handler hasn't run), the writer correctly dispatches via `_readerCompletion` from the drain.
 
-Symmetric on the reader side: `ReadAsync` / `TryRead`'s extended cancel-flag drain catches writer-completion via `CompleteFlag` in `_readAwaiter._state` before any consult of `LastAcquiredWriterState`.
+Symmetric on the reader side: `ReadAsync` / `TryRead`'s extended cancel-flag drain catches writer-completion via `WriterCompleteFlag` in `_readAwaiter._state` before any consult of `LastAcquiredWriterState`.
 
 The terminal-state publish (when the owner's deferred handler eventually runs) brings the cached / triple-buffer state in line with `_completion`. This matters for code paths that read `LastAcquired*State` *outside* the CAS drain (e.g., `BufferedBytes` accessor). After the deferred handler has run, those paths see consistent terminal state.
 
@@ -228,49 +234,65 @@ The terminal-state publish (when the owner's deferred handler eventually runs) b
 
 #### `GetMemory` / `Advance` / `Splice` — Volatile.Read gate (the three sites)
 
-The existing plain-bool gate (`if (_pipe._writer.WriterCompleted) throw …`) at the top of each method is **removed**. The body now begins with a single gate:
+The existing plain-bool gate (`if (_pipe._writer.WriterCompleted) throw …`) at the top of each method is **removed**. The body now begins with a single gate that checks `WriterCompleteFlag` only — these methods do not throw on peer (reader) completion, mirroring today's behavior (`WriterCompleted` was the only gate today; reader-completion isn't checked here):
 
 ```csharp
 // Cross-thread Complete gate. Volatile.Read is required here because this method
 // performs no Interlocked operation anywhere in its body, so a plain read of
 // _flushAwaiter._state would be vulnerable to JIT hoisting / ARM64 weak-memory
-// staleness and could miss a CompleteFlag bit set by a third-thread Writer.Complete.
+// staleness and could miss a WriterCompleteFlag bit set by a third-thread
+// Writer.Complete.
+//
+// We test only WriterCompleteFlag here; ReaderCompleteFlag (peer completion) is
+// not a reason for GetMemory/Advance/Splice to throw — peer completion surfaces
+// to the writer via FlushAsync (per existing BCL/Pipely contract).
 //
 // This is one of three Volatile.Read sites added by the cross-thread-Complete change
 // (the other two are in Advance and Splice). Volatile.Read is otherwise avoided in
 // this project as a matter of policy — please do not propagate this pattern to other
-// methods. FlushAsync, ReadAsync, TryRead, and AdvanceTo all observe CompleteFlag
-// via existing Interlocked machinery and do not need a separate Volatile.Read.
+// methods. FlushAsync, ReadAsync, TryRead, and AdvanceTo all observe completion
+// flags via existing Interlocked machinery and do not need a separate Volatile.Read.
 //
 // Cost: one acquire load per call. x86-64: emits a plain MOV (TSO + compiler
 // barrier). ARM64: emits LDAR. Both are vastly cheaper than an Interlocked op and
 // well below the noise floor for typical workloads.
-if ((Volatile.Read(ref _pipe._flushAwaiter._state) & PipelyAwaiter<FlushResult>.CompleteFlag) != 0)
+if ((Volatile.Read(ref _pipe._flushAwaiter._state) & PipelyAwaiter<FlushResult>.WriterCompleteFlag) != 0)
 {
     _pipe.RunWriterDeferredHandlerIfNeeded();
     Pipe.ThrowFromWriterCompletion(_pipe._writerCompletion!);
 }
 ```
 
-The deferred handler (`RunWriterDeferredHandlerIfNeeded`) is idempotent (early-returns if `_writer.WriterCompleted` is already true), so subsequent post-Complete calls don't re-publish — they just re-read the bit and throw via `ThrowFromWriterCompletion`. The branch cost is a single test-and-branch on `_flushAwaiter._state`'s `CompleteFlag` bit, predicted not-taken on the steady-state path.
+The deferred handler (`RunWriterDeferredHandlerIfNeeded`) is idempotent (early-returns if `_writer.WriterCompleted` is already true), so subsequent post-Complete calls don't re-publish — they just re-read the bit and throw via `ThrowFromWriterCompletion`. The branch cost is a single test-and-branch on `_flushAwaiter._state`'s `WriterCompleteFlag` bit, predicted not-taken on the steady-state path.
 
-#### `FlushAsync` — plain-bool gate removed, CAS drain extended
+#### `FlushAsync` — plain-bool gate removed, CAS drain extended (handles both flags)
 
-The existing plain-bool gate at line 70 (`if (_pipe._writer.WriterCompleted) throw …`) is **removed**. The CAS drain at lines 80-87 is extended to drain `CompleteFlag`:
+The existing plain-bool gate at line 70 (`if (_pipe._writer.WriterCompleted) throw …`) is **removed**. The CAS drain at lines 80-87 is extended to dispatch on both completion flags:
 
 ```csharp
 while (true)
 {
     int oldV = _pipe._flushAwaiter._state;
 
-    // CompleteFlag check first — sticky and authoritative; consulting other flags
-    // after this is unnecessary work. Note: read of oldV is post-fence relative to
-    // the Interlocked.Exchange in TryAcquire (Pipe.Writer.cs:73), so a plain read
-    // suffices here.
-    if ((oldV & PipelyAwaiter<FlushResult>.CompleteFlag) != 0)
+    // Self-completion (Writer.Complete fired): throw. Sticky bit, never cleared.
+    // Read of oldV is post-fence relative to the Interlocked.Exchange in
+    // TryAcquire (Pipe.Writer.cs:73), so a plain read suffices here.
+    if ((oldV & PipelyAwaiter<FlushResult>.WriterCompleteFlag) != 0)
     {
         _pipe.RunWriterDeferredHandlerIfNeeded();
         Pipe.ThrowFromWriterCompletion(_pipe._writerCompletion!);
+    }
+
+    // Peer-completion (Reader.Complete fired): return FlushResult(IsCompleted=true)
+    // for graceful close, or rethrow the captured exception for faulted close.
+    // This matches today's behavior at Pipe.Writer.cs:76 but observes via the flag
+    // instead of relying on LastAcquiredReaderState being terminal.
+    if ((oldV & PipelyAwaiter<FlushResult>.ReaderCompleteFlag) != 0)
+    {
+        var completion = _pipe._readerCompletion;     // post-fence plain read
+        if (completion is ExceptionDispatchInfo edi) edi.Throw();
+        // s_completedSuccessfully — graceful close.
+        return new ValueTask<FlushResult>(new FlushResult(isCanceled: false, isCompleted: true));
     }
 
     if ((oldV & PipelyAwaiter<FlushResult>.CancelFlag) == 0) break;
@@ -280,40 +302,106 @@ while (true)
 }
 ```
 
-`CompleteFlag` is sticky — never cleared by drain. Subsequent iterations of the loop (if any) re-observe it and re-throw.
+Both flags are sticky — never cleared by drain. Subsequent iterations of the loop (if any) re-observe them.
 
-`ParkFlushAwaiter`'s lost-wakeup re-check (Pipe.Writer.cs:213-252) gets a symmetric `CompleteFlag` check after its `TryAcquire` (line 214), with a CAS that transitions Pending → Inactive when `CompleteFlag` is observed and delivers the completion exception via `_core.SetException`.
-
-### 4.2 — Reader-side hot-path methods
-
-#### `ReadAsync` / `TryRead` — plain-bool gate removed, CAS drain extended
-
-The plain-bool gates at Pipe.Reader.cs:28 / 66 (`if (_pipe._reader.ReaderCompleted) throw …`) are **removed**, following the same logic as the writer-side removals: the CAS drain catches all completion shapes, including post-deferred-handler calls. Each call pays one extra `Interlocked.CompareExchange` (the drain) on the rare second-throw path — negligible cost.
-
-The existing cancel-flag drain at Pipe.Reader.cs:42-50 (and 78-89 for `TryRead`) extends to drain `CompleteFlag` first. On observation, runs the reader deferred handler and throws via `_readerCompletion`.
-
-`ParkReadAwaiter`'s lost-wakeup re-check extends symmetrically.
-
-The non-trivial behavior wrinkle: after `Writer.Complete` (no exception), `ReadAsync` should return a `ReadResult` with `IsCompleted = true` and any remaining buffered data, **not** throw. The drain logic distinguishes:
+`ParkFlushAwaiter`'s lost-wakeup re-check (Pipe.Writer.cs:213-252) gets a symmetric two-flag check after its `TryAcquire` (line 214):
 
 ```csharp
-if ((oldV & PipelyAwaiter<ReadResult>.CompleteFlag) != 0)
+int v = _pipe._flushAwaiter._state;
+if ((v & PipelyAwaiter<FlushResult>.WriterCompleteFlag) != 0)
 {
-    _pipe.RunReaderDeferredHandlerIfNeeded();   // sets ReaderCompleted-style fields if needed
-    var completion = _pipe._writerCompletion!;
-    if (completion is ExceptionDispatchInfo edi) edi.Throw();
-    // s_completedSuccessfully — graceful close, return ReadResult with IsCompleted=true.
-    _pipe._reader.ReadPending = true;
-    return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: false));
-    // BuildReadResult synthesizes IsCompleted=true via _writerCompletion.
+    // Self-completion observed lost-wakeup-style. CAS Pending→Inactive and deliver throw.
+    while (true)
+    {
+        int oldV = _pipe._flushAwaiter._state;
+        if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) break;
+        int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
+        if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
+        {
+            Interlocked.Increment(ref _pipe._flushAwaiter._lostWakeupResolvedCount);
+            _pipe.RunWriterDeferredHandlerIfNeeded();
+            _pipe._flushAwaiter._core.SetException(
+                (_pipe._writerCompletion as ExceptionDispatchInfo)?.SourceException
+                ?? new InvalidOperationException("Writing is completed."));
+            return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
+        }
+    }
+}
+if ((v & PipelyAwaiter<FlushResult>.ReaderCompleteFlag) != 0)
+{
+    // Peer-completion observed lost-wakeup-style. CAS Pending→Inactive and deliver
+    // either SetException (faulted reader) or SetResult(IsCompleted=true).
+    while (true)
+    {
+        int oldV = _pipe._flushAwaiter._state;
+        if ((oldV & PipelyAwaiter<FlushResult>.StateMask) != PipelyAwaiter<FlushResult>.Pending) break;
+        int desired = oldV & ~PipelyAwaiter<FlushResult>.StateMask;
+        if (Interlocked.CompareExchange(ref _pipe._flushAwaiter._state, desired, oldV) == oldV)
+        {
+            Interlocked.Increment(ref _pipe._flushAwaiter._lostWakeupResolvedCount);
+            var completion = _pipe._readerCompletion;
+            if (completion is ExceptionDispatchInfo edi)
+                _pipe._flushAwaiter._core.SetException(edi.SourceException);
+            else
+                _pipe._flushAwaiter._core.SetResult(new FlushResult(isCanceled: false, isCompleted: true));
+            return new ValueTask<FlushResult>(_pipe._flushAwaiter, _pipe._flushAwaiter.Version);
+        }
+    }
 }
 ```
 
-`BuildReadResult` is updated to consult `_writerCompletion` for the `isCompleted` flag in addition to `LastAcquiredWriterState.IsCompleted`. (Symmetric: `BuildFlushResult` consults `_readerCompletion`.)
+The existing lost-wakeup blocks for backpressure-release and lost-cancel follow these, unchanged in shape.
+
+### 4.2 — Reader-side hot-path methods
+
+#### `ReadAsync` / `TryRead` — plain-bool gate removed, CAS drain extended (handles both flags)
+
+The plain-bool gates at Pipe.Reader.cs:28 / 66 (`if (_pipe._reader.ReaderCompleted) throw …`) are **removed**, following the same logic as the writer-side removals: the CAS drain catches all completion shapes, including post-deferred-handler calls. Each call pays one extra `Interlocked.CompareExchange` (the drain) on the rare second-throw path — negligible cost.
+
+The existing cancel-flag drain at Pipe.Reader.cs:42-50 (and 78-89 for `TryRead`) extends to dispatch on both completion flags:
+
+```csharp
+while (true)
+{
+    int oldV = _pipe._readAwaiter._state;
+
+    // Self-completion (Reader.Complete fired): throw via _readerCompletion.
+    if ((oldV & PipelyAwaiter<ReadResult>.ReaderCompleteFlag) != 0)
+    {
+        _pipe.RunReaderDeferredHandlerIfNeeded();
+        Pipe.ThrowFromReaderCompletion(_pipe._readerCompletion!);
+    }
+
+    // Peer-completion (Writer.Complete fired): return ReadResult(IsCompleted=true)
+    // for graceful close (with any remaining buffered data), or rethrow the
+    // captured exception for faulted close.
+    if ((oldV & PipelyAwaiter<ReadResult>.WriterCompleteFlag) != 0)
+    {
+        var completion = _pipe._writerCompletion;       // post-fence plain read
+        if (completion is ExceptionDispatchInfo edi) edi.Throw();
+        // s_completedSuccessfully — graceful close, return ReadResult with IsCompleted=true.
+        _pipe._reader.ReadPending = true;
+        return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: false));
+        // BuildReadResult synthesizes IsCompleted=true via _writerCompletion (see §5.2).
+    }
+
+    if ((oldV & PipelyAwaiter<ReadResult>.CancelFlag) == 0) break;
+    int desired = oldV & ~PipelyAwaiter<ReadResult>.CancelFlag;
+    if (Interlocked.CompareExchange(ref _pipe._readAwaiter._state, desired, oldV) == oldV)
+    {
+        _pipe._reader.ReadPending = true;
+        return new ValueTask<ReadResult>(_pipe.BuildReadResult(isCanceled: true));
+    }
+}
+```
+
+`ParkReadAwaiter`'s lost-wakeup re-check extends symmetrically — same shape as the writer-side `ParkFlushAwaiter` extension in §4.1: two CAS-back-to-Inactive blocks, one per flag, dispatching to `SetException` (self-completion or peer-faulted) or `SetResult(IsCompleted=true)` (peer-graceful).
 
 #### `AdvanceTo` — plain-bool gate removed; two new gate-after-Interlocked sites; `PublishReaderState`/`SignalFlushIfBackpressureRelieved` decoupled
 
 The existing plain-bool gate at line 106 is **removed**. The two branches handle cross-thread completion via gates placed after Interlocked ops already present in the method.
+
+`AdvanceTo` only checks `ReaderCompleteFlag` (own-side completion). Peer (writer) completion is not a reason for `AdvanceTo` to throw — symmetric to today's behavior where `AdvanceTo`'s only gate is `ReaderCompleted`.
 
 **Trivial branch** (`consumedSeg == null && examinedSeg == null` at lines 112-116):
 
@@ -324,11 +412,11 @@ if (consumedSeg == null && examinedSeg == null)
 
     // Cross-thread Complete gate. _pipe.PublishReaderState() invokes
     // _readerTb.Publish() which performs Interlocked.Exchange — full memory barrier.
-    // A plain read of _readAwaiter._state after PublishReaderState returns sees
-    // the latest globally-visible value, including any CompleteFlag bit set by a
+    // A plain read of _readAwaiter._state after PublishReaderState returns sees the
+    // latest globally-visible value, including any ReaderCompleteFlag bit set by a
     // third-thread Reader.Complete. DO NOT hoist this gate to the top of the
     // method — the fence is what makes the plain read correct.
-    if ((_pipe._readAwaiter._state & PipelyAwaiter<ReadResult>.CompleteFlag) != 0)
+    if ((_pipe._readAwaiter._state & PipelyAwaiter<ReadResult>.ReaderCompleteFlag) != 0)
     {
         _pipe.RunReaderDeferredHandlerIfNeeded();
         Pipe.ThrowFromReaderCompletion(_pipe._readerCompletion!);
@@ -356,10 +444,10 @@ if (_pipe._writerTb.TryAcquire())
 // Cross-thread Complete gate. _writerTb.TryAcquire() performs Volatile.Read on its
 // fast path and Interlocked.Exchange on its slow path — both are acquire-or-stronger
 // fences. A plain read of _readAwaiter._state here sees the latest globally-visible
-// value, including any CompleteFlag bit set by a third-thread Reader.Complete. The
-// gate must be after TryAcquire, not at the top of the method — the fence is what
-// makes the plain read correct. DO NOT hoist.
-if ((_pipe._readAwaiter._state & PipelyAwaiter<ReadResult>.CompleteFlag) != 0)
+// value, including any ReaderCompleteFlag bit set by a third-thread Reader.Complete.
+// The gate must be after TryAcquire, not at the top of the method — the fence is
+// what makes the plain read correct. DO NOT hoist.
+if ((_pipe._readAwaiter._state & PipelyAwaiter<ReadResult>.ReaderCompleteFlag) != 0)
 {
     _pipe.RunReaderDeferredHandlerIfNeeded();
     Pipe.ThrowFromReaderCompletion(_pipe._readerCompletion!);
@@ -387,7 +475,7 @@ _pipe.SignalFlushIfBackpressureRelieved();   // separated; was a tail-call insid
 
 Today, `PublishReaderState` (Pipe.cs:351-366) calls `SignalFlushIfBackpressureRelieved` (Pipe.cs:374-404) as a tail. The latter is the only signaler that wakes the parked writer when *backpressure relieves* (as opposed to `SignalFlushAwaiterIfPending`, which is the unconditional signaler used by `Reader.Complete`).
 
-The tail-coupling is what creates the original §5.1 problem (now repaired in this revision): `AdvanceTo`'s trivial branch — where the reader didn't actually consume anything — still ends up running `SignalFlushIfBackpressureRelieved`. In the third-thread `reader.Complete` scenario, that wake can race against the `Complete`-installed `CompleteFlag` and deliver a stale `FlushResult` to the parked writer.
+The tail-coupling is what creates the original §5.1 problem (now repaired in this revision): `AdvanceTo`'s trivial branch — where the reader didn't actually consume anything — still ends up running `SignalFlushIfBackpressureRelieved`. In the third-thread `reader.Complete` scenario, that wake can race against the `Complete`-installed `ReaderCompleteFlag` and deliver a stale `FlushResult` to the parked writer.
 
 The two functions are decoupled. Callers now invoke them explicitly:
 
@@ -410,7 +498,7 @@ to:
 
 #### 5.1.2 — `DeliverFlushResult` / `DeliverReadResult` completion-awareness
 
-`DeliverFlushResult` (Pipe.cs:424-431) currently builds its delivery from `_reader.LastPublishedReaderState`. Under the new design, that snapshot can be stale: a third-thread `reader.Complete` sets `CompleteFlag` and `_readerCompletion` but does not publish the terminal `ReaderState` (the deferred handler does, later, on the owner thread). A signaler firing in this window would otherwise hand the parked writer a `FlushResult(IsCompleted=false)`.
+`DeliverFlushResult` (Pipe.cs:424-431) currently builds its delivery from `_reader.LastPublishedReaderState`. Under the new design, that snapshot can be stale: a third-thread `reader.Complete` sets `ReaderCompleteFlag` and `_readerCompletion` but does not publish the terminal `ReaderState` (the deferred handler does, later, on the owner thread). A signaler firing in this window would otherwise hand the parked writer a `FlushResult(IsCompleted=false)`.
 
 `DeliverFlushResult` is amended to consult `_readerCompletion` first:
 
@@ -445,9 +533,43 @@ private void DeliverFlushResult()
 }
 ```
 
-`DeliverReadResult` (on the reader side, called from `SignalReadAwaiterIfPending`) is symmetric: consults `_writerCompletion` first, falls back to `LastPublishedWriterState`.
+On the reader side there is no existing `DeliverReadResult` helper — the equivalent logic is inlined in `SignalReadAwaiterIfPending` (Pipe.cs:283-317, lines 295-313 are the construction block). As part of this change, factor that block out into a new `DeliverReadResult` helper and amend it symmetrically:
 
-With this in place, the parked-owner-wake guarantee matches BCL: a third-thread `Complete` wakes the parked peer with `IsCompleted=true` (graceful) or the rethrown `ExceptionDispatchInfo` (faulted), regardless of whether the deferred handler has run yet.
+```csharp
+private void DeliverReadResult()
+{
+    // _writerCompletion is set by Writer.Complete (any thread) via Interlocked.CompareExchange,
+    // full fence. Callers of DeliverReadResult have just executed an Interlocked op
+    // (either the signaler's Pending→Inactive CAS, or Writer.Complete's Interlocked.Or
+    // on _readAwaiter._state), so this plain read is post-fence.
+    var completion = _writerCompletion;
+
+    if (completion is ExceptionDispatchInfo edi)
+    {
+        _readAwaiter._core.SetException(edi.SourceException);
+        return;
+    }
+
+    // Pre-completion or graceful completion: build buffer from stash + last-published
+    // writer state. If `completion` is s_completedSuccessfully, synthesize
+    // IsCompleted=true (terminal state may not have been published yet by the
+    // deferred handler).
+    var w = _writer.LastPublishedWriterState;
+    var head    = _readAwaiter._stashHead ?? w.HeadSegment;
+    var headIdx = _readAwaiter._stashHead == null ? 0 : _readAwaiter._stashHeadIdx;
+    var buffer = head == null
+        ? ReadOnlySequence<byte>.Empty
+        : new ReadOnlySequence<byte>(head, headIdx, w.TailSegment!, w.TailWritten);
+
+    bool isCompleted = (completion is not null) || w.IsCompleted;
+    _reader.ReadPending = true;
+    _readAwaiter._core.SetResult(new ReadResult(buffer, isCanceled: false, isCompleted));
+}
+```
+
+`SignalReadAwaiterIfPending` becomes thin — the Pending→Inactive CAS followed by `DeliverReadResult()`.
+
+With both helpers in place, the parked-owner-wake guarantee matches BCL: a third-thread `Complete` wakes the parked peer with `IsCompleted=true` (graceful) or the rethrown `ExceptionDispatchInfo` (faulted), regardless of whether the deferred handler has run yet.
 
 ### 5.2 — `BuildReadResult` / `BuildFlushResult` consult `_completion`
 
@@ -481,18 +603,22 @@ Two threads (or the owner and a third thread) call `Complete` concurrently with 
 
 - Both compute their `captured` values and race on `Interlocked.CompareExchange(ref _completion, captured, null)`.
 - One CAS returns null (winner installed its captured value); the other returns the winner's value (loser sees non-null) and silently returns.
-- The winner sets `CompleteFlag` bits and signals.
+- The winner sets its side's completion flag bit on both awaiter state words and signals.
 - The loser's exception is discarded — matches BCL `TryComplete`.
 
-Note: there is no requirement that the winner's `CompleteFlag` bits and signals are observed by the loser; the loser exits before doing any further work.
+Note: there is no requirement that the winner's flag bits and signals are observed by the loser; the loser exits before doing any further work.
 
 ### 6.2 — `Complete` called while owner is mid-`FlushAsync` / `ReadAsync` etc.
 
 The owner-thread method is in some intermediate state (e.g., having just published a `WriterState` snapshot and about to park). Third thread calls `Complete`.
 
-- Third thread's `Interlocked.Or` sets `CompleteFlag`.
-- Third thread's `SignalFlushAwaiterIfPending` either wakes a parked owner (if owner is already in Pending state) or no-ops (if owner is Inactive or transitioning).
-- Owner's continued execution: the next Interlocked op (CAS drain in `FlushAsync`, or the `Park*` lost-wakeup re-check) observes `CompleteFlag`. Throws.
+- Third thread's `Interlocked.Or` sets the relevant `*CompleteFlag` (`WriterCompleteFlag` for `Writer.Complete`, `ReaderCompleteFlag` for `Reader.Complete`).
+- Third thread's `SignalFlushAwaiterIfPending` / `SignalReadAwaiterIfPending` either wakes a parked owner (if already Pending) or no-ops.
+- Owner's continued execution: observation depends on the method:
+  - **`FlushAsync` / `ReadAsync` / `TryRead`**: the next Interlocked op (the extended CAS drain) observes the flag and dispatches (self-throw or peer-completion delivery).
+  - **`GetMemory` / `Advance` / `Splice`**: there is no Interlocked op in the body; observation is via the `Volatile.Read` gate (§4.1). The gate's acquire fence is sufficient to see the third-thread `Interlocked.Or` write.
+  - **`AdvanceTo`**: observation is via the post-Interlocked plain read at the gate placed after `_writerTb.TryAcquire()` (non-trivial branch) or after `_pipe.PublishReaderState()` (trivial branch). Both fences are TripleBuffer Interlocked ops.
+  - **Parked owner**: the `Park*Awaiter` lost-wakeup re-check observes the flag during its `TryAcquire`-fenced read sequence.
 
 The signal-wakeup race is handled by the existing `PipelyAwaiter` state machine: the signal fails to find Pending (owner hasn't transitioned yet), but the owner's lost-wakeup re-check fires the throw on its own subsequent iteration. This is the same race shape that already exists for `CancelPending*`; the design is reused.
 
@@ -506,7 +632,7 @@ The continuation runs on whichever thread the awaiter scheduled it on. If that's
 
 ### 6.5 — Reader observing writer-completion while writer is mid-flush
 
-Third thread calls `writer.Complete()` while the writer thread is mid-`FlushAsync` (between `_writerTb.ProducerSlot()` write and `_writerTb.Publish()`). The `CompleteFlag` is set on `_readAwaiter._state`. The reader's next `ReadAsync` / `TryRead` drain catches it and either throws (faulted) or returns `IsCompleted=true` with whatever data was previously visible (graceful).
+Third thread calls `writer.Complete()` while the writer thread is mid-`FlushAsync` (between `_writerTb.ProducerSlot()` write and `_writerTb.Publish()`). `WriterCompleteFlag` is set on `_readAwaiter._state`. The reader's next `ReadAsync` / `TryRead` drain catches it and either rethrows (faulted) or returns `IsCompleted=true` with whatever data was previously visible (graceful).
 
 The data that the writer was about to publish via the in-flight `FlushAsync` may or may not become visible to the reader — depends on the race. In either case, the reader sees a consistent prefix (matches BCL: a `Complete`-vs-`Flush` race is not specified to expose the in-flight bytes).
 
