@@ -1,6 +1,6 @@
 # Cross-thread `Complete` — Design
 
-**Date:** 2026-05-10 (revised 2026-05-11, revised 2026-05-11 round 3, revised 2026-05-15 round 4)
+**Date:** 2026-05-10 (revised 2026-05-11, revised 2026-05-11 round 3, revised 2026-05-15 round 4, revised 2026-05-16 round 5)
 **Status:** Spec (pre-implementation). Relaxes the SPSC threading contract on `PipeWriter.Complete` and `PipeReader.Complete` to allow invocation from any thread, matching `System.IO.Pipelines` (BCL) behavior.
 
 **2026-05-11 revision (round 2)**: replaces the single `CompleteFlag` bit with two distinct flags `WriterCompleteFlag` / `ReaderCompleteFlag` so drains can distinguish self- vs peer-completion (caught by code review — a single bit on both awaiter words couldn't tell which side completed, leading to wrong dispatch and a null-deref on the unset `_*Completion` field). Also factors out a `DeliverReadResult` helper to match `DeliverFlushResult`, and corrects the `PipelyAwaiter._state` bit-layout description.
@@ -8,6 +8,8 @@
 **2026-05-11 revision (round 3)**: fixes a blocker in the round-2 `Deliver*Result` helpers — they only consulted the *peer's* `_*Completion` field and would silently deliver a non-completion result when a parked owner is woken by its own side's `Complete` (e.g., parked `ReadAsync` + third-thread `reader.Complete(ex)` → wake with `ReadResult(IsCompleted=false)`, exception lost). Helpers now take the observed state bits from the signaler's CAS and dispatch on own-side flag first, peer-side second, pre-completion last. Plus several spec-hygiene fixes: drop the bogus `Pipe.Dispose` reference (no such member exists), simplify the over-determined `Pipe.Reset` precondition, sketch the `Reset` deferred-handler cleanup, show concrete code for `BuildReadResult`/`BuildFlushResult` (peer-only consultation), tighten "post-fence relative to `TryAcquire`" rationale on `Volatile.Read`/`Interlocked.Exchange` distinction, and add two symmetric parked-wake tests that would have caught the blocker.
 
 **2026-05-15 revision (round 4)**: fixes a blocker in `DeliverReadResult`'s peer-graceful branch — it read `_writer.LastPublishedWriterState`, a 6-field struct mutated whole at Pipe.Writer.cs:104 by the writer thread inside `FlushAsync`. With the new uniform `Complete` body calling `SignalReadAwaiterIfPending` from any thread, a third-thread `writer.Complete()` while the writer is mid-`FlushAsync` tears that struct read — head from new snapshot, tail from old (or vice versa), then `new ReadOnlySequence<byte>(head, headIdx, tail!, tailWritten)` walks a broken segment graph. Fixed by building the peer-graceful `ReadResult` from the reader's stash (Head/HeadIdx/Tail/TailIdx, set during `ParkReadAwaiter` and immutable until next park — safe to read from any thread). Documents the behavioral implication (§5.5): unflushed-but-not-yet-published writer-side data is invisible to the parked-reader wake, matching BCL but differing from today's Pipely behavior where self-`Complete` auto-published unflushed data. The pre-completion and own-completion branches were already safe; the `DeliverFlushResult` peer-graceful branch was already safe (no struct read — `FlushResult` is just two bools).
+
+**2026-05-16 revision (round 5)**: corrects an overconfident claim in the round-4 annotation, and tightens §5.5's migration guidance. The round-4 comment in `DeliverReadResult`'s peer-graceful branch asserted "the writer's `FlushAsync` signals the reader (waking it from park) before any subsequent third-thread `Complete` can race, so when the reader is still parked at Complete time, no publish has happened since park." That's wrong: `FlushAsync`'s `Publish` (Pipe.Writer.cs:103) and `SignalReadAwaiterIfPending` (line 106) are *separate* operations — a third-thread `Complete` can interleave between them, observe the reader still `Pending`, win the signal-CAS, and deliver a stash-only `ReadResult` that misses the just-published data. The data sits in the triple buffer but is never delivered (or, depending on user pattern, may be delivered on a subsequent `ReadAsync` per BCL "drain until empty" convention — but a `while (!result.IsCompleted)` loop misses it). The fix is spec-only: drop the false claim, document the residual race in §5.5 and a new §6.6 edge case, and clarify the migration idiom — `await writer.FlushAsync(); writer.Complete();` from a single writer thread is lossless; third-thread `Complete` racing concurrent `FlushAsync` is not, by design (closing it requires fusing `Publish`+`Signal` into one Interlocked op or reintroducing a lock, neither of which is justified by use cases on the table). The §7.2 stress test wording is tightened to assert "well-formed `ReadResult`" (no AV/NRE) rather than "lossless data delivery," since the latter is not a contract for this race.
 
 ## Top-level key takeaways
 
@@ -625,14 +627,17 @@ private void DeliverReadResult(int observedState)
         // and the subsequent ReadOnlySequence<byte> ctor would walk a broken
         // segment graph (head not reachable from tail).
         //
-        // Behavioral consequence: data the writer published between park-time and
-        // Complete-time is not included in this wake's ReadResult. In practice this
-        // is not lost data — the writer's FlushAsync signals the reader (waking it
-        // from park) before any subsequent third-thread Complete can race, so when
-        // the reader is *still parked* at Complete time, no publish has happened
-        // since park. The only data that genuinely differs from today's Pipely
-        // behavior is writer-buffered-but-not-yet-flushed bytes at Complete time,
-        // which today's self-Complete auto-published; see §5.5.
+        // Behavioral consequence: data published between park-time and Complete-
+        // time is not delivered in this wake's ReadResult. The writer's FlushAsync
+        // publishes (Pipe.Writer.cs:103) and signals (Pipe.Writer.cs:106) as two
+        // separate operations; a third-thread Complete can interleave between
+        // them, win the signal-CAS, and deliver this stash-only result before the
+        // writer's own signal fires. The just-published data sits in the triple
+        // buffer; a subsequent ReadAsync would TryAcquire it and surface it via
+        // BuildReadResult (per BCL's "drain until buffer-empty + IsCompleted=true"
+        // convention), but a `while (!result.IsCompleted)` loop will not call
+        // back in and will miss it. See §5.5 and §6.6 for the documented race
+        // and migration idiom.
         var head    = _readAwaiter._stashHead;
         var headIdx = _readAwaiter._stashHeadIdx;
         var tail    = _readAwaiter._stashTail;
@@ -745,7 +750,19 @@ Consequences:
 
 In both paths, unflushed-at-Complete-time data is invisible. This matches BCL semantics (`System.IO.Pipelines.Pipe.CompleteWriter` does not auto-flush either) but differs from today's Pipely behavior.
 
-Migration note for callers who rely on the old auto-publish behavior: call `FlushAsync` before `Complete`. This is the recommended idiom for `System.IO.Pipelines` callers and now applies to Pipely as well.
+Migration idiom for callers who need lossless delivery on `Complete`:
+
+```csharp
+// On the writer thread, sequential and lossless:
+await writer.FlushAsync();
+writer.Complete();
+```
+
+This works because awaiting `FlushAsync` ensures both the `Publish` (Pipe.Writer.cs:103) *and* the subsequent `SignalReadAwaiterIfPending` (line 106) have completed before `Complete` is invoked. There is no `Publish`-without-`Signal` window for the third-thread `Complete` path to interleave with.
+
+**However**: a third-thread `Complete` racing against a concurrent writer-thread `FlushAsync` is *not* lossless, even with the idiom above. The race window — between the writer's `Publish` and its `Signal` — is small but real. A third thread that calls `writer.Complete()` while the writer thread is between those two operations can win the signal-CAS and deliver a stash-only wake; the just-published data is left in the triple buffer and reaches the reader only via the BCL "drain until empty" convention (which a `while (!result.IsCompleted)` loop does not satisfy). See §6.6 for the full race walk and the contract this gives up.
+
+Closing this race would require either fusing `Publish` and `Signal` into a single Interlocked operation (which couples `TripleBuffer` to `PipelyAwaiter` and complicates both) or a lock around the publish-signal window (which violates the project's no-lock policy). Neither is justified by use cases on the table; the documented constraint is the trade-off.
 
 The behavior change is *not* selectable by caller thread — even self-`Complete` on the writer thread defers terminal-state publication. Preserving the old behavior for self-`Complete` while supporting safe third-thread `Complete` would require runtime thread identification (compare to a stored writer-thread ID), which is fragile across async boundaries and inconsistent with the SPSC contract (which never tracked owner-thread identity). The simpler, uniform behavior is the trade-off.
 
@@ -789,6 +806,26 @@ The continuation runs on whichever thread the awaiter scheduled it on. If that's
 Third thread calls `writer.Complete()` while the writer thread is mid-`FlushAsync` (between `_writerTb.ProducerSlot()` write and `_writerTb.Publish()`). `WriterCompleteFlag` is set on `_readAwaiter._state`. The reader's next `ReadAsync` / `TryRead` drain catches it and either rethrows (faulted) or returns `IsCompleted=true` with whatever data was previously visible (graceful).
 
 The data that the writer was about to publish via the in-flight `FlushAsync` may or may not become visible to the reader — depends on the race. In either case, the reader sees a consistent prefix (matches BCL: a `Complete`-vs-`Flush` race is not specified to expose the in-flight bytes).
+
+### 6.6 — Parked-reader wake racing the writer's `Publish`-`Signal` window
+
+This is the race the round-5 revision documents. `FlushAsync` is not atomic across `Publish` (Pipe.Writer.cs:103) and `SignalReadAwaiterIfPending` (line 106) — `Publish` makes data globally visible in the triple buffer, then several instructions later the signal wakes the parked reader. A third-thread `writer.Complete()` can interleave:
+
+1. **Writer line 103** — `_writerTb.Publish()`. The new `WriterState` is now visible to consumers; a `TryAcquire` from any consumer-context call would observe it.
+2. **Writer between lines 103 and 106** — `_writer.LastPublishedWriterState = snapshot` (writer-thread-local, irrelevant to this race).
+3. **Third thread** — `Interlocked.Or(_readAwaiter._state, WriterCompleteFlag)`. State is now `Pending | WriterCompleteFlag`.
+4. **Third thread** — `SignalReadAwaiterIfPending()`. CAS `Pending → Inactive` *wins* (writer hasn't reached line 106 yet). `observedState` carries `WriterCompleteFlag`.
+5. **Third thread** — `DeliverReadResult` peer-graceful branch fires. Builds `ReadResult` from the reader's stash (park-time view, doesn't include the just-published data). Calls `_readAwaiter._core.SetResult(...)`.
+6. **Writer line 106** — `SignalReadAwaiterIfPending()`. State is `Inactive` (already consumed by step 4). Loop exits without doing anything.
+
+The reader's parked `ReadAsync` returns a `ReadResult` with `IsCompleted=true` and the *park-time* buffer. The data published at step 1 is in the triple buffer but is not in the delivered buffer.
+
+What happens next depends on user pattern:
+
+- **BCL "drain until empty"** (`while (!result.IsCompleted || !result.Buffer.IsEmpty)`): the user calls `ReadAsync` again. `TryAcquire` at Pipe.Reader.cs:31 grabs the post-step-1 state; the drain catches `WriterCompleteFlag`; `BuildReadResult` returns the data + `IsCompleted=true`. Data delivered. ✓
+- **Common "stop on IsCompleted"** (`while (!result.IsCompleted)` or `if (result.IsCompleted) break;`): the user does not call back in. The published data is never delivered.
+
+This is a documented BCL-parity gap. The race window is narrow (a few instructions on the writer thread between `Publish` and `Signal`), and the gap is exposed only when a third thread fires `Complete` mid-window. Self-thread sequencing — `await writer.FlushAsync(); writer.Complete();` — is lossless because the await ensures both line 103 and line 106 have executed before `Complete` runs. See §5.5 for the recommended idiom and the rationale for not closing this race in code.
 
 ## Section 7 — Testing strategy
 
@@ -837,11 +874,16 @@ Three scenarios, each with a 5-10s wall-clock budget:
 
 - **Concurrent `Complete` vs hot-path activity.** The writer thread runs a `GetMemory`/`Advance`/`FlushAsync` loop; the reader thread runs a `ReadAsync`/`AdvanceTo` loop. A third thread, after a randomized delay, calls `writer.Complete(new InvalidOperationException("test"))` exactly once. Assert: writer's loop terminates with the test exception; reader's loop terminates with the test exception (rethrown via `ExceptionDispatchInfo`); no other exceptions. Repeat with reader-side third-thread `Complete`.
 - **Race against `CancelPendingFlush` / `CancelPendingRead`.** Same setup, but the third thread also fires `CancelPendingRead` / `CancelPendingFlush` interleaved with `Complete`. Assert: no deadlocks, no spurious cancellations, terminal exception is the `Complete`-supplied one.
-- **Third-thread `Complete` racing mid-`FlushAsync` (torn-struct verification).** The writer thread runs a tight `GetMemory`/`Advance`/`FlushAsync` loop. The reader thread parks in `ReadAsync` (waiting for data). A third thread, *during* a writer-thread `FlushAsync` (timed via a probe), calls `writer.Complete()`. Asserts:
-  - The reader's parked task always wakes with a well-formed `ReadResult`. The buffer is either empty or walks a consistent segment chain from head to tail (no AVs, no `NullReferenceException`, no head-not-reachable-from-tail).
-  - The reader never sees `ReadResult(IsCompleted=false)` after this race — `IsCompleted` is always true on this wake.
-  - The exception (or graceful-close indicator) supplied to `writer.Complete()` is observable on the reader side.
-  This test pins the round-4 fix: prior to using stash in `DeliverReadResult`'s peer-graceful branch, the race could tear the `WriterState` struct read and produce undefined behavior. Run with a large iteration count (tens of thousands per second of budget) to maximize race coverage.
+- **Third-thread `Complete` racing mid-`FlushAsync` (well-formed-wake verification).** The writer thread runs a tight `GetMemory`/`Advance`/`FlushAsync` loop. The reader thread parks in `ReadAsync` (waiting for data). A third thread, *during* a writer-thread `FlushAsync` (timed via a probe), calls `writer.Complete()`. Asserts:
+  - The reader's parked task always wakes with a *well-formed* `ReadResult`. The buffer is either empty or walks a consistent segment chain from head to tail (no AVs, no `NullReferenceException`, no head-not-reachable-from-tail).
+  - The reader never sees `ReadResult(IsCompleted=false)` after this race — `IsCompleted` is always true on the wake.
+  - The completion indicator supplied to `writer.Complete()` (graceful or `ExceptionDispatchInfo`) is observable on the reader side, either on this wake or on a follow-up `ReadAsync`.
+
+  Crucially, this test does *not* assert lossless data delivery on the wake itself. The race documented in §6.6 — `Publish` (line 103) vs the third-thread signal — can result in the just-published bytes being left in the triple buffer rather than appearing in this wake's buffer. A separate "drain-until-empty" follow-up test (below) verifies the BCL drain idiom recovers the data. This test's purpose is solely to pin the round-4 stash fix: no torn struct, no broken segment graph, regardless of race timing.
+
+- **Drain-until-empty recovery after third-thread `Complete` (BCL-idiom verification).** Same setup as the previous test, but the reader uses the BCL "drain until empty + IsCompleted" loop (`while (!result.IsCompleted || !result.Buffer.IsEmpty)`). Asserts no exceptions, no AVs, all `ReadResult`s well-formed. The total observed byte count is *not* asserted exactly — the race documented in §6.6 plus the §5.5 unflushed-data behavior change make exact counts depend on race timing and writer post-`Complete` activity — but the count is recorded and logged for inspection. The intent of this test is to pin: (a) the drain-until-empty idiom never throws or wedges, (b) data that's in the triple buffer at the time of drain is delivered, and (c) the residual race per §6.6 is the only path by which bytes go missing.
+
+- **Serialized `flush-then-complete` (lossless-idiom verification).** Writer awaits `FlushAsync` to completion before invoking `Complete` (either from writer thread or via `await` continuation that resumes on writer thread). Asserts total bytes observed by reader equals total bytes written by writer (lossless), independent of race timing. This pins §5.5's recommended idiom as actually lossless when followed.
 
 ### 7.3 — Regression / invariant verification
 
